@@ -10,6 +10,63 @@ Paseo 支持任务与真实 Agent 绑定、提供方和模型选择、Thinking /
 
 本次导入基于原作者提交 `c346e8e`，不代表已同步原作者最新主分支。
 
+## 在 Paseo 中安装和使用
+
+### 准备环境
+
+- 安装 [Paseo](https://paseo.sh/download)，插件要求 Paseo 0.8 或更高版本。
+- 安装 Node.js 22.5 或更高版本，以及 Git。
+- 在 Paseo 的 **Settings → Plugins** 中启用插件，并配置至少一个可用的 Agent 提供方。
+- 以下命令在运行 Paseo daemon 的同一台机器上执行；使用与该 daemon 版本匹配的 `paseo` CLI。
+
+### 1. 启动看板数据服务
+
+在终端中克隆本仓库，然后安装依赖并启动服务：
+
+```bash
+git clone https://github.com/moeacgx/agent-taskboard.git
+cd agent-taskboard
+npm ci
+npm run build:web
+npm start
+```
+
+保留这个终端运行。服务默认监听 `http://127.0.0.1:47823`，负责保存任务、评论和项目文档。
+
+### 2. 安装 Paseo 插件
+
+另开一个终端，在刚才克隆的 `agent-taskboard` 目录中执行：
+
+```bash
+cd integrations/paseo
+npm ci --ignore-scripts
+npm run typecheck
+paseo plugin install .
+paseo plugin ls
+```
+
+确认 `dashi-taskboard` 状态为 `running`，然后打开 Paseo 侧栏的 **任务看板**。仓库已包含插件所需的自包含页面，无需另外启动前端开发服务器。
+
+### 3. 创建并执行任务
+
+1. 在任务看板选择或创建项目，点击 **新建议题**。
+2. 填写任务要求，选择提供方、模型、Thinking / Mode，以及项目根目录或 Worktree。
+3. 保存后，将任务拖入 **处理中**，插件会创建或继续绑定的 Paseo Agent。
+4. Agent 完成后，结果自动写入任务评论，任务进入 **等你确认**；人工验收后再标记完成。
+5. **项目文档**可填写共享背景；从看板发起的每轮执行会读取最新文档。自动认领默认关闭，需要时在项目自动化菜单中开启。
+
+### 日常启动与更新
+
+**插件由 Paseo 自动加载，不需要单独打开原版看板窗口；但目前仍须单独运行看板数据服务。** 仅打开 Paseo 不会自动启动 `npm start`。
+
+安装后不要移动或删除插件源码目录。拉取更新后，按上述步骤更新依赖、运行类型检查，再执行：
+
+```bash
+paseo plugin reload dashi-taskboard
+```
+
+服务不在默认地址时，通过 `DASHI_TASKBOARD_URL` 配置插件连接地址。更多设置、数据目录和功能边界见 [Paseo 插件说明](integrations/paseo/README.md)。
+
 ## 原版 Codex Taskboard
 
 一个本地优先的议题面板，可在浏览器中运行，也可通过独立 CDP 启动器或其注入脚本嵌入 Codex。同一套 HTTP API 为 React UI 和随附 Codex Skill 使用的 `taskctl` CLI 提供支持。

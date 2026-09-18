@@ -91,7 +91,7 @@ async function harness() {
       defaultModeId: "auto-review",
       models: [{
         id: "grok-4.6",
-        label: "maolaoapi",
+        label: "Example Grok",
         isSelectable: true,
         defaultThinkingOptionId: "xhigh",
       }],
@@ -343,7 +343,7 @@ test("保存计划不会被 Grok 慢 feature 读取阻塞；已知无效模型�
     workspacePath: directory,
     profile: {
       id: "paseo-catalog-model:grok:grok-4.6",
-      name: "Grok · maolaoapi",
+      name: "Grok · Example Grok",
       provider: "grok",
       model: "grok-4.6",
     },
