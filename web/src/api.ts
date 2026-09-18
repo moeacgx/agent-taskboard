@@ -31,6 +31,11 @@ import type {
   TaskDraft,
   TaskStatus,
 } from "./types";
+import {
+  requestPaseoWorktree,
+  type PaseoCreatedWorktree,
+  type PaseoWorktreeScan,
+} from "./paseo-bridge";
 
 const DEFAULT_USER_ACTOR: ActorIdentity = {
   type: "user",
@@ -80,6 +85,11 @@ export function resolveTaskboardWebSocketUrl(path: string): string {
   const url = new URL(resolveTaskboardUrl(path));
   url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
   return url.href;
+}
+
+/** Paseo 使用自身的 workspace/agent 绑定，不能读取原版 Codex 本机状态。 */
+function isPaseoEmbeddedHost(): boolean {
+  return new URL(document.baseURI).searchParams.get("host") === "paseo";
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -211,7 +221,17 @@ export async function getProjectSummary(
 }
 
 export async function getTaskboardMetadata(signal?: AbortSignal): Promise<TaskboardMetadata> {
-  return request<TaskboardMetadata>("/api/meta", { signal });
+  const metadata = await request<TaskboardMetadata>("/api/meta", { signal });
+  if (!isPaseoEmbeddedHost()) return metadata;
+  return {
+    ...metadata,
+    capabilities: { ...metadata.capabilities, localAiChat: false },
+    // srcDoc 不能直连 Dashi 的 WebSocket 基址；仍经白名单 revision API 轮询真实变更。
+    ...(metadata.realtime ? {
+      mode: "cloud" as const,
+      realtime: { transport: "poll" as const, intervalMs: 4_000 },
+    } : {}),
+  };
 }
 
 export async function getTaskboardRevision(
@@ -430,6 +450,9 @@ export function subscribeAiChatThread(
 }
 
 export async function listDeviceWorkspaces(signal?: AbortSignal): Promise<Record<string, string>> {
+  // 原接口返回 Codex device projectId -> path，不可伪装为 Paseo workspaceId -> path。
+  // Paseo 下调用方会回退到项目记录自身的 workspacePath。
+  if (isPaseoEmbeddedHost()) return {};
   try {
     const data = await request<{ workspaces: Record<string, string> }>("/api/device-workspaces", { signal });
     return data.workspaces;
@@ -540,6 +563,20 @@ export async function listDevelopmentContexts(
     `/api/projects/${encodeURIComponent(projectId)}/development-contexts${suffix}`,
     { signal },
   );
+}
+
+/** 仅在 Paseo 隔离 iframe 中可用，由父端 RPC 到 daemon，不会在浏览器执行 git。 */
+export function inspectPaseoWorktree(workspacePath: string): Promise<PaseoWorktreeScan> {
+  return requestPaseoWorktree("inspect", { workspacePath });
+}
+
+export function createPaseoWorktree(input: {
+  workspacePath: string;
+  branch: string;
+  branchMode: "existing" | "new";
+  taskId?: string;
+}): Promise<PaseoCreatedWorktree> {
+  return requestPaseoWorktree("create", input);
 }
 
 async function listTasksByArchive(

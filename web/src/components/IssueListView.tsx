@@ -43,6 +43,7 @@ export function IssueListView({
   onUpdate,
 }: IssueListViewProps) {
   const { language, locale, text } = useTaskboardI18n();
+  const paseoEmbedded = new URL(document.baseURI).searchParams.get("host") === "paseo";
   const [collapsed, setCollapsed] = useState(() => new Set(COLLAPSED_BY_DEFAULT));
   const [priorityMenuTaskId, setPriorityMenuTaskId] = useState<string | null>(null);
 
@@ -144,18 +145,33 @@ export function IssueListView({
                             conversations={presentations[task.id]?.conversations ?? []}
                             onOpenConversation={onOpenConversation}
                           />
-                          <label className="issue-list-assignee" title={task.assignee.name} onClick={stopRow}>
-                            <ActorAvatar actor={task.assignee} />
-                            <select
-                              aria-label={text(`${displayIdentifier} 负责人`, `${displayIdentifier} assignee`)}
-                              value={assigneeTarget}
-                              disabled={task.source === "jira"}
-                              onChange={(event) => void onUpdate(task, { assigneeTarget: event.target.value as "current-user" | "codex-agent" }).catch(() => {})}
+                          {paseoEmbedded ? (
+                            <button
+                              type="button"
+                              className="issue-list-assignee"
+                              title={text("在详情中更改 Paseo 负责人", "Change the Paseo assignee in issue details")}
+                              aria-label={text(`${displayIdentifier} 的 Paseo 负责人`, `${displayIdentifier} Paseo assignee`)}
+                              onClick={(event) => {
+                                stopRow(event);
+                                onOpenTask(task);
+                              }}
                             >
-                              <option value="current-user">{currentUser.name}</option>
-                              <option value="codex-agent">Codex Agent</option>
-                            </select>
-                          </label>
+                              <ActorAvatar actor={task.assignee} />
+                            </button>
+                          ) : (
+                            <label className="issue-list-assignee" title={task.assignee.name} onClick={stopRow}>
+                              <ActorAvatar actor={task.assignee} />
+                              <select
+                                aria-label={text(`${displayIdentifier} 负责人`, `${displayIdentifier} assignee`)}
+                                value={assigneeTarget}
+                                disabled={task.source === "jira"}
+                                onChange={(event) => void onUpdate(task, { assigneeTarget: event.target.value as "current-user" | "codex-agent" }).catch(() => {})}
+                              >
+                                <option value="current-user">{currentUser.name}</option>
+                                <option value="codex-agent">Codex Agent</option>
+                              </select>
+                            </label>
+                          )}
                         </span>
                         <time
                           dateTime={task.createdAt}

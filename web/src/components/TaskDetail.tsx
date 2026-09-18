@@ -92,6 +92,21 @@ import {
 import { TaskPropertyPicker } from "./TaskPropertyPicker";
 import { buildIssueUrl } from "../issueRoute";
 import { postEmbeddedHostMessage } from "../embeddedHost.mjs";
+import type {
+  PaseoConfigurationOptions,
+  PaseoConfigurationOptionsRequest,
+  PaseoTaskAssignment,
+} from "../paseo-bridge";
+import type { PaseoAgentPresentation } from "../taskConversations";
+import {
+  PaseoAssigneePicker,
+  type PaseoAssigneeOption,
+} from "./PaseoAssigneePicker";
+import {
+  PaseoConfigurationFields,
+  type PaseoConfigurationSelection,
+} from "./PaseoConfigurationFields";
+import { PaseoWorktreeDialog } from "./PaseoWorktreeDialog";
 import copyIdIcon from "../assets/figma-taskboard/copy-id.svg";
 import copyLinkIcon from "../assets/figma-taskboard/copy-link.svg";
 import { DescriptionDocument } from "./DescriptionDocument";
@@ -130,6 +145,23 @@ interface TaskDetailProps {
   onCopy: (text: string, announcement: string) => void;
   openingThread: boolean;
   onError: (message: TaskDetailError | null) => void;
+  paseoAssignment?: PaseoTaskAssignment | null;
+  paseoPresentation?: PaseoAgentPresentation | null;
+  onOpenPaseoAgent?: (agentId: string) => void;
+  paseoAssignee?: {
+    options: PaseoAssigneeOption[];
+    value: string;
+    loading: boolean;
+    error: string | null;
+    onRefresh: () => void;
+    onChange: (id: string) => void;
+  };
+  paseoConfiguration?: {
+    target: PaseoConfigurationOptionsRequest | null;
+    loadOptions: (target: PaseoConfigurationOptionsRequest) => Promise<PaseoConfigurationOptions>;
+    onSave?: (selection: PaseoConfigurationSelection) => Promise<void>;
+  };
+  paseoWorktree?: boolean;
 }
 
 function messageFor(error: unknown): TaskDetailError {
@@ -389,9 +421,16 @@ export function TaskDetail({
   onCopy,
   openingThread,
   onError,
+  paseoAssignment = null,
+  paseoPresentation = null,
+  onOpenPaseoAgent,
+  paseoAssignee,
+  paseoConfiguration,
+  paseoWorktree = false,
 }: TaskDetailProps) {
   const { language, locale, text } = useTaskboardI18n();
   const [currentTask, setCurrentTask] = useState(task);
+  const [worktreeDialogOpen, setWorktreeDialogOpen] = useState(false);
   const [title, setTitle] = useState(task.title);
   const [description, setDescription] = useState(task.description);
   const [descriptionSegments, setDescriptionSegments] = useState<InlineMediaSegment[]>(
@@ -988,7 +1027,8 @@ export function TaskDetail({
     && currentTask.assignee.id === currentUser.id
     ? currentUser
     : currentTask.assignee;
-  const assigneeOptions = [displayAssignee, currentUser, CODEX_AGENT_ACTOR]
+  const paseoEmbedded = new URL(document.baseURI).searchParams.get("host") === "paseo";
+  const assigneeOptions = (paseoEmbedded ? [displayAssignee] : [displayAssignee, currentUser, CODEX_AGENT_ACTOR])
     .filter((actor, index, actors) => (
       actors.findIndex((candidate) => actorKey(candidate) === actorKey(actor)) === index
     ));
@@ -1598,6 +1638,22 @@ export function TaskDetail({
 
           <aside className="issue-properties" aria-label={text("议题属性", "Issue properties")}>
             <div className="detail-primary-actions">
+              {paseoPresentation && (
+                <div className={`detail-paseo-agent-status${paseoPresentation.requiresAttention && paseoPresentation.attentionReason === "permission" ? " is-permission" : ""}`}>
+                  <span>{paseoPresentation.requiresAttention && paseoPresentation.attentionReason === "permission"
+                    ? text("等待 Agent 权限", "Awaiting Agent permission")
+                    : paseoPresentation.status === "running"
+                      ? text("Agent 正在处理", "Agent is working")
+                      : paseoPresentation.status === "unavailable"
+                        ? text("Agent 状态不可用", "Agent status unavailable")
+                        : text("已关联 Paseo Agent", "Paseo Agent linked")}</span>
+                  {onOpenPaseoAgent && (
+                    <button type="button" onClick={() => onOpenPaseoAgent(paseoPresentation.agentId)}>
+                      {text("打开会话", "Open session")}
+                    </button>
+                  )}
+                </div>
+              )}
               <button
                 className="detail-open-thread-action"
                 type="button"
@@ -1704,7 +1760,26 @@ export function TaskDetail({
             </div>
             <div className="detail-property-row assignee-property">
               <span className="detail-property-label">{text("负责人", "Assignee")}</span>
-              <TaskPropertyPicker
+              {paseoEmbedded && paseoAssignee ? (
+                <PaseoAssigneePicker
+                  options={paseoAssignee.options}
+                  value={paseoAssignee.value}
+                  loading={paseoAssignee.loading}
+                  error={paseoAssignee.error}
+                  onRefresh={paseoAssignee.onRefresh}
+                  onChange={paseoAssignee.onChange}
+                />
+              ) : paseoEmbedded ? (
+                <div className="detail-property-trigger" title={paseoAssignment?.kind === "existing"
+                  ? `${paseoAssignment.provider}${paseoAssignment.model ? `/${paseoAssignment.model}` : ""} · ${paseoAssignment.status}`
+                  : paseoAssignment?.kind === "planned"
+                    ? `计划新建 · ${paseoAssignment.profile.name} · ${paseoAssignment.workspacePath}`
+                    : undefined}
+                >
+                  <ActorAvatar actor={displayAssignee} className="task-property-assignee-avatar" />
+                  <span>{displayAssignee.name}</span>
+                </div>
+              ) : <TaskPropertyPicker
                 value={actorKey(displayAssignee)}
                 options={assigneeOptions.map((actor) => ({
                   value: actorKey(actor),
@@ -1726,8 +1801,19 @@ export function TaskDetail({
                     : undefined;
                   if (assigneeTarget) void saveTask({ assigneeTarget }, "assignee");
                 }}
-              />
+              />}
             </div>
+            {paseoConfiguration?.target && (
+              <PaseoConfigurationFields
+                target={paseoConfiguration.target}
+                loadOptions={paseoConfiguration.loadOptions}
+                onSave={paseoConfiguration.onSave}
+                onOpenAgent={paseoAssignment?.kind === "existing" && onOpenPaseoAgent
+                  ? () => onOpenPaseoAgent(paseoAssignment.agentId)
+                  : undefined}
+                variant="detail"
+              />
+            )}
             <div className="detail-property-row labels-property">
               <span className="detail-property-icon" aria-hidden="true">
                 <LabelIcon color="currentColor" size={14} />
@@ -1767,6 +1853,13 @@ export function TaskDetail({
                       ? <BranchIcon color="currentColor" size={14} />
                       : <LinearIcon name="folder" />,
                   })),
+                  ...(paseoWorktree ? [{
+                    value: "__paseo-create-worktree__",
+                    label: text("创建 Worktree", "Create worktree"),
+                    icon: <NewConversationIcon color="currentColor" size={14} />,
+                    className: "development-context-create-option",
+                    onSelect: () => setWorktreeDialogOpen(true),
+                  }] : []),
                 ]}
                 open={propertyMenu === "development"}
                 disabled={developmentScanLoading || savingProperty === "developmentContext"}
@@ -1780,6 +1873,18 @@ export function TaskDetail({
                   developmentContext: value ? JSON.parse(value) as DevelopmentContext : null,
                 }, "developmentContext")}
               />
+              {paseoWorktree && (
+                <PaseoWorktreeDialog
+                  open={worktreeDialogOpen}
+                  workspacePath={developmentScan.workspacePath}
+                  taskId={currentTask.id}
+                  onClose={() => setWorktreeDialogOpen(false)}
+                  onCreated={async (result) => {
+                    const saved = await saveTask({ developmentContext: result.context }, "developmentContext");
+                    if (!saved) throw new Error(text("Worktree 已创建，但任务未切换。请重试保存。", "The worktree was created, but the task was not switched. Try saving again."));
+                  }}
+                />
+              )}
             </div>
             <label
               className="detail-property-row detail-date-property-row"

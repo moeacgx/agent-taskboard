@@ -16,6 +16,8 @@ export interface TaskPropertyOption<Value extends string> {
   label: string;
   icon: ReactNode;
   className?: string;
+  /** 特殊选项可打开本地对话框，而非直接写入属性。 */
+  onSelect?: () => void;
 }
 
 interface TaskPropertyPickerProps<Value extends string> {
@@ -61,7 +63,8 @@ export function TaskPropertyPicker<Value extends string>({
 
   function selectOption(option: TaskPropertyOption<Value>) {
     onOpenChange(false);
-    if (option.value !== value) onChange(option.value);
+    if (option.onSelect) option.onSelect();
+    else if (option.value !== value) onChange(option.value);
     requestAnimationFrame(() => triggerRef.current?.focus());
   }
 

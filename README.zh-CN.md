@@ -1,6 +1,16 @@
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-# Codex Taskboard
+# Agent Taskboard
+
+基于 [chuspeeism/dashi-taskboard](https://github.com/chuspeeism/dashi-taskboard) 的扩展版本，保留原作者 Git 历史和 Apache-2.0 许可证，并增加 Paseo 任务看板插件。
+
+Paseo 支持任务与真实 Agent 绑定、提供方和模型选择、Thinking / Mode 配置、项目及 Worktree 选择、拖动执行、自动认领、结果回写，以及项目文档共享背景。
+
+**Paseo 安装与使用：[integrations/paseo/README.md](integrations/paseo/README.md)。** 插件标识仍为 `dashi-taskboard`。以下保留原版功能和运行说明；原项目的发布资产不包含本仓库新增的 Paseo 插件。
+
+本次导入基于原作者提交 `c346e8e`，不代表已同步原作者最新主分支。
+
+## 原版 Codex Taskboard
 
 一个本地优先的议题面板，可在浏览器中运行，也可通过独立 CDP 启动器或其注入脚本嵌入 Codex。同一套 HTTP API 为 React UI 和随附 Codex Skill 使用的 `taskctl` CLI 提供支持。
 

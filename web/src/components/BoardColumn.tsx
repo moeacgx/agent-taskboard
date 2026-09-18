@@ -22,6 +22,7 @@ export const STATUS_DETAILS: Record<
 interface BoardColumnProps {
   scrollRef: (element: HTMLDivElement | null) => void;
   status: TaskStatus;
+  label?: string;
   tasks: Task[];
   presentations: Record<string, TaskCardPresentation>;
   emptyMessage: string;
@@ -53,6 +54,7 @@ interface BoardColumnProps {
 export function BoardColumn({
   scrollRef,
   status,
+  label: labelOverride,
   tasks,
   presentations,
   emptyMessage,
@@ -82,7 +84,7 @@ export function BoardColumn({
 }: BoardColumnProps) {
   const { language, text } = useTaskboardI18n();
   const details = STATUS_DETAILS[status];
-  const label = taskStatusLabel(language, status);
+  const label = labelOverride ?? taskStatusLabel(language, status);
   const { findDropBefore, clearDropPreview, updateDropPreview, leaveDropPreview, getTaskDragShift } =
     useTaskCardDragPreview({ tasks, draggedTaskId, draggedTaskHeight, isDropTarget });
 

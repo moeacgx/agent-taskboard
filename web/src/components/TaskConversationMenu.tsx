@@ -14,6 +14,7 @@ function conversationSource(
   conversation: TaskConversationItem,
   text: (chinese: string, english: string) => string,
 ) {
+  if (conversation.kind === "paseo") return text("Paseo Agent", "Paseo Agent");
   if (conversation.kind === "local-ai") return text("内置 AI", "Built-in AI");
   return conversation.source === "comment"
     ? text("评论对话", "Comment conversation")
@@ -24,6 +25,14 @@ function conversationStatus(
   conversation: TaskConversationItem,
   text: (chinese: string, english: string) => string,
 ) {
+  if (conversation.kind === "paseo") {
+    if (conversation.requiresAttention) return text("等待权限", "Needs attention");
+    if (conversation.paseoStatus === "running") return text("正在处理", "Processing");
+    if (conversation.paseoStatus === "error" || conversation.paseoStatus === "unavailable") {
+      return text("状态不可用", "Status unavailable");
+    }
+    return text("已暂停", "Paused");
+  }
   if (conversation.currentRun?.status === "running") {
     if (conversation.latestTodo?.total) {
       return `${conversation.latestTodo.completed}/${conversation.latestTodo.total}`;

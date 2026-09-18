@@ -12,16 +12,20 @@ type AutomationStatus = "ACTIVE" | "PAUSED";
 type AutomationQuotaState = "available" | "blocked" | "unknown" | "unavailable";
 type IntervalMinutes = 5 | 10 | 15 | 30 | 60;
 
-interface AutomationOptions {
+export interface AutomationOptions {
   enabledByUser: boolean;
   quotaAware: boolean;
   intervalMinutes: IntervalMinutes;
-  model: string;
-  reasoningEffort: string;
+  model?: string;
+  reasoningEffort?: string;
 }
 
 interface AutomationState extends AutomationOptions {
   status: AutomationStatus;
+  schedulerReady?: boolean;
+  quotaAvailable?: boolean;
+  lastRunAt?: string | null;
+  lastError?: string | null;
   quota?: {
     state: AutomationQuotaState;
     checkedAt: number;
@@ -32,7 +36,8 @@ interface AutomationState extends AutomationOptions {
 
 interface ProjectAutomationMenuProps {
   automation?: Partial<AutomationState>;
-  models: AiChatModel[];
+  models?: AiChatModel[];
+  mode?: "codex" | "paseo";
   pending: boolean;
   error: string | null;
   unavailableReason: string | null;
@@ -49,6 +54,8 @@ const EFFORT_LABELS: Record<string, readonly [string, string]> = {
   ultra: ["极高 (ultra)", "Ultra"],
 };
 
+const EMPTY_MODELS: AiChatModel[] = [];
+
 function automationOptions(
   models: AiChatModel[],
   automation?: Partial<AutomationState>,
@@ -61,14 +68,17 @@ function automationOptions(
     enabledByUser: automation?.enabledByUser ?? false,
     quotaAware: automation?.quotaAware ?? false,
     intervalMinutes: automation?.intervalMinutes ?? 5,
-    model: model?.slug ?? "",
-    reasoningEffort: reasoningEffort ?? "",
+    ...(model ? {
+      model: model.slug,
+      reasoningEffort: reasoningEffort ?? model.defaultReasoningEffort,
+    } : {}),
   };
 }
 
 export function ProjectAutomationMenu({
   automation,
-  models,
+  models = EMPTY_MODELS,
+  mode = "codex",
   pending,
   error,
   unavailableReason,
@@ -85,8 +95,13 @@ export function ProjectAutomationMenu({
   const [draft, setDraft] = useState<AutomationOptions>(() => automationOptions(models, automation));
   const status = automation?.status ?? "PAUSED";
   const quota = automation?.quota;
+  const paseoMode = mode === "paseo";
+  const schedulerReady = automation?.schedulerReady ?? !paseoMode;
+  const quotaAvailable = automation?.quotaAvailable ?? !paseoMode;
   const stateLabel = !automation?.enabledByUser
     ? text("已暂停", "Paused")
+    : !schedulerReady
+      ? text("等待调度器", "Waiting for scheduler")
     : automation.quotaAware && quota?.state === "blocked"
       ? text("额度暂停", "Paused by quota")
       : automation.quotaAware && quota?.state === "unavailable"
@@ -97,7 +112,7 @@ export function ProjectAutomationMenu({
             ? text("运行中", "Running")
             : text("已暂停", "Paused");
   const selectedModel = models.find((model) => model.slug === draft.model) ?? models[0];
-  const disabled = pending || !selectedModel || Boolean(unavailableReason);
+  const disabled = pending || (!paseoMode && !selectedModel) || Boolean(unavailableReason);
 
   useEffect(() => {
     if (!open) return;
@@ -188,7 +203,7 @@ export function ProjectAutomationMenu({
           className={`board-setting-switch${draft.quotaAware ? " is-on" : ""}`}
           role="switch"
           aria-checked={draft.quotaAware}
-          disabled={disabled}
+          disabled={disabled || !quotaAvailable}
           onClick={() => submitChange({
             ...draft,
             quotaAware: !draft.quotaAware,
@@ -197,7 +212,12 @@ export function ProjectAutomationMenu({
           <span aria-hidden="true" />
         </button>
       </div>
-      {draft.quotaAware && (
+      {!quotaAvailable && (
+        <div className="project-automation-quota is-unavailable">
+          {text("Paseo SDK 当前无法提供可靠额度，额度联动暂不可用。", "Paseo SDK quota data is currently unavailable, so quota-aware automation is disabled.")}
+        </div>
+      )}
+      {quotaAvailable && draft.quotaAware && (
         <div className={`project-automation-quota is-${quota?.state ?? "unknown"}`}>
           {quota?.state === "available" && text("当前额度可用", "Quota is available")}
           {quota?.state === "blocked" && (
@@ -243,12 +263,12 @@ export function ProjectAutomationMenu({
           })}
         />
       </div>
-      {selectedModel && (
+      {!paseoMode && selectedModel && (
         <>
           <div className="project-automation-field">
             <span>{text("模型", "Model")}</span>
             <TaskPropertyPicker
-              value={draft.model}
+              value={draft.model ?? selectedModel.slug}
               options={models.map((model) => ({
                 value: model.slug,
                 label: model.displayName,
@@ -266,8 +286,8 @@ export function ProjectAutomationMenu({
                 submitChange({
                   ...draft,
                   model: value,
-                  reasoningEffort: model.supportedReasoningEfforts.includes(draft.reasoningEffort)
-                    ? draft.reasoningEffort
+                  reasoningEffort: model.supportedReasoningEfforts.includes(draft.reasoningEffort ?? "")
+                    ? draft.reasoningEffort ?? model.defaultReasoningEffort
                     : model.defaultReasoningEffort,
                 });
               }}
@@ -276,7 +296,7 @@ export function ProjectAutomationMenu({
           <div className="project-automation-field">
             <span>{text("推理强度", "Reasoning effort")}</span>
             <TaskPropertyPicker
-              value={draft.reasoningEffort}
+              value={draft.reasoningEffort ?? selectedModel.defaultReasoningEffort}
               options={selectedModel.supportedReasoningEfforts.map((effort) => ({
                 value: effort,
                 label: EFFORT_LABELS[effort] ? text(...EFFORT_LABELS[effort]) : effort,
@@ -296,6 +316,15 @@ export function ProjectAutomationMenu({
           </div>
         </>
       )}
+      {paseoMode && automation?.lastRunAt && (
+        <p className="project-automation-note">
+          {text(
+            `上次检查：${new Intl.DateTimeFormat(locale, { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }).format(new Date(automation.lastRunAt))}`,
+            `Last checked: ${new Intl.DateTimeFormat(locale, { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }).format(new Date(automation.lastRunAt))}`,
+          )}
+        </p>
+      )}
+      {paseoMode && automation?.lastError && <p className="project-automation-error" role="alert">{automation.lastError}</p>}
       {unavailableReason && <p className="project-automation-note">{unavailableReason}</p>}
       {error && error !== unavailableReason && <p className="project-automation-error" role="alert">{error}</p>}
     </div>,

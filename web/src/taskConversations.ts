@@ -9,7 +9,7 @@ import type {
 export interface TaskConversationItem {
   key: string;
   projectId: string;
-  kind: "native" | "local-ai";
+  kind: "native" | "local-ai" | "paseo";
   title: string;
   source: "task" | "comment" | "local-ai";
   nativeThreadId: string | null;
@@ -19,10 +19,24 @@ export interface TaskConversationItem {
   updatedAt: string;
   currentRun: AiChatRun | null;
   latestTodo: AiChatTodoProgress | null;
+  paseoAgentId: string | null;
+  paseoStatus: PaseoAgentPresentation["status"] | null;
+  requiresAttention: boolean;
+}
+
+/** 由 Paseo 父端刷新后注入 iframe 的真实 Agent 快照。 */
+export interface PaseoAgentPresentation {
+  agentId: string;
+  status: "initializing" | "idle" | "running" | "error" | "closed" | "unavailable";
+  requiresAttention: boolean;
+  attentionReason: "finished" | "error" | "permission" | null;
+  updatedAt: string | null;
+  title: string | null;
 }
 
 export interface TaskProcessingPresentation {
   running: boolean;
+  awaitingPermission: boolean;
   completed: number | null;
   total: number | null;
   startedAt: string | null;
@@ -32,6 +46,10 @@ export interface TaskCardPresentation {
   conversations: TaskConversationItem[];
   processing: TaskProcessingPresentation;
   unread: boolean;
+  workspaceDisplay: {
+    name: string;
+    path: string | null;
+  } | null;
 }
 
 export function normalizeCodexThreadId(value: string | null | undefined) {
@@ -82,6 +100,9 @@ export function taskConversations(task: Task, aiThreads: AiChatThread[]) {
       updatedAt: ref.updatedAt,
       currentRun: null,
       latestTodo: null,
+      paseoAgentId: null,
+      paseoStatus: null,
+      requiresAttention: false,
     };
     if (!current || next.updatedAt >= current.updatedAt) items.set(key, next);
   }
@@ -111,6 +132,9 @@ export function taskConversations(task: Task, aiThreads: AiChatThread[]) {
         : threadActivityUpdatedAt,
       currentRun: thread.currentRun ?? null,
       latestTodo: thread.latestTodo ?? null,
+      paseoAgentId: null,
+      paseoStatus: null,
+      requiresAttention: false,
     };
     if (current?.kind === "local-ai") {
       const currentRunning = current.currentRun?.status === "running";
@@ -141,8 +165,40 @@ export function taskCardPresentation(
     total: number | null;
     running: boolean;
   } | null | undefined = undefined,
+  paseoAgent: PaseoAgentPresentation | null = null,
+  workspaceDisplay: TaskCardPresentation["workspaceDisplay"] = null,
 ): TaskCardPresentation {
-  const conversations = taskConversations(task, aiThreads);
+  const conversations = paseoAgent ? [{
+    key: `paseo:${paseoAgent.agentId}`,
+    projectId: task.projectId,
+    kind: "paseo" as const,
+    title: paseoAgent.title ?? task.title,
+    source: "task" as const,
+    nativeThreadId: null,
+    threadBinding: null,
+    legacyLocalThreadId: null,
+    aiThreadId: null,
+    updatedAt: paseoAgent.updatedAt ?? task.updatedAt,
+    currentRun: null,
+    latestTodo: null,
+    paseoAgentId: paseoAgent.agentId,
+    paseoStatus: paseoAgent.status,
+    requiresAttention: paseoAgent.requiresAttention,
+  }] : taskConversations(task, aiThreads);
+  if (paseoAgent) {
+    return {
+      conversations,
+      unread,
+      processing: {
+        running: paseoAgent.status === "running",
+        awaitingPermission: paseoAgent.requiresAttention && paseoAgent.attentionReason === "permission",
+        completed: null,
+        total: null,
+        startedAt: null,
+      },
+      workspaceDisplay,
+    };
+  }
   let runningAi: TaskConversationItem | undefined;
   for (const conversation of conversations) {
     if (conversation.currentRun?.status !== "running") continue;
@@ -175,9 +231,11 @@ export function taskCardPresentation(
     processing: {
       running: task.status === "in_progress"
         && (Boolean(running) || taskNativeSession?.running === true),
+      awaitingPermission: false,
       completed: latestTodo?.completed ?? null,
       total: latestTodo?.total ?? null,
       startedAt: runningAi?.currentRun?.startedAt ?? null,
     },
+    workspaceDisplay,
   };
 }

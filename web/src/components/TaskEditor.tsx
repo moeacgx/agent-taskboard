@@ -23,6 +23,20 @@ import {
   actorKey,
   assigneeTargetForActor,
 } from "../actors";
+import {
+  PaseoAssigneePicker,
+  type PaseoAssigneeOption,
+} from "./PaseoAssigneePicker";
+import {
+  PaseoConfigurationFields,
+  type PaseoConfigurationSelection,
+} from "./PaseoConfigurationFields";
+import type {
+  PaseoConfigurationOptions,
+  PaseoConfigurationOptionsRequest,
+} from "../paseo-bridge";
+import { PaseoWorktreeDialog } from "./PaseoWorktreeDialog";
+import { PaseoWorkspacePicker, type PaseoWorkspaceOption } from "./PaseoWorkspacePicker";
 import { ActorAvatar } from "./ActorAvatar";
 import { LabelPicker } from "./LabelPicker";
 import { IssuePickerContent } from "./IssueRelations";
@@ -78,6 +92,10 @@ export interface NewTaskRelationDraft {
 export interface NewTaskCreateOptions {
   keepOpen: boolean;
   relations: NewTaskRelationDraft;
+  paseoAssigneeId?: string;
+  paseoWorkspacePath?: string;
+  paseoModeId?: string;
+  paseoThinkingOptionId?: string;
 }
 
 export interface NewTaskEditorDraft {
@@ -106,6 +124,21 @@ interface TaskEditorProps {
   currentUser: ActorIdentity;
   developmentScan: DevelopmentScan;
   developmentScanLoading: boolean;
+  paseoAssignee?: {
+    options: PaseoAssigneeOption[];
+    loading: boolean;
+    error: string | null;
+    onRefresh: () => void;
+  };
+  paseoConfiguration?: {
+    loadOptions: (target: PaseoConfigurationOptionsRequest) => Promise<PaseoConfigurationOptions>;
+    onOpenAgent: (agentId: string) => void;
+  };
+  paseoWorkspaces?: PaseoWorkspaceOption[];
+  paseoDefaultWorkspacePath?: string | null;
+  paseoWorktree?: {
+    onCreated: (context: DevelopmentContext) => void;
+  };
   onCreateLabel: (label: string) => Promise<void>;
   onCancel: (draft: NewTaskEditorDraft | null) => void;
   onSave: (
@@ -164,6 +197,11 @@ export function TaskEditor({
   currentUser,
   developmentScan,
   developmentScanLoading,
+  paseoAssignee,
+  paseoConfiguration,
+  paseoWorkspaces = [],
+  paseoDefaultWorkspacePath = null,
+  paseoWorktree,
   onCreateLabel,
   onCancel,
   onSave,
@@ -183,6 +221,10 @@ export function TaskEditor({
   const [status, setStatus] = useState<TaskStatus>(initialStatus);
   const [priority, setPriority] = useState<TaskPriority>(initialDraft?.priority ?? "none");
   const [assignee, setAssignee] = useState<ActorIdentity>(initialDraft?.assignee ?? currentUser);
+  const [paseoAssigneeId, setPaseoAssigneeId] = useState("paseo:self");
+  const [paseoWorkspaceId, setPaseoWorkspaceId] = useState("");
+  const [paseoConfigurationSelection, setPaseoConfigurationSelection] = useState<PaseoConfigurationSelection>({});
+  const [paseoConfigurationReady, setPaseoConfigurationReady] = useState(false);
   const [selectedLabels, setSelectedLabels] = useState<string[]>(initialDraft?.selectedLabels ?? []);
   const [developmentContext, setDevelopmentContext] = useState<DevelopmentContext | null>(initialDraft?.developmentContext ?? null);
   const [startDate] = useState(initialDraft?.startDate ?? "");
@@ -192,13 +234,21 @@ export function TaskEditor({
   const [relatedIds, setRelatedIds] = useState<string[]>(initialDraft?.relations.relatedIds ?? []);
   const [subIssueIds, setSubIssueIds] = useState<string[]>(initialDraft?.relations.subIssueIds ?? []);
   const [createMore, setCreateMore] = useState(false);
-  const [menu, setMenu] = useState<"project" | "status" | "priority" | "assignee" | "labels" | "development" | "more" | "due" | "recurrence" | null>(null);
+  const [menu, setMenu] = useState<"project" | "status" | "priority" | "assignee" | "labels" | "development" | "paseo-workspace" | "more" | "due" | "recurrence" | null>(null);
   const [relationMenu, setRelationMenu] = useState<DraftRelationMenu | null>(null);
   const [moreMenuPosition, setMoreMenuPosition] = useState<{ right: number; bottom: number } | null>(null);
   const [expanded, setExpanded] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<TaskEditorError | null>(null);
   const [attachmentError, setAttachmentError] = useState<TaskEditorError | null>(null);
+  const [worktreeDialogOpen, setWorktreeDialogOpen] = useState(false);
+  const [createdPaseoWorkspace, setCreatedPaseoWorkspace] = useState<{
+    id: string;
+    name: string | null;
+    path: string;
+    projectWorkspace: boolean;
+    kind: "workspace";
+  } | null>(null);
 
   const developmentOptions = useMemo(() => {
     const options = [...developmentScan.contexts];
@@ -266,6 +316,35 @@ export function TaskEditor({
     .filter((actor, index, actors) => (
       actors.findIndex((candidate) => actorKey(candidate) === actorKey(actor)) === index
     ));
+
+  const paseoNeedsWorkspace = Boolean(
+    paseoAssignee?.options.find((option) => option.id === paseoAssigneeId)?.requiresWorkspace,
+  );
+  const availablePaseoWorkspaces = useMemo(() => [
+    ...(createdPaseoWorkspace ? [createdPaseoWorkspace] : []),
+    ...paseoWorkspaces.filter((workspace) => workspace.id !== createdPaseoWorkspace?.id),
+  ], [createdPaseoWorkspace, paseoWorkspaces]);
+  const selectedPaseoWorkspace = availablePaseoWorkspaces.find((workspace) => workspace.id === paseoWorkspaceId) ?? null;
+  const selectedPaseoAssignee = paseoAssignee?.options.find((option) => option.id === paseoAssigneeId) ?? null;
+  const paseoConfigurationTarget = selectedPaseoAssignee?.provider && selectedPaseoAssignee.model
+    && (selectedPaseoAssignee.workspacePath || selectedPaseoWorkspace?.path)
+    ? {
+        provider: selectedPaseoAssignee.provider,
+        model: selectedPaseoAssignee.model,
+        workspacePath: selectedPaseoAssignee.workspacePath ?? selectedPaseoWorkspace!.path,
+        ...(selectedPaseoAssignee.agentId ? { agentId: selectedPaseoAssignee.agentId } : {}),
+        ...(selectedPaseoAssignee.modeId ? { modeId: selectedPaseoAssignee.modeId } : {}),
+        ...(selectedPaseoAssignee.thinkingOptionId ? { thinkingOptionId: selectedPaseoAssignee.thinkingOptionId } : {}),
+      }
+    : null;
+  const worktreeRepositoryPath = selectedPaseoWorkspace?.path ?? developmentScan.workspacePath;
+
+  useEffect(() => {
+    if (!paseoNeedsWorkspace || availablePaseoWorkspaces.length === 0) return;
+    if (selectedPaseoWorkspace) return;
+    const preferred = availablePaseoWorkspaces.find((workspace) => workspace.path === paseoDefaultWorkspacePath);
+    if (preferred) setPaseoWorkspaceId(preferred.id);
+  }, [availablePaseoWorkspaces, paseoDefaultWorkspacePath, paseoNeedsWorkspace, selectedPaseoWorkspace]);
 
   useEffect(() => {
     dialogRef.current?.showModal();
@@ -368,11 +447,21 @@ export function TaskEditor({
       ]);
       return;
     }
+    if (paseoAssignee && paseoNeedsWorkspace && !selectedPaseoWorkspace) {
+      setError("请选择新 Agent 的工作区。");
+      return;
+    }
+    if (paseoConfigurationTarget && !paseoConfigurationReady) {
+      setError("正在读取 Paseo Thinking/Mode 选项，请稍后重试。");
+      return;
+    }
 
     setSaving(true);
     setError(null);
     try {
-      const assigneeTarget = assigneeTargetForActor(assignee, currentUser);
+      const assigneeTarget = paseoAssignee
+        ? paseoAssigneeId === "paseo:self" ? "current-user" : undefined
+        : assigneeTargetForActor(assignee, currentUser);
       const descriptionValue = serializeInlineMedia(descriptionSegments).trim();
       await onSave({
         title: cleanTitle,
@@ -388,6 +477,12 @@ export function TaskEditor({
       }, inlineMediaFiles(descriptionSegments), inlineMediaImages(descriptionSegments), {
         keepOpen: createMore,
         relations: { parentId, relatedIds, subIssueIds },
+        ...(paseoAssignee ? { paseoAssigneeId } : {}),
+        ...(paseoAssignee && selectedPaseoWorkspace ? { paseoWorkspacePath: selectedPaseoWorkspace.path } : {}),
+        ...(paseoConfigurationSelection.modeId ? { paseoModeId: paseoConfigurationSelection.modeId } : {}),
+        ...(paseoConfigurationSelection.thinkingOptionId
+          ? { paseoThinkingOptionId: paseoConfigurationSelection.thinkingOptionId }
+          : {}),
       });
       if (createMore) {
         setTitle("");
@@ -576,7 +671,30 @@ export function TaskEditor({
               onOpenChange={(open) => setMenu(open ? "priority" : null)}
               onChange={setPriority}
             />
-            <TaskPropertyPicker
+            {paseoAssignee ? (
+              <div className="paseo-agent-configuration-group">
+                <PaseoAssigneePicker
+                  options={paseoAssignee.options}
+                  value={paseoAssigneeId}
+                  loading={paseoAssignee.loading}
+                  error={paseoAssignee.error}
+                  onRefresh={paseoAssignee.onRefresh}
+                  onChange={setPaseoAssigneeId}
+                />
+                {paseoConfiguration && paseoConfigurationTarget && (
+                  <PaseoConfigurationFields
+                    target={paseoConfigurationTarget}
+                    loadOptions={paseoConfiguration.loadOptions}
+                    onSelectionChange={setPaseoConfigurationSelection}
+                    onReadyChange={setPaseoConfigurationReady}
+                    onOpenAgent={selectedPaseoAssignee?.agentId
+                      ? () => paseoConfiguration.onOpenAgent(selectedPaseoAssignee.agentId!)
+                      : undefined}
+                    variant="editor"
+                  />
+                )}
+              </div>
+            ) : <TaskPropertyPicker
               value={actorKey(assignee)}
               options={assigneeOptions.map((actor) => ({
                 value: actorKey(actor),
@@ -593,7 +711,14 @@ export function TaskEditor({
                 const selected = assigneeOptions.find((actor) => actorKey(actor) === value);
                 if (selected) setAssignee(selected);
               }}
-            />
+            />}
+            {paseoAssignee && paseoNeedsWorkspace && (
+              <PaseoWorkspacePicker
+                value={paseoWorkspaceId}
+                options={availablePaseoWorkspaces}
+                onChange={setPaseoWorkspaceId}
+              />
+            )}
             <LabelPicker
               availableLabels={availableLabels}
               selectedLabels={selectedLabels}
@@ -622,6 +747,13 @@ export function TaskEditor({
                     ? <BranchIcon color="currentColor" size={14} />
                     : <LinearIcon name="folder" />,
                 })),
+                ...(paseoWorktree ? [{
+                  value: "__paseo-create-worktree__",
+                  label: text("创建 Worktree", "Create worktree"),
+                  icon: <PlusIcon color="currentColor" size={14} />,
+                  className: "development-context-create-option",
+                  onSelect: () => setWorktreeDialogOpen(true),
+                }] : []),
               ]}
               open={menu === "development"}
               disabled={developmentScanLoading}
@@ -632,6 +764,25 @@ export function TaskEditor({
               onOpenChange={(open) => setMenu(open ? "development" : null)}
               onChange={(value) => setDevelopmentContext(value ? JSON.parse(value) as DevelopmentContext : null)}
             />
+            {paseoWorktree && (
+              <PaseoWorktreeDialog
+                open={worktreeDialogOpen}
+                workspacePath={worktreeRepositoryPath}
+                onClose={() => setWorktreeDialogOpen(false)}
+                onCreated={(result) => {
+                  setDevelopmentContext(result.context);
+                  setCreatedPaseoWorkspace({
+                    id: result.workspace.id,
+                    name: `Worktree · ${result.workspace.branch}`,
+                    path: result.workspace.path,
+                    projectWorkspace: false,
+                    kind: "workspace",
+                  });
+                  setPaseoWorkspaceId(result.workspace.id);
+                  paseoWorktree.onCreated(result.context);
+                }}
+              />
+            )}
 
             {dueDate && (
               <button className="property-control" type="button" onClick={() => setMenu("due")}>

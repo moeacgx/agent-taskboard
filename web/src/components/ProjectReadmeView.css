@@ -56,3 +56,10 @@
   background: rgba(220, 38, 38, 0.1);
   color: #dc2626;
 }
+
+.project-readme-editor-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 10px;
+}

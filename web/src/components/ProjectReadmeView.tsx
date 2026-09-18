@@ -196,13 +196,7 @@ export function ProjectReadmeView({
         )}
 
         {editing ? (
-          <div
-            className="issue-description-composer"
-            onBlur={(event) => {
-              if (event.currentTarget.contains(event.relatedTarget as Node | null)) return;
-              void save();
-            }}
-          >
+          <div className="issue-description-composer project-readme-editor">
             <InlineMediaComposer
               ref={composerRef}
               segments={segments}
@@ -225,6 +219,24 @@ export function ProjectReadmeView({
                 }
               }}
             />
+            <div className="project-readme-editor-actions">
+              <button
+                type="button"
+                className="button secondary"
+                disabled={saving}
+                onClick={cancelEditing}
+              >
+                {text("取消", "Cancel")}
+              </button>
+              <button
+                type="button"
+                className="button primary"
+                disabled={saving}
+                onClick={() => void save()}
+              >
+                {saving ? text("保存中…", "Saving…") : text("保存", "Save")}
+              </button>
+            </div>
           </div>
         ) : (
           <div

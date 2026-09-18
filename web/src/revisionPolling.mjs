@@ -10,6 +10,44 @@ export function getRevisionWebSocketConfig(metadata) {
   };
 }
 
+export function createRefreshPoller({
+  refresh,
+  intervalMs,
+  setInterval: scheduleInterval = globalThis.setInterval,
+  clearInterval: cancelInterval = globalThis.clearInterval,
+}) {
+  let timer;
+  let running = false;
+  let requestPending = false;
+
+  async function poll() {
+    if (!running || requestPending) return;
+    requestPending = true;
+    try {
+      await refresh();
+    } catch {
+      // A later tick retries the same read-only refresh.
+    } finally {
+      requestPending = false;
+    }
+  }
+
+  return {
+    start() {
+      if (running) return;
+      running = true;
+      timer = scheduleInterval(poll, intervalMs);
+      void poll();
+    },
+    stop() {
+      if (!running) return;
+      running = false;
+      cancelInterval(timer);
+      timer = undefined;
+    },
+  };
+}
+
 export function createRevisionPoller({
   fetchRevision,
   onInvalidate,

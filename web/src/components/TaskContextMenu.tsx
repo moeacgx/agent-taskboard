@@ -44,6 +44,7 @@ interface TaskContextMenuProps {
   openInThreadDisabled?: boolean;
   onOpenInThread: (task: Task) => void;
   onArchive: (task: Task) => void;
+  onDelete: (task: Task) => void;
 }
 
 interface MenuItemProps {
@@ -116,6 +117,7 @@ export function TaskContextMenu({
   openInThreadDisabled = false,
   onOpenInThread,
   onArchive,
+  onDelete,
 }: TaskContextMenuProps) {
   const { language, text } = useTaskboardI18n();
   const displayIdentifier = task.externalKey ?? task.identifier;
@@ -435,6 +437,15 @@ export function TaskContextMenu({
               onPointerEnter={closeSubmenu}
               onClick={() => closeThen(() => onArchive(task))}
             />
+            {(task.status === "backlog" || task.status === "todo") && (
+              <MenuItem
+                label={text("删除议题", "Delete issue")}
+                icon={<DeleteIcon color="currentColor" />}
+                danger
+                onPointerEnter={closeSubmenu}
+                onClick={() => closeThen(() => onDelete(task))}
+              />
+            )}
           </div>
         </>
       )}

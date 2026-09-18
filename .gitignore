@@ -1,4 +1,5 @@
 node_modules/
+integrations/paseo/.paseo-web-dist/
 dist/
 .data/
 .wrangler/

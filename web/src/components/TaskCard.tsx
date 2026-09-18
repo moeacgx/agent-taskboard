@@ -196,7 +196,7 @@ function ProcessingProgress({
 
 function ProcessingLabel({ processing }: { processing: TaskCardPresentation["processing"] }) {
   const { text } = useTaskboardI18n();
-  const { running, startedAt } = processing;
+  const { running, startedAt, awaitingPermission } = processing;
   const [now, setNow] = useState(Date.now);
   useEffect(() => {
     if (!running || !startedAt) return;
@@ -207,8 +207,10 @@ function ProcessingLabel({ processing }: { processing: TaskCardPresentation["pro
   const elapsed = elapsedTime(startedAt, now);
   return (
     <span className="task-processing-label">
-      {running
-        ? (elapsed ? text(`已处理 ${elapsed}...`, `Processing for ${elapsed}...`) : text("正在处理...", "Processing..."))
+      {awaitingPermission
+        ? text("等待 Agent 权限", "Awaiting Agent permission")
+        : running
+          ? (elapsed ? text(`已处理 ${elapsed}...`, `Processing for ${elapsed}...`) : text("正在处理...", "Processing..."))
         : text("暂停处理", "Processing paused")}
     </span>
   );
@@ -221,7 +223,7 @@ function ProcessingStatusRow({
   presentation: TaskCardPresentation;
   onOpenConversation: (conversation: TaskConversationItem) => void;
 }) {
-  const running = presentation.processing.running;
+  const running = presentation.processing.running && !presentation.processing.awaitingPermission;
   return (
     <div className={`task-processing-row${running ? " is-running" : " is-paused"}`}>
       {running && <img className="task-processing-glyph" src={processingAnimation} alt="" aria-hidden="true" />}
@@ -331,6 +333,7 @@ function DueDateControl({
 }) {
   const { locale, text } = useTaskboardI18n();
   const displayIdentifier = task.externalKey ?? task.identifier;
+  const paseoEmbedded = new URL(document.baseURI).searchParams.get("host") === "paseo";
   if (!task.dueDate) return null;
   return (
     <label className="due-date-chip card-property-control" title={text(`截止日期 ${task.dueDate}`, `Due date ${task.dueDate}`)}>
@@ -366,11 +369,12 @@ function AssigneeControl({
   const { text } = useTaskboardI18n();
   const displayIdentifier = task.externalKey ?? task.identifier;
   const currentUserKey = actorKey(currentUser);
+  const paseoEmbedded = new URL(document.baseURI).searchParams.get("host") === "paseo";
   const assignee = actorKey(task.assignee) === currentUserKey ? currentUser : task.assignee;
   const participants = persistedParticipants.map((participant) => (
     actorKey(participant) === currentUserKey ? currentUser : participant
   ));
-  const options = [assignee, currentUser, CODEX_AGENT_ACTOR]
+  const options = (paseoEmbedded ? [assignee] : [assignee, currentUser, CODEX_AGENT_ACTOR])
     .filter((actor, index, actors) => (
       actors.findIndex((candidate) => actorKey(candidate) === actorKey(actor)) === index
     ));
@@ -424,6 +428,11 @@ export function TaskCard({
 }: TaskCardProps) {
   const { locale, text } = useTaskboardI18n();
   const displayIdentifier = task.externalKey ?? task.identifier;
+  const paseoEmbedded = new URL(document.baseURI).searchParams.get("host") === "paseo";
+  const workspaceReference = presentation.workspaceDisplay?.name
+    .replace(/^\s*Worktree\s*·\s*/i, "")
+    .replace(/^\s*#+\s*/, "")
+    .trim() ?? "";
   const [propertyMenu, setPropertyMenu] = useState<"priority" | "labels" | "assignee" | null>(null);
   const [savingProperty, setSavingProperty] = useState<"priority" | "labels" | "dueDate" | "assignee" | null>(null);
   const creator: ActorIdentity = {
@@ -460,7 +469,7 @@ export function TaskCard({
 
   return (
     <article
-      className={`task-card task-card-${variant} status-${task.status}${processingCard ? " is-processing-card" : ""}${processingCard && presentation.processing.running ? " is-running-card" : ""}${image ? " has-media" : ""}${presentation.unread ? " is-unread" : ""}${isDragging ? " is-dragging" : ""}${dragShift ? " is-drag-shifted" : ""}${isMoving ? " is-moving" : ""}${isSettling ? " is-settling" : ""}${isContextMenuOpen ? " is-context-open" : ""}${propertyMenu ? " is-property-menu-open" : ""}`}
+      className={`task-card task-card-${variant} status-${task.status}${processingCard ? " is-processing-card" : ""}${processingCard && presentation.processing.running && !presentation.processing.awaitingPermission ? " is-running-card" : ""}${image ? " has-media" : ""}${presentation.unread ? " is-unread" : ""}${isDragging ? " is-dragging" : ""}${dragShift ? " is-drag-shifted" : ""}${isMoving ? " is-moving" : ""}${isSettling ? " is-settling" : ""}${isContextMenuOpen ? " is-context-open" : ""}${propertyMenu ? " is-property-menu-open" : ""}`}
       style={{
         viewTransitionName: task.status === "in_review" ? `review-task-${task.id}` : "none",
         ...(dragShift ? { transform: `translate3d(0, ${dragShift}px, 0)` } : {}),
@@ -490,9 +499,19 @@ export function TaskCard({
       />
 
       <div className="card-topline">
-        <span className="card-reference">
-          <span className="task-identifier">ID: {displayIdentifier}</span>
-        </span>
+        {paseoEmbedded && presentation.workspaceDisplay && workspaceReference ? (
+          <span
+            className="card-reference is-workspace-reference"
+            title={presentation.workspaceDisplay.path ?? presentation.workspaceDisplay.name}
+          >
+            <LinearIcon name="folder" />
+            <span className="task-identifier workspace-reference-name">#{workspaceReference}</span>
+          </span>
+        ) : !paseoEmbedded ? (
+          <span className="card-reference">
+            <span className="task-identifier">ID: {displayIdentifier}</span>
+          </span>
+        ) : null}
         {presentation.unread && <span className="task-unread-dot" aria-label={text("有未读更新", "Unread updates")} />}
         {task.status === "in_review" && onComplete && (
           <button
@@ -580,7 +599,21 @@ export function TaskCard({
               }, "dueDate")}
             />
           )}
-          {!processingCard && showsInlineParticipants && (
+          {!processingCard && showsInlineParticipants && paseoEmbedded && (
+            <button
+              type="button"
+              className="task-assignee-trigger task-participants-control card-property-control"
+              title={text("在详情中更改 Paseo 负责人", "Change the Paseo assignee in issue details")}
+              aria-label={text(`${displayIdentifier} 的 Paseo 负责人`, `${displayIdentifier} Paseo assignee`)}
+              onClick={(event) => {
+                event.stopPropagation();
+                onEdit(task);
+              }}
+            >
+              <ParticipantAvatars participants={task.participants} />
+            </button>
+          )}
+          {!processingCard && showsInlineParticipants && !paseoEmbedded && (
             <AssigneeControl
               task={task}
               participants={task.participants}

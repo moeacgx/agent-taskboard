@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 import {
+  createRefreshPoller,
   createRevisionPoller,
   createRevisionWebSocketClient,
   getRevisionPollingInterval,
@@ -43,6 +44,65 @@ async function runFirstPoll(poller, timer, calls) {
     await flush();
   }
 }
+
+test("Paseo data refresh starts immediately, repeats every 4 seconds, and never overlaps", async () => {
+  const timer = createTimerHarness();
+  const calls = [];
+  let resolveRefresh;
+  const firstRefresh = new Promise((resolve) => {
+    resolveRefresh = resolve;
+  });
+  const poller = createRefreshPoller({
+    refresh: async () => {
+      calls.push(calls.length + 1);
+      if (calls.length === 1) await firstRefresh;
+    },
+    intervalMs: 4_000,
+    setInterval: timer.setInterval,
+    clearInterval: timer.clearInterval,
+  });
+
+  poller.start();
+  await flush();
+  assert.deepEqual(calls, [1]);
+  assert.equal(timer.intervals[0].delay, 4_000);
+
+  timer.fire();
+  timer.fire();
+  await flush();
+  assert.deepEqual(calls, [1]);
+
+  resolveRefresh();
+  await flush();
+  await timer.fire();
+  await flush();
+  assert.deepEqual(calls, [1, 2]);
+
+  poller.stop();
+  assert.deepEqual(timer.cleared, [timer.intervals[0]]);
+});
+
+test("Paseo data refresh retries on the next tick after a failure", async () => {
+  const timer = createTimerHarness();
+  let calls = 0;
+  const poller = createRefreshPoller({
+    refresh: async () => {
+      calls += 1;
+      if (calls === 1) throw new Error("temporary failure");
+    },
+    intervalMs: 4_000,
+    setInterval: timer.setInterval,
+    clearInterval: timer.clearInterval,
+  });
+
+  poller.start();
+  await flush();
+  await timer.fire();
+  await flush();
+
+  assert.equal(calls, 2);
+  poller.stop();
+});
 
 test("polls the current revision every 2000ms by default and ignores unchanged responses", async () => {
   const timer = createTimerHarness();

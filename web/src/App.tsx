@@ -79,6 +79,8 @@ import { ProjectAutomationMenu } from "./components/ProjectAutomationMenu";
 import { TaskboardIcon } from "./components/TaskboardIcon";
 import { TaskContextMenu } from "./components/TaskContextMenu";
 import { TaskDetail } from "./components/TaskDetail";
+import type { PaseoAssigneeOption } from "./components/PaseoAssigneePicker";
+import type { PaseoConfigurationSelection } from "./components/PaseoConfigurationFields";
 import {
   TaskEditor,
   type NewTaskCreateOptions,
@@ -96,6 +98,15 @@ import {
   postEmbeddedHostMessage,
   setEmbeddedFrameChallenge,
 } from "./embeddedHost.mjs";
+import type {
+  PaseoAutomationIntervalMinutes,
+  PaseoAutomationState,
+  PaseoAssignmentOptions,
+  PaseoConfigurationOptions,
+  PaseoConfigurationOptionsRequest,
+  PaseoTaskAssignment,
+} from "./paseo-bridge";
+import { profileIconSource, providerIconSource } from "./providerIcons";
 import { buildIssueUrl, readIssueIdentifier } from "./issueRoute";
 import {
   getTaskboardI18n,
@@ -111,6 +122,7 @@ import {
   indexAiThreadsByTask,
   normalizeCodexThreadId,
   taskCardPresentation,
+  type PaseoAgentPresentation,
   type TaskCardPresentation,
   type TaskConversationItem,
 } from "./taskConversations";
@@ -142,7 +154,7 @@ import {
 } from "./types";
 // The poller stays in ESM JavaScript so its lifecycle can be tested directly with node:test.
 // @ts-expect-error The module's option contract is enforced by its focused node tests.
-import { createRevisionPoller, createRevisionWebSocketClient, getRevisionPollingInterval, getRevisionWebSocketConfig } from "./revisionPolling.mjs";
+import { createRefreshPoller, createRevisionPoller, createRevisionWebSocketClient, getRevisionPollingInterval, getRevisionWebSocketConfig } from "./revisionPolling.mjs";
 
 type ConnectionState = "connecting" | "live" | "reconnecting";
 type Theme = "light" | "dark";
@@ -235,10 +247,13 @@ interface ProjectAutomationRecord {
   reasoningEffort: string;
 }
 
-type ProjectAutomationOptions = Pick<
-  ProjectAutomationRecord,
-  "enabledByUser" | "quotaAware" | "intervalMinutes" | "model" | "reasoningEffort"
->;
+interface ProjectAutomationOptions {
+  enabledByUser: boolean;
+  quotaAware: boolean;
+  intervalMinutes: AutomationIntervalMinutes;
+  model?: string;
+  reasoningEffort?: string;
+}
 
 interface AutomationRequestContext {
   taskboardProjectId: string;
@@ -310,6 +325,141 @@ const ALL_PROJECTS_DEFAULT_BOARD_DISPLAY_SETTINGS: BoardDisplaySettings = {
     (status) => status !== "backlog",
   ),
 };
+const PASEO_DEFAULT_BOARD_DISPLAY_SETTINGS: BoardDisplaySettings = {
+  cover: true,
+  body: false,
+  mainStatuses: ["todo", "in_progress", "in_review"],
+  sidebarStatuses: ["done", "canceled", "archived"],
+  hiddenStatuses: [],
+};
+
+const PASEO_UNASSIGNED_ACTOR: ActorIdentity = {
+  type: "user",
+  id: "paseo-unassigned",
+  name: "未分配",
+  avatarUrl: null,
+};
+
+function assignmentProviderIcon(
+  provider: string,
+  providerIcons: ReadonlyMap<string, string | null>,
+): string | null {
+  return providerIcons.get(provider) ?? providerIcons.get(provider.split("/", 1)[0]) ?? null;
+}
+
+interface PendingPaseoAutomationRequest {
+  resolve: (automation: PaseoAutomationState) => void;
+  reject: (error: Error) => void;
+  timeoutId: number;
+}
+
+interface PendingPaseoConfigurationRequest {
+  resolve: (options: PaseoConfigurationOptions) => void;
+  reject: (error: Error) => void;
+  timeoutId: number;
+}
+
+interface PaseoAutomationRequestToken {
+  sequence: number;
+  foreground: boolean;
+}
+
+export function createPaseoAutomationRequestGate(onPendingChange: (pending: boolean) => void) {
+  let sequence = 0;
+  let foregroundRequests = 0;
+
+  return {
+    begin(quiet: boolean): PaseoAutomationRequestToken | null {
+      if (quiet && foregroundRequests > 0) return null;
+      const token = { sequence: ++sequence, foreground: !quiet };
+      if (token.foreground) {
+        foregroundRequests += 1;
+        if (foregroundRequests === 1) onPendingChange(true);
+      }
+      return token;
+    },
+    isCurrent(token: PaseoAutomationRequestToken): boolean {
+      return token.sequence === sequence;
+    },
+    end(token: PaseoAutomationRequestToken): void {
+      if (!token.foreground) return;
+      foregroundRequests = Math.max(0, foregroundRequests - 1);
+      if (foregroundRequests === 0) onPendingChange(false);
+    },
+  };
+}
+
+function paseoAssignmentActor(
+  assignment: PaseoTaskAssignment,
+  providerIcons: ReadonlyMap<string, string | null>,
+): ActorIdentity {
+  if (assignment.kind === "existing") {
+    return {
+      type: "agent",
+      id: `paseo-agent:${assignment.agentId}`,
+      name: assignment.title ?? `Paseo · ${assignment.provider}${assignment.model ? `/${assignment.model}` : ""}`,
+      avatarUrl: providerIconSource(assignment.provider, assignmentProviderIcon(assignment.provider, providerIcons)),
+    };
+  }
+  return {
+    type: "agent",
+    id: `paseo-plan:${assignment.profile.id}`,
+    name: `计划新建 · ${assignment.profile.name}`,
+    avatarUrl: profileIconSource(
+      assignment.profile.icon,
+      assignment.profile.provider,
+      assignmentProviderIcon(assignment.profile.provider, providerIcons),
+    ),
+  };
+}
+
+function decoratePaseoTask(
+  task: Task,
+  assignment: PaseoTaskAssignment | undefined,
+  providerIcons: ReadonlyMap<string, string | null>,
+): Task {
+  if (assignment) {
+    const actor = paseoAssignmentActor(assignment, providerIcons);
+    const participants = [
+      ...task.participants.filter((participant) => participant.id !== "codex-agent" && actorKey(participant) !== actorKey(actor)),
+      actor,
+    ];
+    if (
+      actorKey(task.assignee) === actorKey(actor)
+      && task.assignee.name === actor.name
+      && task.assignee.avatarUrl === actor.avatarUrl
+      && task.participants.length === participants.length
+    ) return task;
+    return { ...task, assignee: actor, participants };
+  }
+  if (task.assignee.id !== "codex-agent" && !task.participants.some((participant) => participant.id === "codex-agent")) return task;
+  return {
+    ...task,
+    assignee: task.assignee.id === "codex-agent" ? PASEO_UNASSIGNED_ACTOR : task.assignee,
+    participants: task.participants.filter((participant) => participant.id !== "codex-agent"),
+  };
+}
+
+type PaseoAssignmentChoice =
+  | { kind: "self" | "unassigned" }
+  | { kind: "existing"; agentId: string }
+  | { kind: "planned"; profile: PaseoAssignmentOptions["profiles"][number] | PaseoAssignmentOptions["models"][number] };
+
+/** 请求已交给父端但 iframe 未在时限内收到回包；不能当成创建或保存失败。 */
+class PaseoAssignmentSavePendingError extends Error {
+  constructor() {
+    super("Paseo 负责人仍在保存，请刷新后确认任务计划；不会重复创建任务。");
+    this.name = "PaseoAssignmentSavePendingError";
+  }
+}
+
+function sameBoardDisplaySettings(left: BoardDisplaySettings, right: BoardDisplaySettings): boolean {
+  return left.cover === right.cover
+    && left.body === right.body
+    && left.mainStatuses.join(",") === right.mainStatuses.join(",")
+    && left.sidebarStatuses.join(",") === right.sidebarStatuses.join(",")
+    && left.hiddenStatuses.join(",") === right.hiddenStatuses.join(",");
+}
 const RECENT_PROJECT_IDS_KEY = "taskboard.recentProjectIds.v1";
 const PROJECT_VIEW_KEY_PREFIX = "taskboard.project-view.v1.";
 const DEVICE_WORKSPACE_PATHS_KEY = "taskboard.deviceWorkspacePaths.v1";
@@ -384,7 +534,7 @@ function getInitialTheme(): Theme {
   const host = query.get("host");
   if (
     window.parent !== window
-    && (host === "codex" || host === "deepseek-harness")
+    && (host === "codex" || host === "deepseek-harness" || host === "paseo")
   ) {
     const fromQuery = query.get("theme");
     if (isTheme(fromQuery)) return fromQuery;
@@ -511,6 +661,30 @@ function isAutomationHostPolicy(
 
 function isAutomationIntervalMinutes(value: unknown): value is AutomationIntervalMinutes {
   return value === 5 || value === 10 || value === 15 || value === 30 || value === 60;
+}
+
+function isPaseoAutomationState(value: unknown): value is PaseoAutomationState {
+  if (!value || typeof value !== "object") return false;
+  const state = value as Partial<PaseoAutomationState>;
+  return typeof state.projectId === "string"
+    && typeof state.enabledByUser === "boolean"
+    && isAutomationIntervalMinutes(state.intervalMinutes)
+    && typeof state.quotaAware === "boolean"
+    && (state.status === "ACTIVE" || state.status === "PAUSED")
+    && typeof state.schedulerReady === "boolean"
+    && typeof state.quotaAvailable === "boolean"
+    && (state.lastRunAt === null || typeof state.lastRunAt === "string")
+    && (state.lastError === null || typeof state.lastError === "string");
+}
+
+function isPaseoConfigurationOptions(value: unknown): value is PaseoConfigurationOptions {
+  if (!value || typeof value !== "object") return false;
+  const options = value as Partial<PaseoConfigurationOptions>;
+  return typeof options.provider === "string"
+    && typeof options.model === "string"
+    && Array.isArray(options.modes)
+    && Array.isArray(options.thinkingOptions)
+    && typeof options.editable === "boolean";
 }
 
 function intervalMinutesFromRrule(value: string): AutomationIntervalMinutes | null {
@@ -729,7 +903,7 @@ function LocalRealtimeSync({
 export function App() {
   const query = useMemo(() => new URL(document.baseURI).searchParams, []);
   const host = query.get("host");
-  const embedded = host === "codex" || host === "deepseek-harness";
+  const embedded = host === "codex" || host === "deepseek-harness" || host === "paseo";
   const undoShortcut = navigator.userAgent.includes("Macintosh") ? "⌘Z" : "Ctrl+Z";
   const [theme, setTheme] = useState<Theme>(getInitialTheme);
   const [hostContext, setHostContext] = useState<HostContext | null>(null);
@@ -760,6 +934,14 @@ export function App() {
       running: boolean;
     } | null>
   >({});
+  const [paseoAgentPresentations, setPaseoAgentPresentations] = useState<Record<string, PaseoAgentPresentation>>({});
+  const [paseoAutomations, setPaseoAutomations] = useState<Record<string, PaseoAutomationState>>({});
+  const [paseoAutomationPending, setPaseoAutomationPending] = useState(false);
+  const [paseoAutomationError, setPaseoAutomationError] = useState<string | null>(null);
+  const [paseoAssignments, setPaseoAssignments] = useState<Record<string, PaseoTaskAssignment>>({});
+  const [paseoAssignmentOptions, setPaseoAssignmentOptions] = useState<PaseoAssignmentOptions | null>(null);
+  const [paseoAssignmentOptionsLoading, setPaseoAssignmentOptionsLoading] = useState(false);
+  const [paseoAssignmentOptionsError, setPaseoAssignmentOptionsError] = useState<string | null>(null);
   const [recentProjectIds, setRecentProjectIds] = useState(readRecentProjectIds);
   const initialProjectId = query.get("project") ?? recentProjectIds[0] ?? ALL_PROJECTS_ID;
   const [projects, setProjects] = useState<Project[]>([]);
@@ -855,6 +1037,12 @@ export function App() {
   const projectsRequestRef = useRef(0);
   const tasksRequestRef = useRef(0);
   const tasksRef = useRef<Task[]>([]);
+  const paseoAssignmentOptionsRequestRef = useRef(0);
+  const pendingPaseoAssignmentSaveRef = useRef(new Map<string, {
+    resolve: (assignment: PaseoTaskAssignment | null) => void;
+    reject: (error: Error) => void;
+    timeoutId: number;
+  }>());
   const undoSequenceRef = useRef(0);
   const undoStackRef = useRef<UndoOperation[]>([]);
   const undoInFlightRef = useRef(false);
@@ -883,6 +1071,12 @@ export function App() {
     );
   }
   const pendingAutomationRequestsRef = useRef(new Map<string, PendingAutomationRequest>());
+  const pendingPaseoAutomationRequestsRef = useRef(new Map<string, PendingPaseoAutomationRequest>());
+  const pendingPaseoConfigurationRequestsRef = useRef(new Map<string, PendingPaseoConfigurationRequest>());
+  const paseoAutomationRequestGateRef = useRef<ReturnType<typeof createPaseoAutomationRequestGate> | null>(null);
+  if (!paseoAutomationRequestGateRef.current) {
+    paseoAutomationRequestGateRef.current = createPaseoAutomationRequestGate(setPaseoAutomationPending);
+  }
   const automationRequestInFlightRef = useRef<"list" | "save" | null>(null);
   const loadedAutomationProjectIdsRef = useRef(new Set<string>());
   const queuedAutomationSavesRef = useRef(new Map<string, QueuedProjectAutomationSave>());
@@ -932,10 +1126,23 @@ export function App() {
   );
   const isAllProjects = selectedProjectId === ALL_PROJECTS_ID;
   const isJiraProject = selectedProject?.source === "jira";
-  const storedBoardDisplaySettings = projectBoardDisplaySettings[selectedProjectId]
-    ?? (isAllProjects
-      ? ALL_PROJECTS_DEFAULT_BOARD_DISPLAY_SETTINGS
-      : DEFAULT_BOARD_DISPLAY_SETTINGS);
+  const savedBoardDisplaySettings = projectBoardDisplaySettings[selectedProjectId];
+  // 曾经自动写入的原版默认四列不是用户自定义；Paseo 继续采用用户约定的三列默认。
+  const usesPaseoDefaultBoard = host === "paseo" && (
+    savedBoardDisplaySettings === undefined
+    || sameBoardDisplaySettings(
+      savedBoardDisplaySettings,
+      isAllProjects ? ALL_PROJECTS_DEFAULT_BOARD_DISPLAY_SETTINGS : DEFAULT_BOARD_DISPLAY_SETTINGS,
+    )
+  );
+  const storedBoardDisplaySettings = savedBoardDisplaySettings
+    ?? (usesPaseoDefaultBoard
+      ? PASEO_DEFAULT_BOARD_DISPLAY_SETTINGS
+      : (
+        isAllProjects
+          ? ALL_PROJECTS_DEFAULT_BOARD_DISPLAY_SETTINGS
+          : DEFAULT_BOARD_DISPLAY_SETTINGS
+      ))
   const boardDisplaySettings: BoardDisplaySettings = isAllProjects
     && storedBoardDisplaySettings.sidebarStatuses.includes("backlog")
     && !storedBoardDisplaySettings.mainStatuses.includes("backlog")
@@ -953,7 +1160,7 @@ export function App() {
   useEffect(() => {
     setAutomationCatalog(null);
     setAutomationCatalogError(null);
-    if (!selectedProject || !localAiChatAvailable) {
+    if (host === "paseo" || !selectedProject || !localAiChatAvailable) {
       setAutomationCatalogLoading(false);
       return;
     }
@@ -980,6 +1187,7 @@ export function App() {
     return () => controller.abort();
   }, [
     localAiChatAvailable,
+    host,
     selectedCodexProjectIdentity?.codexHostId,
     selectedCodexProjectIdentity?.codexProjectId,
     selectedCodexProjectIdentity?.codexProjectKind,
@@ -1023,6 +1231,7 @@ export function App() {
     ? undefined
     : deviceWorkspacePaths[selectedProjectId];
   const selectedProjectAutomation = projectAutomations[selectedProjectId];
+  const selectedPaseoAutomation = paseoAutomations[selectedProjectId];
   const automationProjectContext = useMemo<Partial<CodexProjectIdentity> & {
     unavailableReason: string | null;
   }>(() => {
@@ -1230,6 +1439,238 @@ export function App() {
     ?? (newTaskDraft?.projectId === selectedProjectId ? newTaskDraft.targetProjectId : undefined)
     ?? (isAllProjects ? GLOBAL_PROJECT_ID : selectedProjectId);
   const developmentEditorProjectId = isAllProjects && editor ? editorProjectId : null;
+  const paseoProviderIcons = useMemo(() => new Map(
+    (paseoAssignmentOptions?.providers ?? []).map((provider) => [provider.id, provider.iconDataUrl]),
+  ), [paseoAssignmentOptions]);
+  const paseoAssignmentsRef = useRef(paseoAssignments);
+  const paseoProviderIconsRef = useRef(paseoProviderIcons);
+  paseoAssignmentsRef.current = paseoAssignments;
+  paseoProviderIconsRef.current = paseoProviderIcons;
+  const paseoAssigneeChoices = useMemo(() => {
+    const options: PaseoAssigneeOption[] = [
+      { id: "paseo:self", label: `${currentUser.name}（我）`, group: "self" },
+      { id: "paseo:unassigned", label: "未分配", detail: "仅保存任务，不绑定或创建 Agent", group: "self" },
+    ];
+    const choices = new Map<string, PaseoAssignmentChoice>([
+      ["paseo:self", { kind: "self" }],
+      ["paseo:unassigned", { kind: "unassigned" }],
+    ]);
+    const catalog = paseoAssignmentOptions;
+    if (!catalog) return { options, choices };
+    const hasWorkspace = catalog.workspaces.some((workspace) => Boolean(workspace.path));
+    const providerChoices = new Map(catalog.providers.map((provider) => [provider.id, provider]));
+    for (const [index, profile] of catalog.profiles.entries()) {
+      const id = `paseo:profile:${profile.id}`;
+      options.push({
+        id,
+        label: profile.name,
+        detail: `${profile.provider}${profile.model ? `/${profile.model}` : ""} · 选择后指定工作区`,
+        group: "profile",
+        provider: profile.provider,
+        model: profile.model,
+        modeId: profile.modeId,
+        thinkingOptionId: profile.thinkingOptionId,
+        iconDataUrl: providerChoices.get(profile.provider)?.iconDataUrl ?? null,
+        profileIcon: profile.icon,
+        hiddenFromRoot: index >= 4,
+        requiresWorkspace: true,
+        disabled: !hasWorkspace,
+        disabledReason: hasWorkspace ? undefined : "没有可用工作区，无法保存新 Agent 计划。",
+      });
+      choices.set(id, { kind: "planned", profile });
+    }
+    for (const provider of catalog.providers) {
+      const modelCount = catalog.models.filter((model) => model.provider === provider.id).length;
+      options.push({
+        id: `paseo:provider:${provider.id}`,
+        label: provider.label,
+        detail: `${modelCount} 个模型`,
+        group: "provider",
+        kind: "provider",
+        providerId: provider.id,
+        provider: provider.id,
+        iconDataUrl: provider.iconDataUrl,
+      });
+    }
+    for (const model of catalog.models) {
+      const id = `paseo:model:${model.id}`;
+      options.push({
+        id,
+        label: model.name,
+        detail: `${providerChoices.get(model.provider)?.label ?? model.provider} · ${model.model ?? "默认模型"}`,
+        group: "profile",
+        providerId: model.provider,
+        provider: model.provider,
+        model: model.model,
+        modeId: model.modeId,
+        thinkingOptionId: model.thinkingOptionId,
+        iconDataUrl: providerChoices.get(model.provider)?.iconDataUrl ?? null,
+        hiddenFromRoot: true,
+        requiresWorkspace: true,
+        disabled: !hasWorkspace,
+        disabledReason: hasWorkspace ? undefined : "没有可用工作区，无法保存新 Agent 计划。",
+      });
+      choices.set(id, { kind: "planned", profile: model });
+    }
+    options.push({
+      id: "paseo:agents",
+      label: "绑定已有会话",
+      detail: "选择后仅保存绑定，不发送消息",
+      group: "agent",
+      kind: "agent-browser",
+    });
+    for (const agent of catalog.agents) {
+      const id = `paseo:agent:${agent.id}`;
+      const status = agent.requiresAttention
+        ? "等待权限"
+        : agent.status === "running" ? "运行中" : agent.status;
+      const occupied = agent.assignedTaskIdentifier;
+      options.push({
+        id,
+        label: agent.title ?? `Paseo · ${agent.provider}${agent.model ? `/${agent.model}` : ""}`,
+        detail: `${(agent.workspaceName ?? agent.cwd) || "未知工作区"} · ${agent.provider}${agent.model ? `/${agent.model}` : ""} · ${status}`,
+        group: "agent",
+        provider: agent.provider,
+        model: agent.model,
+        workspacePath: agent.cwd,
+        agentId: agent.id,
+        iconDataUrl: providerChoices.get(agent.provider)?.iconDataUrl ?? null,
+        hiddenFromRoot: true,
+        disabled: Boolean(occupied),
+        disabledReason: occupied ? `已绑定到任务 ${occupied}，不能抢占。` : undefined,
+      });
+      choices.set(id, { kind: "existing", agentId: agent.id });
+    }
+    return { options, choices };
+  }, [currentUser.name, paseoAssignmentOptions]);
+
+  function refreshPaseoAssignmentOptions(projectId = editorProjectId ?? detailTask?.projectId) {
+    if (host !== "paseo" || !embeddedFrameChallenge || !projectId) return;
+    const requestId = ++paseoAssignmentOptionsRequestRef.current;
+    setPaseoAssignmentOptionsLoading(true);
+    setPaseoAssignmentOptionsError(null);
+    postEmbeddedHostMessage({
+      type: "taskboard:paseo-assignment-options-request",
+      payload: { requestId, projectId },
+    });
+  }
+
+  const loadPaseoConfigurationOptions = useCallback((target: PaseoConfigurationOptionsRequest) => {
+    if (host !== "paseo" || !embeddedFrameChallenge) {
+      return Promise.reject(new Error("Paseo 配置桥尚未就绪。"));
+    }
+    const requestId = crypto.randomUUID();
+    const response = new Promise<PaseoConfigurationOptions>((resolve, reject) => {
+      const timeoutId = window.setTimeout(() => {
+        pendingPaseoConfigurationRequestsRef.current.delete(requestId);
+        reject(new Error("Paseo 配置选项没有响应，请重试。"));
+      }, 15_000);
+      pendingPaseoConfigurationRequestsRef.current.set(requestId, { resolve, reject, timeoutId });
+    });
+    postEmbeddedHostMessage({
+      type: "taskboard:paseo-configuration-options-request",
+      payload: { requestId, ...target },
+    });
+    return response;
+  }, [embeddedFrameChallenge, host]);
+
+  function savePaseoTaskAssignment(
+    task: Task,
+    choiceId: string | undefined,
+    workspacePath?: string,
+    configuration?: PaseoConfigurationSelection,
+  ): Promise<PaseoTaskAssignment | null> {
+    const choice = choiceId ? paseoAssigneeChoices.choices.get(choiceId) : null;
+    if (host !== "paseo" || !choice) {
+      return Promise.resolve(null);
+    }
+    if (choice.kind === "planned" && !workspacePath) {
+      return Promise.reject(new Error("请选择新 Agent 的工作区。"));
+    }
+    const requestId = crypto.randomUUID();
+    return new Promise<PaseoTaskAssignment | null>((resolve, reject) => {
+      const timeoutId = window.setTimeout(() => {
+        pendingPaseoAssignmentSaveRef.current.delete(requestId);
+        reject(new PaseoAssignmentSavePendingError());
+      }, 15_000);
+      pendingPaseoAssignmentSaveRef.current.set(requestId, { resolve, reject, timeoutId });
+      postEmbeddedHostMessage({
+        type: "taskboard:paseo-assignment-save",
+        payload: {
+          requestId,
+          taskId: task.id,
+          projectId: task.projectId,
+          choice: choice.kind === "planned" ? {
+            ...choice,
+            workspacePath,
+            profile: configuration && choice.profile.model ? {
+              ...choice.profile,
+              modeId: configuration.modeId,
+              thinkingOptionId: configuration.thinkingOptionId,
+            } : choice.profile,
+          } : choice,
+        },
+      });
+    });
+  }
+
+  function paseoAssignmentValue(task: Task): string {
+    const assignment = paseoAssignments[task.id];
+    if (!assignment) return task.assignee.id === PASEO_UNASSIGNED_ACTOR.id ? "paseo:unassigned" : "paseo:self";
+    if (assignment.kind === "existing") return `paseo:agent:${assignment.agentId}`;
+    for (const [id, choice] of paseoAssigneeChoices.choices) {
+      if (choice.kind === "planned" && choice.profile.id === assignment.profile.id) return id;
+    }
+    return "paseo:self";
+  }
+
+  function configurationTargetForAssignment(
+    assignment: PaseoTaskAssignment | undefined,
+  ): PaseoConfigurationOptionsRequest | null {
+    if (!assignment) return null;
+    if (assignment.kind === "planned") {
+      if (!assignment.profile.model) return null;
+      return {
+        provider: assignment.profile.provider,
+        model: assignment.profile.model,
+        workspacePath: assignment.workspacePath,
+        ...(assignment.profile.modeId ? { modeId: assignment.profile.modeId } : {}),
+        ...(assignment.profile.thinkingOptionId
+          ? { thinkingOptionId: assignment.profile.thinkingOptionId }
+          : {}),
+      };
+    }
+    const agent = paseoAssignmentOptions?.agents.find((candidate) => candidate.id === assignment.agentId);
+    if (!assignment.model || !agent?.cwd) return null;
+    return {
+      provider: assignment.provider,
+      model: assignment.model,
+      workspacePath: agent.cwd,
+      agentId: assignment.agentId,
+    };
+  }
+
+  async function changePaseoTaskAssignment(
+    task: Task,
+    choiceId: string,
+    workspacePath?: string,
+    configuration?: PaseoConfigurationSelection,
+    propagateError = false,
+  ) {
+    setActionError(null);
+    try {
+      const assignment = await savePaseoTaskAssignment(task, choiceId, workspacePath, configuration);
+      setPaseoAssignments((current) => {
+        const next = { ...current };
+        if (assignment) next[task.id] = assignment;
+        else delete next[task.id];
+        return next;
+      });
+    } catch (error) {
+      setActionError(errorMessage(error));
+      if (propagateError) throw error;
+    }
+  }
   const createTargetProjects = projectChoices.flatMap((choice) => {
     const project = projects.find((candidate) => candidate.id === choice.id);
     return project && project.source !== "jira"
@@ -1327,6 +1768,12 @@ export function App() {
     context: AutomationRequestContext,
     automationId?: string,
   ) => {
+    if (!options.model || !options.reasoningEffort) {
+      return Promise.reject(new Error(textRef.current(
+        "Codex 自动化需要选择模型和推理强度。",
+        "Codex automation requires a model and reasoning effort.",
+      )));
+    }
     const requestId = window.crypto.randomUUID();
     const response = new Promise<AutomationHostResponse>((resolve, reject) => {
       const timeoutId = window.setTimeout(() => {
@@ -1377,6 +1824,12 @@ export function App() {
       setAutomationPending(true);
       setAutomationError(null);
       try {
+        if (!queuedSave.options.model || !queuedSave.options.reasoningEffort) {
+          throw new Error(textRef.current(
+            "Codex 自动化需要选择模型和推理强度。",
+            "Codex automation requires a model and reasoning effort.",
+          ));
+        }
         const response = await sendAutomationRequest(
           "apply-policy",
           queuedSave.options,
@@ -1558,6 +2011,84 @@ export function App() {
     drainQueuedAutomationSaves,
   ]);
 
+  const requestPaseoAutomation = useCallback((
+    operation: "get" | "save",
+    projectId: string,
+    options?: {
+      enabledByUser: boolean;
+      intervalMinutes: PaseoAutomationIntervalMinutes;
+      quotaAware: boolean;
+    },
+  ) => {
+    const requestId = window.crypto.randomUUID();
+    const response = new Promise<PaseoAutomationState>((resolve, reject) => {
+      const timeoutId = window.setTimeout(() => {
+        pendingPaseoAutomationRequestsRef.current.delete(requestId);
+        reject(new Error(textRef.current(
+          "Paseo 自动认领服务没有响应，请稍后重试。",
+          "Paseo auto-claim did not respond. Try again later.",
+        )));
+      }, 15_000);
+      pendingPaseoAutomationRequestsRef.current.set(requestId, { resolve, reject, timeoutId });
+    });
+    postEmbeddedHostMessage({
+      type: "taskboard:paseo-automation-request",
+      payload: {
+        requestId,
+        operation,
+        projectId,
+        ...(options ?? {}),
+      },
+    });
+    return response;
+  }, []);
+
+  const refreshPaseoAutomation = useCallback(async (options: { quiet?: boolean } = {}) => {
+    if (host !== "paseo" || !selectedProject || selectedProject.id === ALL_PROJECTS_ID) return;
+    const requestGate = paseoAutomationRequestGateRef.current!;
+    const requestToken = requestGate.begin(options.quiet === true);
+    if (!requestToken) return;
+    if (!options.quiet) setPaseoAutomationError(null);
+    try {
+      const automation = await requestPaseoAutomation("get", selectedProject.id);
+      if (!requestGate.isCurrent(requestToken)) return;
+      setPaseoAutomations((current) => ({ ...current, [automation.projectId]: automation }));
+      setPaseoAutomationError(null);
+    } catch (error) {
+      if (!requestGate.isCurrent(requestToken)) return;
+      setPaseoAutomationError(error instanceof Error
+        ? error.message
+        : textRef.current("无法读取 Paseo 自动认领状态。", "Could not read Paseo auto-claim status."));
+    } finally {
+      requestGate.end(requestToken);
+    }
+  }, [host, requestPaseoAutomation, selectedProject]);
+
+  const savePaseoAutomation = useCallback(async (options: {
+    enabledByUser: boolean;
+    intervalMinutes: PaseoAutomationIntervalMinutes;
+    quotaAware: boolean;
+  }) => {
+    if (host !== "paseo" || !selectedProject || selectedProject.id === ALL_PROJECTS_ID) return;
+    const requestGate = paseoAutomationRequestGateRef.current!;
+    const requestToken = requestGate.begin(false)!;
+    setPaseoAutomationError(null);
+    try {
+      const automation = await requestPaseoAutomation("save", selectedProject.id, options);
+      if (requestGate.isCurrent(requestToken)) {
+        setPaseoAutomations((current) => ({ ...current, [automation.projectId]: automation }));
+      }
+    } catch (error) {
+      if (requestGate.isCurrent(requestToken)) {
+        setPaseoAutomationError(error instanceof Error
+          ? error.message
+          : textRef.current("无法更新 Paseo 自动认领。", "Could not update Paseo auto-claim."));
+      }
+    } finally {
+      requestGate.end(requestToken);
+    }
+  }, [host, requestPaseoAutomation, selectedProject]);
+
   function openTaskDetail(task: Pick<Task, "identifier" | "projectId">) {
     const fullTask = tasksRef.current.find((candidate) => candidate.identifier === task.identifier);
     if (fullTask) markTaskRead(fullTask);
@@ -1704,6 +2235,22 @@ export function App() {
   }, [tasks]);
 
   useEffect(() => {
+    if (host !== "paseo") return;
+    const decorate = (items: Task[]) => {
+      const next = items.map((task) => decoratePaseoTask(task, paseoAssignments[task.id], paseoProviderIcons));
+      return next.some((task, index) => task !== items[index]) ? sortTasks(next) : items;
+    };
+    setTasks(decorate);
+    setArchivedTasks(decorate);
+  }, [archivedTasks, host, paseoAssignments, paseoProviderIcons, tasks]);
+
+  useEffect(() => {
+    const projectId = editor ? editorProjectId : detailTask?.projectId;
+    if (host !== "paseo" || !projectId || (!editor && !detailTask)) return;
+    refreshPaseoAssignmentOptions(projectId);
+  }, [detailTask?.id, detailTask?.projectId, editor, editorProjectId, embeddedFrameChallenge, host]);
+
+  useEffect(() => {
     if (taskboardStorage.getItem(FIRST_USE_COMPLETE_KEY) === null) {
       taskboardStorage.setItem(FIRST_USE_COMPLETE_KEY, "true");
     }
@@ -1744,9 +2291,13 @@ export function App() {
   }, [projectContextMenu]);
 
   useEffect(() => {
+    if (host === "paseo") {
+      void refreshPaseoAutomation();
+      return;
+    }
     setAutomationError(null);
     void reconcileProjectAutomation();
-  }, [selectedProjectId, reconcileProjectAutomation]);
+  }, [host, selectedProjectId, reconcileProjectAutomation, refreshPaseoAutomation]);
 
   useEffect(() => {
     if (!embedded || window.parent === window) return;
@@ -1814,6 +2365,111 @@ export function App() {
         return;
       }
 
+      if (message.type === "taskboard:paseo-automation-response" && message.payload) {
+        const payload = message.payload as { requestId?: unknown; automation?: unknown; error?: unknown };
+        if (typeof payload.requestId !== "string") return;
+        const pending = pendingPaseoAutomationRequestsRef.current.get(payload.requestId);
+        if (!pending) return;
+        window.clearTimeout(pending.timeoutId);
+        pendingPaseoAutomationRequestsRef.current.delete(payload.requestId);
+        if (typeof payload.error === "string") {
+          pending.reject(new Error(payload.error));
+        } else if (isPaseoAutomationState(payload.automation)) {
+          pending.resolve(payload.automation);
+        } else {
+          pending.reject(new Error(textRef.current(
+            "Paseo 返回了无效的自动认领状态。",
+            "Paseo returned an invalid auto-claim state.",
+          )));
+        }
+        return;
+      }
+
+      if (message.type === "taskboard:paseo-presentations" && message.payload) {
+        const payload = message.payload as { presentations?: unknown };
+        if (!Array.isArray(payload.presentations)) return;
+        const next: Record<string, PaseoAgentPresentation> = {};
+        for (const item of payload.presentations) {
+          if (!item || typeof item !== "object") continue;
+          const presentation = item as Partial<PaseoAgentPresentation> & { taskId?: unknown };
+          if (
+            typeof presentation.taskId !== "string"
+            || typeof presentation.agentId !== "string"
+            || typeof presentation.status !== "string"
+            || typeof presentation.requiresAttention !== "boolean"
+          ) continue;
+          next[presentation.taskId] = {
+            agentId: presentation.agentId,
+            status: presentation.status as PaseoAgentPresentation["status"],
+            requiresAttention: presentation.requiresAttention,
+            attentionReason: presentation.attentionReason ?? null,
+            updatedAt: presentation.updatedAt ?? null,
+            title: presentation.title ?? null,
+          };
+        }
+        setPaseoAgentPresentations(next);
+        return;
+      }
+
+      if (message.type === "taskboard:paseo-assignment-options" && message.payload) {
+        const payload = message.payload as { requestId?: unknown; options?: PaseoAssignmentOptions; error?: unknown };
+        if (payload.requestId !== paseoAssignmentOptionsRequestRef.current) return;
+        setPaseoAssignmentOptionsLoading(false);
+        if (typeof payload.error === "string") {
+          setPaseoAssignmentOptionsError(payload.error);
+          return;
+        }
+        if (payload.options) {
+          setPaseoAssignmentOptions(payload.options);
+          setPaseoAssignmentOptionsError(null);
+        }
+        return;
+      }
+
+      if (message.type === "taskboard:paseo-configuration-options" && message.payload) {
+        const payload = message.payload as { requestId?: unknown; options?: unknown; error?: unknown };
+        if (typeof payload.requestId !== "string") return;
+        const pending = pendingPaseoConfigurationRequestsRef.current.get(payload.requestId);
+        if (!pending) return;
+        window.clearTimeout(pending.timeoutId);
+        pendingPaseoConfigurationRequestsRef.current.delete(payload.requestId);
+        if (typeof payload.error === "string") pending.reject(new Error(payload.error));
+        else if (isPaseoConfigurationOptions(payload.options)) pending.resolve(payload.options);
+        else pending.reject(new Error("Paseo 返回了无效的配置选项。"));
+        return;
+      }
+
+      if (message.type === "taskboard:paseo-task-assignments" && message.payload) {
+        const payload = message.payload as { assignments?: PaseoTaskAssignment[] };
+        if (!Array.isArray(payload.assignments)) return;
+        setPaseoAssignments(Object.fromEntries(payload.assignments.map((assignment) => [assignment.taskId, assignment])));
+        return;
+      }
+
+      if (message.type === "taskboard:paseo-assignment-saved" && message.payload) {
+        const payload = message.payload as { requestId?: unknown; taskId?: unknown; assignment?: PaseoTaskAssignment | null; error?: unknown };
+        if (typeof payload.requestId !== "string") return;
+        const pending = pendingPaseoAssignmentSaveRef.current.get(payload.requestId);
+        if (!pending) {
+          // iframe 已提示“仍在保存”后仍可能收到迟到成功；不可丢掉真实计划映射。
+          const taskId = payload.taskId;
+          if (typeof taskId === "string" && !payload.error) {
+            setPaseoAssignments((current) => {
+              const next = { ...current };
+              if (payload.assignment) next[taskId] = payload.assignment;
+              else delete next[taskId];
+              return next;
+            });
+          }
+          return;
+        }
+        window.clearTimeout(pending.timeoutId);
+        pendingPaseoAssignmentSaveRef.current.delete(payload.requestId);
+        if (typeof payload.error === "string") pending.reject(new Error(payload.error));
+        else pending.resolve(payload.assignment ?? null);
+        return;
+      }
+
       if (message.type !== "taskboard:host-context" || !message.payload) return;
       const payload = message.payload as HostContext;
       setHostContext(payload);
@@ -1837,8 +2493,46 @@ export function App() {
         )));
       }
       pendingAutomationRequestsRef.current.clear();
+      for (const pending of pendingPaseoAutomationRequestsRef.current.values()) {
+        window.clearTimeout(pending.timeoutId);
+        pending.reject(new Error(textRef.current("Paseo 自动认领桥已关闭", "Paseo auto-claim bridge closed.")));
+      }
+      pendingPaseoAutomationRequestsRef.current.clear();
+      for (const pending of pendingPaseoConfigurationRequestsRef.current.values()) {
+        window.clearTimeout(pending.timeoutId);
+        pending.reject(new Error("Paseo 配置桥已关闭。"));
+      }
+      pendingPaseoConfigurationRequestsRef.current.clear();
+      for (const pending of pendingPaseoAssignmentSaveRef.current.values()) {
+        window.clearTimeout(pending.timeoutId);
+        pending.reject(new Error(textRef.current("Paseo 负责人桥已关闭", "Paseo assignee bridge closed.")));
+      }
+      pendingPaseoAssignmentSaveRef.current.clear();
     };
   }, [embedded, host]);
+
+  useEffect(() => {
+    if (host !== "paseo" || !embeddedFrameChallenge || window.parent === window) return;
+    const requestPaseoTaskState = () => {
+      const taskIds = [...tasks, ...archivedTasks].map((task) => task.id).slice(0, 200);
+      if (taskIds.length === 0) {
+        setPaseoAssignments({});
+        setPaseoAgentPresentations({});
+        return;
+      }
+      postEmbeddedHostMessage({
+        type: "taskboard:paseo-presentations-request",
+        payload: { taskIds },
+      });
+      postEmbeddedHostMessage({
+        type: "taskboard:paseo-task-assignments-request",
+        payload: { taskIds },
+      });
+    };
+    requestPaseoTaskState();
+    const timer = window.setInterval(requestPaseoTaskState, 4_000);
+    return () => window.clearInterval(timer);
+  }, [archivedTasks, embeddedFrameChallenge, host, tasks]);
 
   useLayoutEffect(() => {
     if (!embedded || window.parent === window || !dragRegionRef.current) return;
@@ -1986,8 +2680,15 @@ export function App() {
         listArchivedTasks(taskProjectId, options.signal),
       ]);
       if (requestId !== tasksRequestRef.current) return;
-      setTasks(sortTasks(nextTasks));
-      setArchivedTasks(sortTasks(nextArchivedTasks));
+      const decorate = (items: Task[]) => host === "paseo"
+        ? items.map((task) => decoratePaseoTask(
+            task,
+            paseoAssignmentsRef.current[task.id],
+            paseoProviderIconsRef.current,
+          ))
+        : items;
+      setTasks(sortTasks(decorate(nextTasks)));
+      setArchivedTasks(sortTasks(decorate(nextArchivedTasks)));
       setProjects((current) => current.map((project) => {
         if (project.id !== projectId || project.source !== "jira") return project;
         const labels = [...new Set(nextTasks.flatMap((task) => task.labels))];
@@ -2006,7 +2707,7 @@ export function App() {
     } finally {
       if (!options.quiet && requestId === tasksRequestRef.current) setTasksLoading(false);
     }
-  }, []);
+  }, [host]);
 
   useEffect(() => {
     if (!taskScopeProjectId) {
@@ -2020,6 +2721,25 @@ export function App() {
     void refreshTasks(taskScopeProjectId, { signal: controller.signal });
     return () => controller.abort();
   }, [refreshTasks, taskScopeProjectId]);
+
+  useEffect(() => {
+    if (host !== "paseo" || !embeddedFrameChallenge || !taskScopeProjectId) return;
+    const poller = createRefreshPoller({
+      intervalMs: 4_000,
+      refresh: () => Promise.all([
+        refreshTasks(taskScopeProjectId, { quiet: true }),
+        refreshPaseoAutomation({ quiet: true }),
+      ]),
+    });
+    poller.start();
+    return () => poller.stop();
+  }, [
+    embeddedFrameChallenge,
+    host,
+    refreshPaseoAutomation,
+    refreshTasks,
+    taskScopeProjectId,
+  ]);
 
   useEffect(() => {
     const isAllProjectTaskScope = taskScopeProjectId === ALL_PROJECTS_ID;
@@ -2287,11 +3007,54 @@ export function App() {
     ) as Record<TaskStatus, Task[]>;
   }, [filteredTasks]);
 
+  function mainColumnTasks(status: TaskStatus): Task[] {
+    if (!usesPaseoDefaultBoard) return tasksByStatus[status];
+    const statuses = status === "todo"
+      ? ["backlog", "todo"] as const
+      : status === "in_progress"
+        ? ["in_progress", "blocked"] as const
+        : [status] as const;
+    return statuses.flatMap((item) => tasksByStatus[item]).sort((left, right) => (
+      left.sortOrder - right.sortOrder || left.createdAt.localeCompare(right.createdAt)
+    ));
+  }
+
+  function mainColumnLabel(status: TaskStatus): string | undefined {
+    if (!usesPaseoDefaultBoard) return undefined;
+    if (status === "todo") return text("等待认领", "Ideas");
+    if (status === "in_progress") return text("处理中", "In progress");
+    if (status === "in_review") return text("等你确认", "Awaiting review");
+    return undefined;
+  }
+
+  function mainColumnEmptyMessage(status: TaskStatus): string {
+    if (hasActiveTaskFilters) return text("当前筛选下无匹配议题", "No issues match the current filters");
+    if (!usesPaseoDefaultBoard) return text("暂无议题", "No issues");
+    if (status === "todo") return text("当前没有等待认领的议题。", "There are no ideas waiting to be claimed.");
+    if (status === "in_progress") {
+      return text("当前没有进行中的议题，可从等待认领拖入处理中。", "No issues are in progress. Drag an idea here to start it.");
+    }
+    return text("当前没有等待确认的议题。", "There are no issues awaiting review.");
+  }
+
   const mainBoardItems = boardDisplaySettings.mainStatuses.filter(
     (status) => status !== "blocked"
       || !hasLoadedTasks
       || tasks.some((task) => task.status === "blocked"),
   );
+  const mainBoardTaskCount = mainBoardItems.reduce(
+    (count, status) => count + (status === "archived"
+      ? filteredArchivedTasks.length
+      : mainColumnTasks(status).length),
+    0,
+  );
+  const doneTaskCount = tasks.filter((task) => task.status === "done").length;
+  const canceledTaskCount = tasks.filter((task) => task.status === "canceled").length;
+  const archivedTaskCount = archivedTasks.length;
+  const boardScopeLabel = isAllProjects
+    ? text("全部项目", "All projects")
+    : selectedProject?.name ?? text("当前项目", "Current project");
+  const emptyMainBoard = !tasksLoading && mainBoardTaskCount === 0;
   const mainColumnCount = Math.max(mainBoardItems.length, 1);
   const mainBoardMinWidth = (mainColumnCount * 300) + ((mainColumnCount - 1) * 24);
   const mainBoardMaxWidth = (mainColumnCount * 400) + ((mainColumnCount - 1) * 24);
@@ -2311,6 +3074,17 @@ export function App() {
   }, [otherTaskTabsKey, otherTasksAvailable, otherTasksTab]);
 
   const aiThreadsByTask = useMemo(() => indexAiThreadsByTask(aiThreads), [aiThreads]);
+  function paseoWorkspaceDisplay(task: Task, assignment: PaseoTaskAssignment | undefined): TaskCardPresentation["workspaceDisplay"] {
+    const worktreePath = task.developmentContext?.type === "worktree"
+      ? task.developmentContext.path
+      : null;
+    const plannedPath = assignment?.kind === "planned" ? assignment.workspacePath : null;
+    const path = worktreePath ?? plannedPath;
+    const basename = (value: string) => value.replace(/[\\/]+$/, "").split(/[\\/]/).filter(Boolean).at(-1) ?? value;
+    const assignmentName = assignment?.kind === "existing" ? assignment.workspaceName?.trim() : "";
+    const name = assignmentName || (path ? basename(path) : "");
+    return name ? { name, path } : null;
+  }
   const taskPresentations = useMemo(() => Object.fromEntries(tasks.map((task) => {
     const storageKey = issueReadStorageKey(issueReadMode, task);
     const readActivityKey = readActivityKeys[storageKey] ?? taskboardStorage.getItem(storageKey);
@@ -2327,6 +3101,8 @@ export function App() {
       runningNativeThreadId,
       hostContext?.threadTodoProgress ?? null,
       taskThreadId ? codexThreadProgress[taskThreadId] ?? null : undefined,
+      host === "paseo" ? paseoAgentPresentations[task.id] ?? null : null,
+      host === "paseo" ? paseoWorkspaceDisplay(task, paseoAssignments[task.id]) : null,
     )];
   })) as Record<string, TaskCardPresentation>, [
     aiThreadsByTask,
@@ -2335,6 +3111,9 @@ export function App() {
     hostContext?.threadRunning,
     hostContext?.threadTodoProgress,
     issueReadMode,
+    host,
+    paseoAgentPresentations,
+    paseoAssignments,
     readActivityKeys,
     tasks,
   ]);
@@ -2385,6 +3164,32 @@ export function App() {
         ? { ...project, issueCount: project.issueCount + 1 }
         : project
     )));
+    let assignmentStillSaving = false;
+    if (host === "paseo" && createOptions?.paseoAssigneeId) {
+      try {
+        const assignment = await savePaseoTaskAssignment(
+          saved,
+          createOptions.paseoAssigneeId,
+          createOptions.paseoWorkspacePath,
+          {
+            ...(createOptions.paseoModeId ? { modeId: createOptions.paseoModeId } : {}),
+            ...(createOptions.paseoThinkingOptionId
+              ? { thinkingOptionId: createOptions.paseoThinkingOptionId }
+              : {}),
+          },
+        );
+        if (assignment) {
+          setPaseoAssignments((current) => ({ ...current, [saved.id]: assignment }));
+        }
+      } catch (error) {
+        setTasks((current) => sortTasks([...current, saved]));
+        if (error instanceof PaseoAssignmentSavePendingError) {
+          assignmentStillSaving = true;
+        } else {
+          throw new Error(`${saved.identifier} 已创建，但 Paseo 负责人保存失败：${errorMessage(error)}`);
+        }
+      }
+    }
     let postCreateWriteFailed = false;
     if (inlineFiles.length > 0 || inlineImages.length > 0) {
       const [fileResults, inlineResults] = await Promise.all([
@@ -2462,12 +3267,19 @@ export function App() {
       ...(relationWriteFailed ? [{ zh: "关系", en: "relations" }] : []),
       ...(postCreateWriteFailed ? [{ zh: "正文或媒体", en: "description or media" }] : []),
     ];
-    if (!createOptions?.keepOpen || failedWrites.length > 0) setEditor(null);
+    if (!createOptions?.keepOpen || failedWrites.length > 0 || assignmentStillSaving) setEditor(null);
     if (failedWrites.length > 0) {
       setActionError(text(
         `${saved.identifier} 已创建，但以下内容写入失败：${failedWrites.map((failure) => failure.zh).join("、")}。`,
         `${saved.identifier} was created, but these follow-up writes failed: ${failedWrites.map((failure) => failure.en).join(", ")}.`,
       ));
+    }
+    if (assignmentStillSaving) {
+      setActionError(text(
+        `${saved.identifier} 已创建，Paseo 负责人仍在保存；已打开详情，刷新后确认即可，不会重复创建任务。`,
+        `${saved.identifier} was created and its Paseo assignee is still saving. The detail is open; refresh to confirm without creating another task.`,
+      ));
+      requestAnimationFrame(() => openTaskDetail(saved));
     }
     pushUndo(null, async () => {
       const restoredRelations = new Map<string, Task>();
@@ -2617,7 +3429,13 @@ export function App() {
     window.setTimeout(() => {
       setSettlingTaskId((current) => current === task.id ? null : current);
     }, 220);
-    void moveTask(task, destination, beforeTaskId, true);
+    // Paseo 默认列把 blocked 与 in_progress 合在“处理中”；同列排序不可暗中重试 Agent。
+    const effectiveDestination = usesPaseoDefaultBoard
+      && destination === "in_progress"
+      && task.status === "blocked"
+      ? "blocked"
+      : destination;
+    void moveTask(task, effectiveDestination, beforeTaskId, true);
   }
 
   async function updateTaskProperties(task: Task, changes: Partial<TaskDraft>): Promise<Task> {
@@ -2638,7 +3456,12 @@ export function App() {
     ));
 
     try {
-      const updated = await updateTaskRequest(task, { ...taskToDraft(task), ...changes });
+      // 原版详情的状态下拉只修改 status。用 /move 保留 Paseo 父端的自动派发链；
+      // 含其它属性的完整 PATCH 则原样交给 Dashi，不能丢 developmentContext 等字段。
+      const statusOnly = Object.keys(changes).length === 1 && typeof changes.status === "string";
+      const updated = statusOnly
+        ? await moveTaskRequest(task, changes.status!)
+        : await updateTaskRequest(task, { ...taskToDraft(task), ...changes });
       setTasks((current) => sortTasks(current.map((candidate) =>
         candidate.id === updated.id ? updated : candidate,
       )));
@@ -2806,8 +3629,17 @@ export function App() {
     const task = pendingArchivedTaskDelete;
     setActionError(null);
     setDeletingArchivedTaskId(task.id);
+    let archived = task;
     try {
-      await deleteArchivedTaskRequest(task);
+      if (!archived.archivedAt) {
+        archived = await archiveTaskRequest(task);
+        setTasks((current) => current.filter((candidate) => candidate.id !== task.id));
+        setArchivedTasks((current) => sortTasks([
+          ...current.filter((candidate) => candidate.id !== archived.id),
+          archived,
+        ]));
+      }
+      await deleteArchivedTaskRequest(archived);
       setArchivedTasks((current) => current.filter((candidate) => candidate.id !== task.id));
       setPendingArchivedTaskDelete(null);
       setAnnouncement(text(
@@ -2815,12 +3647,19 @@ export function App() {
         `${task.identifier} was permanently deleted.`,
       ));
     } catch (error) {
-      setActionError(error instanceof ApiError && error.code === "VERSION_CONFLICT"
+      const message = error instanceof ApiError && error.code === "VERSION_CONFLICT"
         ? text(
           "该议题已在其他位置更新，看板已重新同步。",
           "This issue changed elsewhere. The board has been synced.",
         )
-        : errorMessage(error));
+        : archived.archivedAt && !task.archivedAt
+          ? text(
+            `${task.identifier} 已归档，但永久删除失败；可在已归档列表中重试。`,
+            `${task.identifier} was archived, but permanent deletion failed. Retry it from Archived.`,
+          )
+          : errorMessage(error);
+      setActionError(message);
+      if (archived.archivedAt && !task.archivedAt) setPendingArchivedTaskDelete(null);
       if (taskScopeProjectId) void refreshTasks(taskScopeProjectId, { quiet: true });
     } finally {
       setDeletingArchivedTaskId(null);
@@ -2914,6 +3753,13 @@ export function App() {
   }
 
   function openTaskConversation(conversation: TaskConversationItem) {
+    if (conversation.kind === "paseo" && conversation.paseoAgentId) {
+      postEmbeddedHostMessage({
+        type: "taskboard:open-paseo-agent",
+        payload: { agentId: conversation.paseoAgentId },
+      });
+      return;
+    }
     if (conversation.kind === "local-ai" && conversation.aiThreadId) {
       aiOpenThreadRequestSequenceRef.current += 1;
       setAiOpenThreadRequest({
@@ -3466,13 +4312,41 @@ export function App() {
           <div className="header-actions">
             {selectedProject && (
               <ProjectAutomationMenu
-                automation={selectedProjectAutomation}
-                models={automationModels}
-                pending={automationPending || automationCatalogLoading}
-                error={automationCatalogError ?? automationError}
-                unavailableReason={automationProjectContext.unavailableReason}
-                onOpen={() => void reconcileProjectAutomation()}
-                onChange={(options) => void saveProjectAutomation(options)}
+                automation={host === "paseo" ? selectedPaseoAutomation : selectedProjectAutomation}
+                models={host === "paseo" ? undefined : automationModels}
+                mode={host === "paseo" ? "paseo" : "codex"}
+                pending={host === "paseo"
+                  ? paseoAutomationPending
+                  : automationPending || automationCatalogLoading}
+                error={host === "paseo"
+                  ? paseoAutomationError
+                  : automationCatalogError ?? automationError}
+                unavailableReason={host === "paseo"
+                  ? selectedProjectId === ALL_PROJECTS_ID
+                    ? text("请选择具体项目", "Select a specific project")
+                    : null
+                  : automationProjectContext.unavailableReason}
+                onOpen={() => {
+                  if (host === "paseo") void refreshPaseoAutomation();
+                  else void reconcileProjectAutomation();
+                }}
+                onChange={(options) => {
+                  if (host === "paseo") {
+                    void savePaseoAutomation({
+                      enabledByUser: options.enabledByUser,
+                      intervalMinutes: options.intervalMinutes,
+                      quotaAware: options.quotaAware,
+                    });
+                  } else if (options.model && options.reasoningEffort) {
+                    void saveProjectAutomation({
+                      enabledByUser: options.enabledByUser,
+                      intervalMinutes: options.intervalMinutes,
+                      quotaAware: options.quotaAware,
+                      model: options.model,
+                      reasoningEffort: options.reasoningEffort,
+                    });
+                  }
+                }}
               />
             )}
             {isJiraProject && (
@@ -3613,21 +4487,6 @@ export function App() {
                 onReset={resetProjectBoardDisplaySettings}
               />
             )}
-            {boardView === "issues" && otherTasksAvailable && (
-              <button
-                className={`other-tasks-trigger${otherTasksOpen ? " is-open" : ""}`}
-                type="button"
-                aria-controls="other-tasks-panel"
-                aria-expanded={otherTasksOpen}
-                aria-label={otherTasksOpen
-                  ? text("关闭其他任务", "Close other issues")
-                  : text("打开其他任务", "Open other issues")}
-                title={text("其他任务", "Other issues")}
-                onClick={() => setOtherTasksOpen((current) => !current)}
-              >
-                <TaskboardIcon name="panel" />
-              </button>
-            )}
           </div>}
         </div>}
 
@@ -3679,6 +4538,56 @@ export function App() {
             onCopy={(text, message) => void copyText(text, message)}
             openingThread={openingThreadTaskId === detailTask.id}
             onError={setActionError}
+            paseoAssignment={host === "paseo" ? paseoAssignments[detailTask.id] ?? null : null}
+            paseoPresentation={host === "paseo" ? paseoAgentPresentations[detailTask.id] ?? null : null}
+            onOpenPaseoAgent={host === "paseo" ? (agentId) => {
+              postEmbeddedHostMessage({
+                type: "taskboard:open-paseo-agent",
+                payload: { agentId },
+              });
+            } : undefined}
+            paseoAssignee={host === "paseo" ? {
+              options: paseoAssigneeChoices.options,
+              value: paseoAssignmentValue(detailTask),
+              loading: paseoAssignmentOptionsLoading,
+              error: paseoAssignmentOptionsError,
+              onRefresh: () => refreshPaseoAssignmentOptions(detailTask.projectId),
+              onChange: (choiceId) => {
+                const currentAssignment = paseoAssignments[detailTask.id];
+                const choice = paseoAssigneeChoices.choices.get(choiceId);
+                const workspacePath = choice?.kind === "planned"
+                  ? (currentAssignment?.kind === "planned"
+                    ? currentAssignment.workspacePath
+                    : paseoAssignmentOptions?.workspaces.find((workspace) => workspace.path === paseoAssignmentOptions.defaultWorkspacePath)?.path ?? null)
+                  : undefined;
+                void changePaseoTaskAssignment(detailTask, choiceId, workspacePath ?? undefined);
+              },
+            } : undefined}
+            paseoConfiguration={host === "paseo" ? (() => {
+              const assignment = paseoAssignments[detailTask.id];
+              const target = configurationTargetForAssignment(assignment);
+              if (!target) return undefined;
+              return {
+                target,
+                loadOptions: loadPaseoConfigurationOptions,
+                ...(assignment?.kind === "planned" ? {
+                  onSave: async (selection: PaseoConfigurationSelection) => {
+                    const choiceId = paseoAssignmentValue(detailTask);
+                    if (!choiceId.startsWith("paseo:profile:") && !choiceId.startsWith("paseo:model:")) {
+                      throw new Error("当前 Agent 计划已不在可用目录中，请重新选择负责人。");
+                    }
+                    await changePaseoTaskAssignment(
+                      detailTask,
+                      choiceId,
+                      assignment.workspacePath,
+                      selection,
+                      true,
+                    );
+                  },
+                } : {}),
+              };
+            })() : undefined}
+            paseoWorktree={host === "paseo"}
           />
         ) : boardView !== "readme"
           && hasLoadedTasks
@@ -3769,7 +4678,7 @@ export function App() {
           </Suspense>
         ) : (
           <div
-            className={`issue-board-layout${otherTasksAvailable && otherTasksVisible ? " has-other-tasks" : ""}`}
+            className={`issue-board-layout${otherTasksAvailable && otherTasksOpen ? " has-other-tasks" : ""}${emptyMainBoard ? " is-empty-main-board" : ""}`}
             data-main-columns={mainBoardItems.length}
             style={{
               "--main-column-count": mainColumnCount,
@@ -3789,6 +4698,49 @@ export function App() {
             ) : (
               <>
                 <div ref={boardScrollRef} className="board-scroll" aria-label={text("议题看板", "Issue board")}>
+                  <div className="board-context-summary" aria-live="polite">
+                    <div className="board-context-primary">
+                      <strong>{boardScopeLabel}</strong>
+                      <span>{text(`未归档议题 ${tasks.length} 个，主看板显示 ${mainBoardTaskCount} 个。`, `${tasks.length} unarchived issues; ${mainBoardTaskCount} shown on the main board.`)}</span>
+                    </div>
+                    {otherTasksAvailable && (
+                      <div className="board-context-terminal-actions" aria-label={text("终态任务入口", "Terminal issue shortcuts")}>
+                        {otherTaskTabs.includes("done") && (
+                          <button
+                            type="button"
+                            className={`board-terminal-chip status-done${otherTasksOpen && otherTasksTab === "done" ? " is-active" : ""}`}
+                            aria-controls="other-tasks-panel"
+                            aria-pressed={otherTasksOpen && otherTasksTab === "done"}
+                            onClick={() => { setOtherTasksTab("done"); setOtherTasksOpen(true); }}
+                          >
+                            <span>{text("已完成", "Done")}</span><b>{doneTaskCount}</b>
+                          </button>
+                        )}
+                        {otherTaskTabs.includes("canceled") && (
+                          <button
+                            type="button"
+                            className={`board-terminal-chip status-canceled${otherTasksOpen && otherTasksTab === "canceled" ? " is-active" : ""}`}
+                            aria-controls="other-tasks-panel"
+                            aria-pressed={otherTasksOpen && otherTasksTab === "canceled"}
+                            onClick={() => { setOtherTasksTab("canceled"); setOtherTasksOpen(true); }}
+                          >
+                            <span>{text("已取消", "Canceled")}</span><b>{canceledTaskCount}</b>
+                          </button>
+                        )}
+                        {otherTaskTabs.includes("archived") && (
+                          <button
+                            type="button"
+                            className={`board-terminal-chip status-archived${otherTasksOpen && otherTasksTab === "archived" ? " is-active" : ""}`}
+                            aria-controls="other-tasks-panel"
+                            aria-pressed={otherTasksOpen && otherTasksTab === "archived"}
+                            onClick={() => { setOtherTasksTab("archived"); setOtherTasksOpen(true); }}
+                          >
+                            <span>{text("已归档", "Archived")}</span><b>{archivedTaskCount}</b>
+                          </button>
+                        )}
+                      </div>
+                    )}
+                  </div>
                   <div className="board">
                     {mainBoardItems.map((item) => item === "archived" ? (
                       <ArchivedTasksColumn
@@ -3807,11 +4759,10 @@ export function App() {
                           boardColumnScrollRefs.current[item] = element;
                         }}
                         status={item}
-                        tasks={tasksByStatus[item]}
+                        label={mainColumnLabel(item)}
+                        tasks={mainColumnTasks(item)}
                         presentations={taskPresentations}
-                        emptyMessage={hasActiveTaskFilters
-                          ? text("当前筛选下无匹配议题", "No issues match the current filters")
-                          : text("暂无议题", "No issues")}
+                        emptyMessage={mainColumnEmptyMessage(item)}
                         isDropTarget={dropTarget === item}
                         draggedTaskId={draggedTaskId}
                         draggedTaskHeight={draggedTaskHeight}
@@ -4066,9 +5017,12 @@ export function App() {
               `永久删除 ${pendingArchivedTaskDelete.identifier}？`,
               `Permanently delete ${pendingArchivedTaskDelete.identifier}?`,
             )}</h2>
-            <p>{text(
+            <p>{pendingArchivedTaskDelete.archivedAt ? text(
               `“${pendingArchivedTaskDelete.title}”及其评论和附件将被永久删除，此操作无法撤销。`,
               `“${pendingArchivedTaskDelete.title}” and its comments and attachments will be permanently deleted. This cannot be undone.`,
+            ) : text(
+              `“${pendingArchivedTaskDelete.title}”将先归档，再永久删除其评论和附件；此操作无法撤销。`,
+              `“${pendingArchivedTaskDelete.title}” will be archived first, then its comments and attachments will be permanently deleted. This cannot be undone.`,
             )}</p>
             <div>
               <button
@@ -4112,6 +5066,26 @@ export function App() {
           currentUser={currentUser}
           developmentScan={developmentScan}
           developmentScanLoading={developmentScanLoading}
+          paseoAssignee={host === "paseo" ? {
+            options: paseoAssigneeChoices.options,
+            loading: paseoAssignmentOptionsLoading,
+            error: paseoAssignmentOptionsError,
+            onRefresh: refreshPaseoAssignmentOptions,
+          } : undefined}
+          paseoConfiguration={host === "paseo" ? {
+            loadOptions: loadPaseoConfigurationOptions,
+            onOpenAgent: (agentId) => {
+              postEmbeddedHostMessage({
+                type: "taskboard:open-paseo-agent",
+                payload: { agentId },
+              });
+            },
+          } : undefined}
+          paseoWorkspaces={host === "paseo"
+            ? (paseoAssignmentOptions?.workspaces ?? []).flatMap((workspace) => workspace.path ? [{ ...workspace, path: workspace.path }] : [])
+            : undefined}
+          paseoDefaultWorkspacePath={host === "paseo" ? paseoAssignmentOptions?.defaultWorkspacePath ?? null : undefined}
+          paseoWorktree={host === "paseo" ? { onCreated: () => {} } : undefined}
           onCreateLabel={(label) => persistProjectLabel(label, editorProjectId ?? selectedProjectId)}
           onCancel={(draft) => {
             setNewTaskDraft(draft ? {
@@ -4146,6 +5120,7 @@ export function App() {
           openInThreadDisabled={developmentScanLoading}
           onOpenInThread={openTaskInThread}
           onArchive={(task) => void archiveTask(task)}
+          onDelete={setPendingArchivedTaskDelete}
         />
       )}
 
