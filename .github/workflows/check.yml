@@ -328,8 +328,10 @@ jobs:
           shared-key: windows-x64
           cache-bin: false
       - run: npm ci
+      - name: Prepare Paseo plugin dependencies
+        run: npm ci --ignore-scripts --prefix integrations/paseo
       - name: Run the Windows Node.js test suite
-        run: npm ci --ignore-scripts --prefix integrations/paseo && npm test
+        run: npm test
       - name: Build the unsigned NSIS installer
         run: npm run app:build:windows
       - name: Preserve the unsigned NSIS installer
