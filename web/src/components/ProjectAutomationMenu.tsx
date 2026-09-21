@@ -1,7 +1,14 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import type {
+  PaseoAgentProfile,
+} from "../paseo-bridge";
 import { LinearIcon } from "./LinearIcon";
 import { ProjectIcon, RecurrenceIcon } from "./SemanticIcons";
+import {
+  PaseoProjectDefaultsDialog,
+  type PaseoProjectDefaultsCatalog,
+} from "./PaseoProjectDefaultsDialog";
 import { TaskPropertyPicker } from "./TaskPropertyPicker";
 import { TaskboardIcon } from "./TaskboardIcon";
 import { useTaskboardI18n } from "../i18n";
@@ -18,6 +25,8 @@ export interface AutomationOptions {
   intervalMinutes: IntervalMinutes;
   model?: string;
   reasoningEffort?: string;
+  workspacePath?: string | null;
+  profile?: PaseoAgentProfile | null;
 }
 
 interface AutomationState extends AutomationOptions {
@@ -42,7 +51,9 @@ interface ProjectAutomationMenuProps {
   error: string | null;
   unavailableReason: string | null;
   onOpen: () => void;
-  onChange: (options: AutomationOptions) => void;
+  onChange: (options: AutomationOptions) => void | Promise<boolean | void>;
+  onSaveDefaults?: (value: { profile: PaseoAgentProfile | null; workspacePath: string | null }) => Promise<boolean | void>;
+  paseoDefaults?: PaseoProjectDefaultsCatalog;
 }
 
 const EFFORT_LABELS: Record<string, readonly [string, string]> = {
@@ -84,12 +95,15 @@ export function ProjectAutomationMenu({
   unavailableReason,
   onOpen,
   onChange,
+  onSaveDefaults,
+  paseoDefaults,
 }: ProjectAutomationMenuProps) {
   const { locale, text } = useTaskboardI18n();
   const triggerRef = useRef<HTMLButtonElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const wasPendingRef = useRef(pending);
   const [open, setOpen] = useState(false);
+  const [defaultsOpen, setDefaultsOpen] = useState(false);
   const [pickerMenu, setPickerMenu] = useState<"interval" | "model" | "reasoning" | null>(null);
   const [position, setPosition] = useState({ left: 0, top: 0, ready: false });
   const [draft, setDraft] = useState<AutomationOptions>(() => automationOptions(models, automation));
@@ -165,6 +179,12 @@ export function ProjectAutomationMenu({
     setDraft(next);
     onChange(next);
   };
+
+  function openDefaultConfiguration() {
+    if (!paseoDefaults) return;
+    setOpen(false);
+    setDefaultsOpen(true);
+  }
 
   const menu = open ? createPortal(
     <div
@@ -263,6 +283,30 @@ export function ProjectAutomationMenu({
           })}
         />
       </div>
+      {paseoMode && paseoDefaults && (
+        <div className="project-automation-defaults">
+          <div>
+            <strong>{text("默认执行配置", "Default execution")}</strong>
+            {automation?.profile || automation?.workspacePath ? (
+              <span title={automation.workspacePath ?? undefined}>{[
+                automation.profile?.name ?? text("项目默认 Agent", "Project default Agent"),
+                automation.profile?.thinkingOptionId ? `Thinking ${automation.profile.thinkingOptionId}` : null,
+                automation.profile?.modeId ? `Mode ${automation.profile.modeId}` : null,
+                automation.workspacePath
+                  ? automation.workspacePath.split(/[\\/]/).filter(Boolean).at(-1) ?? automation.workspacePath
+                  : text("执行时决定目录", "Directory chosen at execution"),
+              ].filter(Boolean).join(" · ")}</span>
+            ) : (
+              <span>{text("未设置；任务自己的执行配置优先。", "Not set; task-level configuration takes priority.")}</span>
+            )}
+          </div>
+          <button type="button" disabled={disabled} onClick={openDefaultConfiguration}>
+            {automation?.profile || automation?.workspacePath
+              ? text("修改默认配置", "Edit defaults")
+              : text("设置默认配置", "Set defaults")}
+          </button>
+        </div>
+      )}
       {!paseoMode && selectedModel && (
         <>
           <div className="project-automation-field">
@@ -331,6 +375,31 @@ export function ProjectAutomationMenu({
     document.body,
   ) : null;
 
+  const defaultsDialog = defaultsOpen && paseoDefaults ? (
+    <PaseoProjectDefaultsDialog
+      title={text("默认执行配置", "Default execution configuration")}
+      description={text(
+        "手动开始和自动认领共用；任务自己的执行配置优先。",
+        "Shared by manual start and auto-claim; task-level settings take priority.",
+      )}
+      value={{
+        profile: automation?.profile ?? null,
+        workspacePath: automation?.workspacePath ?? null,
+      }}
+      catalog={paseoDefaults}
+      onClose={() => setDefaultsOpen(false)}
+      onSave={(value) => onSaveDefaults
+        ? onSaveDefaults(value)
+        : onChange({
+            enabledByUser: automation?.enabledByUser ?? false,
+            quotaAware: automation?.quotaAware ?? false,
+            intervalMinutes: automation?.intervalMinutes ?? 5,
+            workspacePath: value.workspacePath,
+            profile: value.profile,
+          })}
+    />
+  ) : null;
+
   return (
     <>
       <button
@@ -360,6 +429,7 @@ export function ProjectAutomationMenu({
           : text("自动化", "Automation")}</span>
       </button>
       {menu}
+      {defaultsDialog}
     </>
   );
 }

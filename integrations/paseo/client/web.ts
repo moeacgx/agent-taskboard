@@ -2,6 +2,7 @@ import { createElement, useEffect, useRef, useState } from "react";
 import { Platform } from "react-native";
 import type { PluginTheme } from "@getpaseo/plugin";
 import { useRpc } from "@getpaseo/plugin/client";
+import { copyText as copyTextToClipboard } from "@getpaseo/plugin/client/react-native";
 
 import * as contracts from "../shared/contracts";
 import type { Task } from "../shared/contracts";
@@ -12,9 +13,38 @@ import type { PluginLayout } from "./types";
 import type { BoardTaskAction } from "./TaskList";
 
 declare const window: {
+  location: { href: string };
+  open(url: string, target?: string, features?: string): unknown;
   addEventListener(type: "message", listener: (event: any) => void): void;
   removeEventListener(type: "message", listener: (event: any) => void): void;
 };
+
+const PRIVATE_ROUTE_PARAMS = ["channel", "nonce", "token", "access_token", "challenge"] as const;
+
+function readHostIssueRoute(): { projectId: string | null; issueIdentifier: string | null } {
+  try {
+    const url = new URL(window.location.href);
+    return {
+      projectId: url.searchParams.get("project")?.trim() || null,
+      issueIdentifier: url.searchParams.get("issue")?.trim().toUpperCase() || null,
+    };
+  } catch {
+    return { projectId: null, issueIdentifier: null };
+  }
+}
+
+function buildHostIssueLink(projectId: string, identifier: string): string {
+  const url = new URL(window.location.href);
+  if (url.protocol === "about:" || url.hostname === "paseo-taskboard.invalid") {
+    throw new Error("当前 Paseo 宿主没有可重新打开的页面链接。");
+  }
+  url.username = "";
+  url.password = "";
+  for (const key of PRIVATE_ROUTE_PARAMS) url.searchParams.delete(key);
+  url.searchParams.set("project", projectId);
+  url.searchParams.set("issue", identifier.toUpperCase());
+  return url.toString();
+}
 
 /** 为 srcDoc 会话生成不可预测的消息通道和挑战值。 */
 function secureFrameToken(): string {
@@ -24,6 +54,17 @@ function secureFrameToken(): string {
 }
 
 /** Paseo 0.8 的 PluginTheme 未暴露 appearance，只能从表面色推断明暗。 */
+function isAllowedPluginReleaseUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:"
+      && url.hostname === "github.com"
+      && (url.pathname === "/moeacgx/agent-taskboard" || url.pathname.startsWith("/moeacgx/agent-taskboard/"));
+  } catch {
+    return false;
+  }
+}
+
 function originalAppTheme(surface: string): "light" | "dark" {
   const hex = surface.trim().replace(/^#/, "");
   if (!/^[\da-f]{3}(?:[\da-f]{3})?$/i.test(hex)) return "light";
@@ -134,12 +175,14 @@ export function OriginalTaskboardFrame(props: { theme: PluginTheme; layout: Plug
   const listBindings = useRpc(contracts.listBindings);
   const bindExistingPaseoAgent = useRpc(contracts.bindExistingPaseoAgent);
   const saveTaskExecutionPlan = useRpc(contracts.saveTaskExecutionPlan);
+  const mergePaseoIdeas = useRpc(contracts.mergePaseoIdeas);
   const getPaseoTaskAssignments = useRpc(contracts.getPaseoTaskAssignments);
   const clearPaseoTaskAssignment = useRpc(contracts.clearPaseoTaskAssignment);
   const inspectPaseoWorktree = useRpc(contracts.inspectPaseoWorktree);
   const createPaseoWorktree = useRpc(contracts.createPaseoWorktree);
   const getPaseoAutomation = useRpc(contracts.getPaseoAutomation);
   const savePaseoAutomation = useRpc(contracts.savePaseoAutomation);
+  const savePaseoProjectDefaults = useRpc(contracts.savePaseoProjectDefaults);
   const frameRef = useRef<any>(null);
   const startingTaskIds = useRef(new Set<string>());
   const presentationRequestSequence = useRef(0);
@@ -163,6 +206,7 @@ export function OriginalTaskboardFrame(props: { theme: PluginTheme; layout: Plug
           language: "zh-CN",
           projectId: null,
           projects: [],
+          route: readHostIssueRoute(),
         },
       });
     }
@@ -275,6 +319,40 @@ export function OriginalTaskboardFrame(props: { theme: PluginTheme; layout: Plug
         }
         return;
       }
+      if (message.type === "taskboard:paseo-open-url" && message.challenge === nonce) {
+        const payload = message.payload as Record<string, unknown> | null;
+        if (typeof payload?.url !== "string" || !isAllowedPluginReleaseUrl(payload.url)) return;
+        window.open(payload.url, "_blank", "noopener,noreferrer");
+        return;
+      }
+      if (message.type === "taskboard:paseo-copy-request" && message.challenge === nonce) {
+        const payload = message.payload as Record<string, unknown> | null;
+        const requestId = payload?.requestId;
+        if (typeof requestId !== "string") return;
+        void (async () => {
+          try {
+            let copiedText: string;
+            if (payload?.kind === "text" && typeof payload.text === "string" && payload.text.length > 0) {
+              copiedText = payload.text;
+            } else if (
+              payload?.kind === "issue-link"
+              && typeof payload.projectId === "string"
+              && payload.projectId.trim().length > 0
+              && typeof payload.identifier === "string"
+              && payload.identifier.trim().length > 0
+            ) {
+              copiedText = buildHostIssueLink(payload.projectId.trim(), payload.identifier.trim());
+            } else {
+              throw new Error("无效的复制请求。");
+            }
+            await copyTextToClipboard(copiedText);
+            post({ type: "taskboard:paseo-copy-response", payload: { requestId, copiedText } });
+          } catch (error) {
+            post({ type: "taskboard:paseo-copy-response", payload: { requestId, error: error instanceof Error ? error.message : String(error) } });
+          }
+        })();
+        return;
+      }
       if (message.type === "taskboard:paseo-presentations-request" && message.challenge === nonce) {
         const payload = message.payload as Record<string, unknown> | null;
         const taskIds = Array.isArray(payload?.taskIds)
@@ -330,11 +408,16 @@ export function OriginalTaskboardFrame(props: { theme: PluginTheme; layout: Plug
         const provider = payload?.provider;
         const model = payload?.model;
         const workspacePath = payload?.workspacePath;
-        if (typeof requestId !== "string" || typeof provider !== "string" || typeof model !== "string" || typeof workspacePath !== "string") return;
+        if (
+          typeof requestId !== "string"
+          || typeof provider !== "string"
+          || typeof model !== "string"
+          || (workspacePath !== undefined && workspacePath !== null && typeof workspacePath !== "string")
+        ) return;
         void getPaseoConfigurationOptions({
           provider,
           model,
-          workspacePath,
+          ...(workspacePath === undefined ? {} : { workspacePath: workspacePath as string | null }),
           ...(typeof payload?.agentId === "string" ? { agentId: payload.agentId } : {}),
           ...(typeof payload?.modeId === "string" ? { modeId: payload.modeId } : {}),
           ...(typeof payload?.thinkingOptionId === "string" ? { thinkingOptionId: payload.thinkingOptionId } : {}),
@@ -388,6 +471,8 @@ export function OriginalTaskboardFrame(props: { theme: PluginTheme; layout: Plug
         const requestId = payload?.requestId;
         const operation = payload?.operation;
         const projectId = payload?.projectId;
+        const hasWorkspacePath = Boolean(payload && Object.hasOwn(payload, "workspacePath"));
+        const hasProfile = Boolean(payload && Object.hasOwn(payload, "profile"));
         if (typeof requestId !== "string" || typeof projectId !== "string") return;
         const request = operation === "get"
           ? getPaseoAutomation({ projectId })
@@ -395,11 +480,18 @@ export function OriginalTaskboardFrame(props: { theme: PluginTheme; layout: Plug
             && typeof payload?.enabledByUser === "boolean"
             && typeof payload?.intervalMinutes === "number"
             && typeof payload?.quotaAware === "boolean"
+            && hasWorkspacePath === hasProfile
             ? savePaseoAutomation({
               projectId,
               enabledByUser: payload.enabledByUser,
               intervalMinutes: payload.intervalMinutes as 5 | 10 | 15 | 30 | 60,
               quotaAware: payload.quotaAware,
+              ...(hasWorkspacePath && hasProfile
+                ? {
+                  workspacePath: typeof payload.workspacePath === "string" ? payload.workspacePath : null,
+                  profile: payload.profile && typeof payload.profile === "object" ? payload.profile as never : null,
+                }
+                : {}),
             })
             : null;
         if (!request) {
@@ -412,6 +504,36 @@ export function OriginalTaskboardFrame(props: { theme: PluginTheme; layout: Plug
         );
         return;
       }
+      if (message.type === "taskboard:paseo-project-defaults-save" && message.challenge === nonce) {
+        const payload = message.payload as Record<string, unknown> | null;
+        const requestId = payload?.requestId;
+        const projectId = payload?.projectId;
+        const workspacePath = payload?.workspacePath;
+        const profile = payload?.profile;
+        if (
+          typeof requestId !== "string"
+          || typeof projectId !== "string"
+          || (workspacePath !== null && typeof workspacePath !== "string")
+          || (profile !== null && (typeof profile !== "object" || !profile))
+        ) return;
+        void savePaseoProjectDefaults({
+          projectId,
+          workspacePath,
+          profile: profile as never,
+        }).then(
+          (result) => post({
+            type: "taskboard:paseo-project-defaults-saved",
+            challenge: nonce,
+            payload: { requestId, projectId: result.projectId, automation: result.automation },
+          }),
+          (error: unknown) => post({
+            type: "taskboard:paseo-project-defaults-saved",
+            challenge: nonce,
+            payload: { requestId, projectId, error: error instanceof Error ? error.message : String(error) },
+          }),
+        );
+        return;
+      }
       if (message.type === "taskboard:paseo-assignment-save" && message.challenge === nonce) {
         const payload = message.payload as Record<string, unknown> | null;
         const requestId = payload?.requestId;
@@ -421,13 +543,100 @@ export function OriginalTaskboardFrame(props: { theme: PluginTheme; layout: Plug
         if (typeof requestId !== "string" || typeof taskId !== "string" || typeof projectId !== "string" || !choice || typeof choice.kind !== "string") return;
         const save = choice.kind === "existing" && typeof choice.agentId === "string"
           ? bindExistingPaseoAgent({ taskId, agentId: choice.agentId })
-          : choice.kind === "planned" && typeof choice.workspacePath === "string" && choice.profile && typeof choice.profile === "object"
-            ? saveTaskExecutionPlan({ taskId, projectId, workspacePath: choice.workspacePath, profile: choice.profile as never })
+          : choice.kind === "planned"
+            && (choice.workspacePath === null || typeof choice.workspacePath === "string")
+            && (choice.profile === null || (choice.profile && typeof choice.profile === "object"))
+            ? saveTaskExecutionPlan({
+              taskId,
+              projectId,
+              workspacePath: choice.workspacePath as string | null,
+              profile: choice.profile as never,
+              ...(choice.replaceWorkspace === true ? { replaceWorkspace: true } : {}),
+            })
             : clearPaseoTaskAssignment({ taskId }).then(() => ({ assignment: null }));
-        void save.then(
-          (result) => post({ type: "taskboard:paseo-assignment-saved", payload: { requestId, taskId, assignment: result.assignment } }),
-          (error: unknown) => post({ type: "taskboard:paseo-assignment-saved", payload: { requestId, taskId, error: error instanceof Error ? error.message : String(error) } }),
-        );
+        void (async () => {
+          try {
+            const result = await save;
+            let fullTask: unknown = null;
+            if ("task" in result) {
+              const refreshed = await bridgeRequest({
+                method: "GET",
+                path: `/api/tasks/${encodeURIComponent(taskId)}`,
+                headers: {},
+                body: null,
+              });
+              const value = refreshed.body.kind === "json" ? refreshed.body.value : null;
+              fullTask = value && typeof value === "object" && "task" in value
+                ? (value as { task: unknown }).task
+                : null;
+              if (refreshed.status < 200 || refreshed.status >= 300 || !fullTask) {
+                throw new Error("执行配置已保存，但无法读取任务的完整数据；请刷新看板。");
+              }
+            }
+            post({
+              type: "taskboard:paseo-assignment-saved",
+              payload: { requestId, taskId, assignment: result.assignment, ...(fullTask ? { task: fullTask } : {}) },
+            });
+          } catch (error) {
+            post({ type: "taskboard:paseo-assignment-saved", payload: { requestId, taskId, error: error instanceof Error ? error.message : String(error) } });
+          }
+        })();
+        return;
+      }
+      if (message.type === "taskboard:paseo-merge-ideas-request" && message.challenge === nonce) {
+        const payload = message.payload as Record<string, unknown> | null;
+        const requestId = payload?.requestId;
+        const operationId = payload?.operationId;
+        const projectId = payload?.projectId;
+        const sourceTaskIds = payload?.sourceTaskIds;
+        const title = payload?.title;
+        const workspacePath = payload?.workspacePath;
+        const profile = payload?.profile;
+        if (
+          typeof requestId !== "string"
+          || typeof operationId !== "string"
+          || typeof projectId !== "string"
+          || !Array.isArray(sourceTaskIds)
+          || !sourceTaskIds.every((taskId) => typeof taskId === "string")
+          || typeof title !== "string"
+          || typeof workspacePath !== "string"
+          || !profile
+          || typeof profile !== "object"
+        ) return;
+        void (async () => {
+          try {
+            const result = await mergePaseoIdeas({
+              operationId,
+              projectId,
+              sourceTaskIds: sourceTaskIds as string[],
+              title,
+              ...(typeof payload?.description === "string" ? { description: payload.description } : {}),
+              workspacePath,
+              profile: profile as never,
+            });
+            // RPC 的 TaskSchema 只覆盖插件所需字段；原版 React 状态还需要
+            // participants、relations、attachments 等完整 Dashi task。
+            const refreshed = await bridgeRequest({
+              method: "GET",
+              path: `/api/tasks/${encodeURIComponent(result.task.id)}`,
+              headers: {},
+              body: null,
+            });
+            const value = refreshed.body.kind === "json" ? refreshed.body.value : null;
+            const fullTask = value && typeof value === "object" && "task" in value
+              ? (value as { task: unknown }).task
+              : null;
+            if (refreshed.status < 200 || refreshed.status >= 300 || !fullTask) {
+              throw new Error("合并已完成，但无法读取新任务的完整数据；请刷新看板。");
+            }
+            post({
+              type: "taskboard:paseo-merge-ideas",
+              payload: { requestId, ...result, task: fullTask },
+            });
+          } catch (error) {
+            post({ type: "taskboard:paseo-merge-ideas", payload: { requestId, error: error instanceof Error ? error.message : String(error) } });
+          }
+        })();
         return;
       }
       if (message.type !== "paseo-taskboard:request" || message.channel !== channel || message.nonce !== nonce || typeof message.requestId !== "string" || typeof message.method !== "string" || typeof message.path !== "string") return;
@@ -448,12 +657,50 @@ export function OriginalTaskboardFrame(props: { theme: PluginTheme; layout: Plug
           : null,
       }).then(
         (result) => post({ type: "paseo-taskboard:response", channel, nonce, requestId: message.requestId, ...result }),
-        (error: unknown) => post({ type: "paseo-taskboard:response", channel, nonce, requestId: message.requestId, status: 502, body: { error: { code: "BRIDGE_FAILURE", message: error instanceof Error ? error.message : String(error) } } }),
+        (error: unknown) => {
+          const messageText = error instanceof Error ? error.message : String(error);
+          if (message.method === "GET" && requestPath === "/api/plugin-update") {
+            post({
+              type: "paseo-taskboard:response",
+              channel,
+              nonce,
+              requestId: message.requestId,
+              status: 200,
+              headers: { "content-type": "application/json" },
+              body: {
+                kind: "json",
+                value: {
+                  status: "unavailable",
+                  updateAvailable: false,
+                  currentVersion: "0.1.0",
+                  latestVersion: null,
+                  publishedAt: null,
+                  title: null,
+                  notes: null,
+                  htmlUrl: "https://github.com/moeacgx/agent-taskboard/releases",
+                  guideUrl: "https://github.com/moeacgx/agent-taskboard/blob/HEAD/integrations/paseo/README.md",
+                  checkedAt: new Date().toISOString(),
+                  error: messageText,
+                },
+              },
+            });
+            return;
+          }
+          post({
+            type: "paseo-taskboard:response",
+            channel,
+            nonce,
+            requestId: message.requestId,
+            status: 502,
+            headers: { "content-type": "application/json" },
+            body: { kind: "json", value: { error: { code: "BRIDGE_FAILURE", message: messageText } } },
+          });
+        },
       );
     }
     window.addEventListener("message", receive);
     return () => window.removeEventListener("message", receive);
-  }, [bindExistingPaseoAgent, bridgeRequest, channel, clearPaseoTaskAssignment, createPaseoWorktree, getBinding, getPaseoAutomation, getPaseoConfigurationOptions, getPaseoPresentations, getPaseoTaskAssignments, getTask, hostTheme, inspectPaseoWorktree, listBindings, listPaseoAssignmentOptions, moveTaskBoard, nonce, props.navigation, savePaseoAutomation, saveTaskExecutionPlan]);
+  }, [bindExistingPaseoAgent, bridgeRequest, channel, clearPaseoTaskAssignment, createPaseoWorktree, getBinding, getPaseoAutomation, getPaseoConfigurationOptions, getPaseoPresentations, getPaseoTaskAssignments, getTask, hostTheme, inspectPaseoWorktree, listBindings, listPaseoAssignmentOptions, mergePaseoIdeas, moveTaskBoard, nonce, props.navigation, savePaseoAutomation, savePaseoProjectDefaults, saveTaskExecutionPlan]);
 
   useEffect(() => {
     frameRef.current?.contentWindow?.postMessage({ type: "taskboard:theme", theme: hostTheme }, "*");

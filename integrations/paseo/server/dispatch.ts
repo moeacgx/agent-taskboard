@@ -16,6 +16,13 @@ export function hasDispatchConfiguration(settings: TaskDispatchConfiguration | n
   return Boolean(settings?.workspacePath && settings.profile?.provider);
 }
 
+export function hasTaskDispatchConfiguration(
+  task: Pick<Task, "developmentContext">,
+  settings: TaskDispatchConfiguration | null,
+): boolean {
+  return Boolean(settings?.profile?.provider && (settings.workspacePath || task.developmentContext?.type === "worktree"));
+}
+
 /** Keeps one move-triggered send in flight per task, without serializing unrelated tasks. */
 export function createTaskDispatchCoordinator() {
   const active = new Map<string, Promise<unknown>>();
@@ -209,8 +216,8 @@ export async function dispatchBoundTask(
   // Agent 也必须打开 daemon 已登记的 Worktree，而不能回退到项目默认 cwd。
   const workspacePath = task.developmentContext?.type === "worktree"
     ? task.developmentContext.path
-    : settings?.workspacePath;
-  const profile = settings?.profile;
+    : settings?.workspacePath ?? null;
+  const profile = settings?.profile ?? null;
   if (!workspacePath || !profile) {
     return {
       kind: "needs_configuration",

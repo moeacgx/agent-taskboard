@@ -25,6 +25,7 @@ import type {
   ProjectReadme,
   ProjectReadmeAttachment,
   ProjectSummary,
+  PluginUpdateStatus,
   Task,
   TaskChangeActivity,
   TaskboardMetadata,
@@ -88,7 +89,7 @@ export function resolveTaskboardWebSocketUrl(path: string): string {
 }
 
 /** Paseo 使用自身的 workspace/agent 绑定，不能读取原版 Codex 本机状态。 */
-function isPaseoEmbeddedHost(): boolean {
+export function isPaseoEmbeddedHost(): boolean {
   return new URL(document.baseURI).searchParams.get("host") === "paseo";
 }
 
@@ -218,6 +219,13 @@ export async function getProjectSummary(
     `/api/local/projects/${encodeURIComponent(projectId)}/summary`,
     { signal },
   );
+}
+
+export async function getPluginUpdateStatus(
+  options: { refresh?: boolean; signal?: AbortSignal } = {},
+): Promise<PluginUpdateStatus> {
+  const query = options.refresh ? "?refresh=1" : "";
+  return request<PluginUpdateStatus>(`/api/plugin-update${query}`, { signal: options.signal });
 }
 
 export async function getTaskboardMetadata(signal?: AbortSignal): Promise<TaskboardMetadata> {
@@ -519,6 +527,14 @@ export async function createProject(input: {
   return data.project;
 }
 
+export async function updateProjectName(projectId: string, name: string): Promise<Project> {
+  const data = await request<{ project: Project }>(`/api/projects/${encodeURIComponent(projectId)}`, {
+    method: "PATCH",
+    body: JSON.stringify({ name }),
+  });
+  return data.project;
+}
+
 export async function createProjectLabel(projectId: string, label: string): Promise<Project> {
   const data = await request<{ project: Project }>(
     `/api/projects/${encodeURIComponent(projectId)}/labels`,
@@ -618,6 +634,14 @@ export async function updateTask(task: Task, draft: TaskDraft, threadId?: string
   const data = await request<{ task: Task }>(`/api/tasks/${encodeURIComponent(task.id)}`, {
     method: "PATCH",
     body: JSON.stringify({ version: task.version, ...draft, ...(threadId ? { threadId } : {}) }),
+  });
+  return data.task;
+}
+
+export async function moveTaskToProject(task: Task, projectId: string): Promise<Task> {
+  const data = await request<{ task: Task }>(`/api/tasks/${encodeURIComponent(task.id)}`, {
+    method: "PATCH",
+    body: JSON.stringify({ version: task.version, projectId }),
   });
   return data.task;
 }

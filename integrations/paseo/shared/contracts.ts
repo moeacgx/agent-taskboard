@@ -192,6 +192,8 @@ export type ProjectAutomationSettings = z.infer<typeof ProjectAutomationSettings
 
 export const PaseoAutomationStateSchema = z.object({
   projectId: z.string(),
+  workspacePath: z.string().nullable(),
+  profile: AgentProfileConfigSchema.nullable(),
   enabledByUser: z.boolean(),
   intervalMinutes: z.union([z.literal(5), z.literal(10), z.literal(15), z.literal(30), z.literal(60)]),
   quotaAware: z.boolean(),
@@ -203,12 +205,15 @@ export const PaseoAutomationStateSchema = z.object({
 });
 export type PaseoAutomationState = z.infer<typeof PaseoAutomationStateSchema>;
 
-/** 新建 Agent 的任务级计划：保存配置但不创建、不发送，拖入处理中时才真正执行。 */
+/**
+ * 新建 Agent 的任务级计划：保存配置但不创建、不发送，拖入处理中时才真正执行。
+ * workspacePath/profile 为 null 表示该字段继承当前项目 defaults；双 null 不会清除项目 defaults。
+ */
 export const TaskExecutionPlanSchema = z.object({
   taskId: z.string(),
   projectId: z.string(),
-  workspacePath: z.string().min(1),
-  profile: AgentProfileConfigSchema,
+  workspacePath: z.string().min(1).nullable(),
+  profile: AgentProfileConfigSchema.nullable(),
   updatedAt: z.string(),
 });
 export type TaskExecutionPlan = z.infer<typeof TaskExecutionPlanSchema>;
@@ -269,8 +274,8 @@ export const PaseoConfigurationOptionsSchema = z.object({
 export type PaseoConfigurationOptions = z.infer<typeof PaseoConfigurationOptionsSchema>;
 
 export const PaseoTaskAssignmentSchema = z.discriminatedUnion("kind", [
-  z.object({ kind: z.literal("existing"), taskId: z.string(), agentId: z.string(), workspaceId: z.string(), workspaceName: z.string().nullable(), provider: z.string(), model: z.string().nullable(), title: z.string().nullable(), status: z.enum(["initializing", "idle", "running", "error", "closed", "unavailable"]) }),
-  z.object({ kind: z.literal("planned"), taskId: z.string(), workspacePath: z.string(), profile: AgentProfileConfigSchema }),
+  z.object({ kind: z.literal("existing"), taskId: z.string(), agentId: z.string(), workspaceId: z.string(), workspaceName: z.string().nullable(), workspacePath: z.string().nullable(), provider: z.string(), model: z.string().nullable(), title: z.string().nullable(), status: z.enum(["initializing", "idle", "running", "error", "closed", "unavailable"]) }),
+  z.object({ kind: z.literal("planned"), taskId: z.string(), workspacePath: z.string().nullable(), profile: AgentProfileConfigSchema.nullable() }),
 ]);
 export type PaseoTaskAssignment = z.infer<typeof PaseoTaskAssignmentSchema>;
 
@@ -484,8 +489,33 @@ export const savePaseoAutomation = defineRpc({
     enabledByUser: z.boolean(),
     intervalMinutes: z.union([z.literal(5), z.literal(10), z.literal(15), z.literal(30), z.literal(60)]),
     quotaAware: z.boolean(),
+    workspacePath: z.string().min(1).max(4_096).nullable().optional(),
+    profile: AgentProfileConfigSchema.nullable().optional(),
+  }).superRefine((value, context) => {
+    const hasWorkspacePath = Object.hasOwn(value, "workspacePath");
+    const hasProfile = Object.hasOwn(value, "profile");
+    if (
+      hasWorkspacePath !== hasProfile
+      || (hasWorkspacePath && value.workspacePath !== null && value.profile === null)
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "workspacePath 与 profile 必须同时设置或同时清空",
+      });
+    }
   }),
   output: z.object({ automation: PaseoAutomationStateSchema }),
+});
+
+/** 仅保存项目默认 Agent 配置；不修改自动化开关、间隔，不创建或派发 Agent。 */
+export const savePaseoProjectDefaults = defineRpc({
+  name: "dashi.save-paseo-project-defaults",
+  input: z.object({
+    projectId: z.string(),
+    workspacePath: z.string().min(1).max(4_096).nullable(),
+    profile: AgentProfileConfigSchema.nullable(),
+  }),
+  output: z.object({ projectId: z.string(), automation: PaseoAutomationStateSchema }),
 });
 
 /** 读取当前 daemon 的真实未归档会话，及可用于“新建 Agent”的真实 profile/workspace。 */
@@ -508,7 +538,7 @@ export const getPaseoConfigurationOptions = defineRpc({
   input: z.object({
     provider: z.string().min(1),
     model: z.string().min(1),
-    workspacePath: z.string().min(1),
+    workspacePath: z.string().min(1).nullable().optional(),
     agentId: z.string().min(1).optional(),
     modeId: z.string().min(1).optional(),
     thinkingOptionId: z.string().min(1).optional(),
@@ -523,11 +553,31 @@ export const bindExistingPaseoAgent = defineRpc({
   output: z.object({ assignment: PaseoTaskAssignmentSchema }),
 });
 
-/** 创建任务后保存新 Agent 的计划；不会创建 Agent 或发送消息。 */
+/** 创建任务后保存新 Agent 的计划；不会创建 Agent 或发送消息。null 字段按项目 defaults 继承。 */
 export const saveTaskExecutionPlan = defineRpc({
   name: "dashi.save-task-execution-plan",
-  input: TaskExecutionPlanSchema.omit({ updatedAt: true }),
-  output: z.object({ assignment: PaseoTaskAssignmentSchema }),
+  input: TaskExecutionPlanSchema.omit({ updatedAt: true }).extend({ replaceWorkspace: z.boolean().optional() }),
+  output: z.object({ assignment: PaseoTaskAssignmentSchema, task: TaskSchema }),
+});
+
+/** 合并等待认领想法；operationId 同时是预分配的新任务 UUID。 */
+export const mergePaseoIdeas = defineRpc({
+  name: "dashi.merge-paseo-ideas",
+  input: z.object({
+    operationId: z.string().uuid(),
+    projectId: z.string(),
+    sourceTaskIds: z.array(z.string()).min(2).max(50),
+    title: z.string().min(1).max(240),
+    description: z.string().max(100_000).optional(),
+    workspacePath: z.string().min(1).max(4_096),
+    profile: AgentProfileConfigSchema,
+  }),
+  output: z.object({
+    task: TaskSchema,
+    assignment: PaseoTaskAssignmentSchema,
+    sourceTaskIds: z.array(z.string()),
+    replayed: z.boolean(),
+  }),
 });
 
 export const getPaseoTaskAssignments = defineRpc({

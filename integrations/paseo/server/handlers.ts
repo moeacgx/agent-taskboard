@@ -1,4 +1,5 @@
 import type { PluginServerContext } from "@getpaseo/plugin/server";
+import { Buffer } from "node:buffer";
 import { execFile as execFileCallback } from "node:child_process";
 import { realpath, stat } from "node:fs/promises";
 import path from "node:path";
@@ -8,10 +9,11 @@ import * as contracts from "../shared/contracts.ts";
 import type { BindingsStore } from "./bindings.ts";
 import * as dashi from "./dashi-api.ts";
 import { performWriteback } from "./writeback.ts";
-import { assertAgentCanLeaveProcessing, buildTaskContinuationPrompt, buildTaskPrompt, canStartTaskDispatch, createTaskDispatchCoordinator, dispatchBoundTask, hasDispatchConfiguration, recordDispatchFailure, type TaskDispatchCoordinator, type TaskMutationLock } from "./dispatch.ts";
+import { assertAgentCanLeaveProcessing, buildTaskContinuationPrompt, buildTaskPrompt, canStartTaskDispatch, createTaskDispatchCoordinator, dispatchBoundTask, hasTaskDispatchConfiguration, recordDispatchFailure, type TaskDispatchCoordinator, type TaskMutationLock } from "./dispatch.ts";
 import type { SettingsStore } from "./settings.ts";
 import type { TaskPlansStore } from "./task-plans.ts";
 import type { PaseoAutomationRuntime } from "./automation.ts";
+import { handlePluginUpdateBridge } from "./plugin-update.ts";
 
 const PROVIDER_ICON_MAX_CHARS = 16_000;
 const OPTIONAL_PROVIDER_READ_TIMEOUT_MS = 5_000;
@@ -117,9 +119,9 @@ async function optionalFeatureDefaults(
 /** 保存计划不应等待 provider discovery；菜单选择时已经验证过 provider/model。 */
 async function optionalProviderSnapshot(
   paseo: import("@getpaseo/client").PaseoApi,
-  workspacePath: string,
+  workspacePath: string | null,
 ): Promise<Awaited<ReturnType<import("@getpaseo/client").PaseoApi["providers"]["snapshot"]>> | null> {
-  return optionalProviderRead(paseo.providers.snapshot({ cwd: workspacePath }));
+  return optionalProviderRead(paseo.providers.snapshot(workspacePath ? { cwd: workspacePath } : undefined));
 }
 
 /** Registers every `dashi.*` RPC handler. Called once from `index.server.ts`. */
@@ -137,6 +139,16 @@ export function registerHandlers(
 
   function withTaskMutation<T>(taskId: string, operation: () => Promise<T>): Promise<T> {
     return mutationLock ? mutationLock.run(taskId, operation) : operation();
+  }
+
+  function withTaskMutations<T>(taskIds: readonly string[], operation: () => Promise<T>): Promise<T> {
+    const ordered = [...new Set(taskIds)].sort();
+    const run = (index: number): Promise<T> => (
+      index >= ordered.length
+        ? operation()
+        : withTaskMutation(ordered[index], () => run(index + 1))
+    );
+    return run(0);
   }
 
   async function inspectWorktree(workspacePathInput: string): Promise<contracts.PaseoWorktreeScan> {
@@ -205,20 +217,27 @@ export function registerHandlers(
     await assertWorktreeCompatibleWithTask(paseo, taskId, context.path);
   }
 
+  async function listAllPaseoWorkspaces(
+    paseo: import("@getpaseo/client").PaseoApi,
+  ): Promise<import("@getpaseo/client").PaseoWorkspace[]> {
+    const entries: import("@getpaseo/client").PaseoWorkspace[] = [];
+    let cursor: string | undefined;
+    do {
+      const page = await paseo.workspaces.list({
+        page: { limit: 200, ...(cursor ? { cursor } : {}) },
+      });
+      entries.push(...page.entries);
+      cursor = page.pageInfo.hasMore ? page.pageInfo.nextCursor ?? undefined : undefined;
+    } while (cursor);
+    return entries;
+  }
+
   /** 只读 daemon 快照；负责人列表绝不创建会话、发送消息或改任务状态。 */
   async function assignmentCatalog(
     paseo: import("@getpaseo/client").PaseoApi,
     projectWorkspacePath: string | null,
   ) {
-    const workspaceEntries: import("@getpaseo/client").PaseoWorkspace[] = [];
-    let workspaceCursor: string | undefined;
-    do {
-      const page = await paseo.workspaces.list({
-        page: { limit: 200, ...(workspaceCursor ? { cursor: workspaceCursor } : {}) },
-      });
-      workspaceEntries.push(...page.entries);
-      workspaceCursor = page.pageInfo.hasMore ? page.pageInfo.nextCursor ?? undefined : undefined;
-    } while (workspaceCursor);
+    const workspaceEntries = await listAllPaseoWorkspaces(paseo);
 
     const [agentResult, projectResult, configResult, availability, snapshot] = await Promise.all([
       paseo.agents.list({ filter: { includeArchived: false }, page: { limit: 200 } }),
@@ -351,9 +370,10 @@ export function registerHandlers(
    */
   async function resolveCatalogModelProfile(
     paseo: import("@getpaseo/client").PaseoApi,
-    workspacePath: string,
-    profile: contracts.AgentProfileConfig,
-  ): Promise<contracts.AgentProfileConfig> {
+    workspacePath: string | null,
+    profile: contracts.AgentProfileConfig | null,
+  ): Promise<contracts.AgentProfileConfig | null> {
+    if (!profile) return null;
     if (!profile.id.startsWith("paseo-catalog-model:")) return profile;
     if (!profile.model) throw new Error("所选 Paseo 模型缺少模型标识，请刷新后重试。");
 
@@ -371,14 +391,14 @@ export function registerHandlers(
     const thinkingOptionId = profile.thinkingOptionId
       ?? model?.defaultThinkingOptionId
       ?? model?.thinkingOptions?.find((option) => option.isDefault)?.id;
-    const featureValues = entry?.status === "ready" && model
+    const featureValues = entry?.status === "ready" && model && workspacePath
       ? await optionalFeatureDefaults(paseo, {
         provider: `${profile.provider}/${model.id}`,
         cwd: workspacePath,
         ...(modeId ? { modeId } : {}),
         ...(thinkingOptionId ? { thinkingOptionId } : {}),
       })
-      : undefined;
+      : profile.featureValues;
     return {
       // 显式选择的 Mode/Thinking 优先；只有未选择时才补当前 workspace 的 SDK 默认值。
       // 用户已有 Profile 不走此分支，保持原样。
@@ -402,10 +422,69 @@ export function registerHandlers(
       agentId: binding.agentId,
       workspaceId: binding.workspaceId,
       workspaceName: agent?.workspaceName ?? null,
+      workspacePath: agent?.cwd.trim() || null,
       provider: agent?.provider ?? binding.provider,
       model: agent?.model ?? binding.agentModel,
       title: agent?.title ?? binding.agentTitle,
       status: agent?.status ?? "unavailable",
+    };
+  }
+
+  async function assertKnownPaseoWorkspacePath(
+    paseo: import("@getpaseo/client").PaseoApi,
+    workspacePath: string,
+  ): Promise<void> {
+    const projects = await paseo.projects.list();
+    if (projects.projects.some((project) => equalPath(project.projectRootPath, workspacePath))) return;
+    let cursor: string | undefined;
+    do {
+      const page = await paseo.workspaces.list({
+        page: { limit: 200, ...(cursor ? { cursor } : {}) },
+      });
+      if (page.entries.some((workspace) => (
+        typeof workspace.workspaceDirectory === "string"
+        && equalPath(workspace.workspaceDirectory, workspacePath)
+      ))) return;
+      cursor = page.pageInfo.hasMore ? page.pageInfo.nextCursor ?? undefined : undefined;
+    } while (cursor);
+    throw new Error("所选目录不是当前 Paseo 中的 Project 根目录或 Workspace，请刷新后重新选择。");
+  }
+
+  function automationState(
+    projectId: string,
+    current: contracts.ProjectAutomationSettings | null,
+  ): contracts.PaseoAutomationState {
+    return {
+      projectId,
+      workspacePath: current?.workspacePath ?? null,
+      profile: current?.profile ?? null,
+      enabledByUser: current?.enabledByUser ?? false,
+      intervalMinutes: current?.intervalMinutes ?? 5,
+      quotaAware: false,
+      status: current?.enabledByUser ? "ACTIVE" : "PAUSED",
+      schedulerReady: automationRuntime?.ready() ?? false,
+      quotaAvailable: false,
+      lastRunAt: current?.lastRunAt ?? null,
+      lastError: current?.lastError ?? null,
+    };
+  }
+
+  async function taskDispatchConfiguration(task: contracts.Task): Promise<{ workspacePath: string | null; profile: contracts.AgentProfileConfig | null }> {
+    const plan = await plans.get(task.id);
+    const configured = await settings.get(task.projectId);
+    let projectWorkspacePath = configured?.workspacePath ?? null;
+    let projectProfile = configured?.profile ?? null;
+    // 只有 settings 尚不存在时兼容旧 Dashi 项目 workspacePath。
+    // settings 存在且默认字段为 null，表示用户明确清除默认值。
+    if (!configured) {
+      const { projects } = await dashi.listProjects(baseUrl);
+      projectWorkspacePath = projects.find((project) => project.id === task.projectId)?.workspacePath ?? null;
+    }
+    return {
+      workspacePath: task.developmentContext?.type === "worktree"
+        ? task.developmentContext.path
+        : plan?.workspacePath ?? projectWorkspacePath,
+      profile: plan?.profile ?? projectProfile,
     };
   }
 
@@ -422,11 +501,9 @@ export function registerHandlers(
   ) {
     const current = await dashi.getTask(baseUrl, input.id);
     const wantsStart = input.status === "in_progress" && current.task.status !== "in_progress";
-    const projectSettings = wantsStart
-      ? (await plans.get(input.id)) ?? await settings.get(current.task.projectId)
-      : null;
+    const projectSettings = wantsStart ? await taskDispatchConfiguration(current.task) : null;
     const binding = wantsStart ? await bindings.get(input.id) : null;
-    if (wantsStart && !binding && !hasDispatchConfiguration(projectSettings)) {
+    if (wantsStart && !binding && !hasTaskDispatchConfiguration(current.task, projectSettings)) {
       return {
         task: current.task,
         dispatch: "needs_configuration" as const,
@@ -494,17 +571,28 @@ export function registerHandlers(
       throw new Error("当前 Git HEAD 处于分离状态，不能据此创建新分支。 ");
     }
 
-    const existing = await paseo.workspaces.list({ page: { limit: 200 } });
-    const sourceWorkspace = existing.entries.find((workspace) => (
-      typeof workspace.workspaceDirectory === "string" && equalPath(workspace.workspaceDirectory, gitRoot)
+    const [projectResult, workspaceEntries] = await Promise.all([
+      paseo.projects.list(),
+      listAllPaseoWorkspaces(paseo),
+    ]);
+    const isSelectedSource = (candidate: string) => (
+      equalPath(candidate, input.workspacePath) || equalPath(candidate, gitRoot)
+    );
+    const sourceProject = projectResult.projects.find((project) => (
+      isSelectedSource(project.projectRootPath)
     ));
+    const sourceWorkspace = workspaceEntries.find((workspace) => (
+      typeof workspace.workspaceDirectory === "string" && isSelectedSource(workspace.workspaceDirectory)
+    ));
+    // 同一路径优先使用 Project 身份；Workspace 仅作为没有 Project 根匹配时的后备来源。
+    const sourceProjectId = sourceProject?.projectId ?? sourceWorkspace?.projectId;
     // worktreeSlug 只是 daemon 管理路径的稳定名称，不接受也不解释为用户自定义绝对路径。
     const worktreeSlug = input.branch.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "worktree";
     const source = input.branchMode === "new"
       ? {
         kind: "worktree" as const,
         cwd: gitRoot,
-        ...(sourceWorkspace?.projectId ? { projectId: sourceWorkspace.projectId } : {}),
+        ...(sourceProjectId ? { projectId: sourceProjectId } : {}),
         action: "branch-off" as const,
         baseBranch: scan.head!,
         branchName: input.branch,
@@ -513,7 +601,7 @@ export function registerHandlers(
       : {
         kind: "worktree" as const,
         cwd: gitRoot,
-        ...(sourceWorkspace?.projectId ? { projectId: sourceWorkspace.projectId } : {}),
+        ...(sourceProjectId ? { projectId: sourceProjectId } : {}),
         action: "checkout" as const,
         refName: input.branch,
         worktreeSlug,
@@ -533,43 +621,204 @@ export function registerHandlers(
 
   server.handle(contracts.bridgeRequest, async (input, { paseo }) => {
     automationRuntime?.attach(paseo);
+    const pluginUpdate = await handlePluginUpdateBridge(input);
+    if (pluginUpdate) return pluginUpdate;
     const path = input.path.split("?", 1)[0];
     const match = /^\/api\/tasks\/([^/]+)(?:\/(archive|restore))?$/.exec(path);
     const taskId = match ? decodeURIComponent(match[1]) : null;
     const forward = async () => {
-    if (match && input.method === "PATCH" && input.body?.kind === "text") {
-      let body: { status?: unknown; developmentContext?: unknown } | null = null;
-      try {
-        body = JSON.parse(input.body.value) as { status?: unknown; developmentContext?: unknown };
-      } catch {
-        // Dashi 仍会为无效 JSON/字段给出原始 API 错误；此处只处理已确认的 worktree 切换。
-      }
-      if (body && typeof body.status === "string") {
-        const current = await dashi.getTask(baseUrl, taskId!);
-        if (body.status !== current.task.status) {
-          return {
-            status: 409,
-            headers: { "content-type": "application/json" },
-            body: {
-              kind: "json" as const,
-              value: { error: {
-                code: "TASK_STATUS_REQUIRES_MOVE",
-                message: "任务状态必须通过移动接口更新，以执行 Paseo Agent 状态与权限门禁。",
-              } },
-            },
-          };
+      if (match && input.method === "PATCH" && input.body) {
+        let body: Record<string, unknown> | null = null;
+        try {
+          const text = input.body.kind === "text"
+            ? input.body.value
+            : Buffer.from(input.body.value, "base64").toString("utf8");
+          const parsed = JSON.parse(text) as unknown;
+          if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
+            body = parsed as Record<string, unknown>;
+          }
+        } catch {
+          // Dashi 仍会为无效 JSON/字段给出原始 API 错误。
+        }
+
+        let current: contracts.Task | null = null;
+        const readCurrent = async () => {
+          current ??= (await dashi.getTask(baseUrl, taskId!)).task;
+          return current;
+        };
+        if (body && typeof body.status === "string") {
+          const task = await readCurrent();
+          if (body.status !== task.status) {
+            return {
+              status: 409,
+              headers: { "content-type": "application/json" },
+              body: {
+                kind: "json" as const,
+                value: { error: {
+                  code: "TASK_STATUS_REQUIRES_MOVE",
+                  message: "任务状态必须通过移动接口更新，以执行 Paseo Agent 状态与权限门禁。",
+                } },
+              },
+            };
+          }
+        }
+        if (body && "developmentContext" in body) {
+          const context = contracts.DevelopmentContextSchema.safeParse(body.developmentContext);
+          if (context.success) await assertDevelopmentContextCompatible(paseo, taskId!, context.data);
+        }
+        if (body && typeof body.projectId === "string") {
+          const task = await readCurrent();
+          const targetProjectId = body.projectId;
+          if (targetProjectId !== task.projectId) {
+            if (!Number.isInteger(body.version) || body.version !== task.version) {
+              return {
+                status: 409,
+                headers: { "content-type": "application/json" },
+                body: {
+                  kind: "json" as const,
+                  value: { error: {
+                    code: "VERSION_CONFLICT",
+                    message: "任务已被其他操作更新，请刷新后重试。",
+                    details: { expectedVersion: body.version, actualVersion: task.version },
+                  } },
+                },
+              };
+            }
+            const target = (await dashi.listProjects(baseUrl)).projects.find((project) => project.id === targetProjectId);
+            if (!target) {
+              return {
+                status: 404,
+                headers: { "content-type": "application/json" },
+                body: { kind: "json" as const, value: { error: {
+                  code: "PROJECT_NOT_FOUND",
+                  message: "目标项目不存在，请刷新项目列表后重试。",
+                } } },
+              };
+            }
+            if (task.source !== "local" || target.source !== "local") {
+              return {
+                status: 409,
+                headers: { "content-type": "application/json" },
+                body: { kind: "json" as const, value: { error: {
+                  code: "PROJECT_MOVE_UNAVAILABLE",
+                  message: "只能在本地项目之间移动议题，Jira 同步议题或项目不支持此操作。",
+                } } },
+              };
+            }
+            try {
+              await assertTaskAgentIdle(paseo, taskId!);
+            } catch (error) {
+              return {
+                status: 409,
+                headers: { "content-type": "application/json" },
+                body: { kind: "json" as const, value: { error: {
+                  code: "TASK_AGENT_BUSY",
+                  message: error instanceof Error ? error.message : String(error),
+                } } },
+              };
+            }
+
+            const previousPlan = await plans.get(taskId!);
+            const previousBinding = await bindings.get(taskId!);
+            const setProjectMetadata = async (projectId: string) => {
+              if (previousPlan) await plans.setProjectId(taskId!, projectId);
+              if (previousBinding) await bindings.setProjectId(taskId!, projectId);
+            };
+            const restoreProjectMetadata = async (cause: unknown) => {
+              const failures: unknown[] = [];
+              if (previousBinding) {
+                try { await bindings.setProjectId(taskId!, previousBinding.projectId); } catch (error) { failures.push(error); }
+              }
+              if (previousPlan) {
+                try { await plans.setProjectId(taskId!, previousPlan.projectId); } catch (error) { failures.push(error); }
+              }
+              if (failures.length > 0) {
+                throw new AggregateError([cause, ...failures], "议题移动失败，且 Paseo 负责人元数据恢复失败。请刷新后检查任务归属。 ");
+              }
+            };
+
+            try {
+              await setProjectMetadata(targetProjectId);
+            } catch (error) {
+              await restoreProjectMetadata(error);
+              throw error;
+            }
+
+            const reconcileUncertainResult = async (cause: unknown) => {
+              let actual: contracts.Task;
+              try {
+                actual = (await dashi.getTask(baseUrl, taskId!)).task;
+              } catch (confirmationError) {
+                return {
+                  status: 502,
+                  headers: { "content-type": "application/json" },
+                  body: { kind: "json" as const, value: { error: {
+                    code: "TASK_PROJECT_MOVE_UNCONFIRMED",
+                    message: "移动请求的结果暂时无法确认，Paseo 已保留目标项目配置；请刷新任务后再操作，避免重复移动。",
+                    details: {
+                      requestError: cause instanceof Error ? cause.message : String(cause),
+                      confirmationError: confirmationError instanceof Error ? confirmationError.message : String(confirmationError),
+                    },
+                  } } },
+                };
+              }
+              try {
+                await setProjectMetadata(actual.projectId);
+              } catch (metadataError) {
+                throw new AggregateError(
+                  [cause, metadataError],
+                  `任务当前属于项目 ${actual.projectId}，但 Paseo 负责人元数据同步失败。请刷新后重试。`,
+                );
+              }
+              if (actual.projectId === targetProjectId) {
+                return {
+                  status: 200,
+                  headers: { "content-type": "application/json" },
+                  body: { kind: "json" as const, value: { task: actual } },
+                };
+              }
+              if (actual.projectId === task.projectId) {
+                return {
+                  status: 502,
+                  headers: { "content-type": "application/json" },
+                  body: { kind: "json" as const, value: { error: {
+                    code: "TASK_PROJECT_MOVE_FAILED",
+                    message: "议题未移动到目标项目，请稍后重试。",
+                    details: { requestError: cause instanceof Error ? cause.message : String(cause) },
+                  } } },
+                };
+              }
+              return {
+                status: 409,
+                headers: { "content-type": "application/json" },
+                body: { kind: "json" as const, value: { error: {
+                  code: "TASK_PROJECT_CHANGED",
+                  message: "任务归属在移动期间发生变化，已按真实项目同步 Paseo 配置；请刷新后继续。",
+                  details: { currentProjectId: actual.projectId },
+                } } },
+              };
+            };
+
+            let response: Awaited<ReturnType<typeof dashi.bridgeRequest>>;
+            try {
+              response = await dashi.bridgeRequest(baseUrl, input);
+            } catch (error) {
+              return reconcileUncertainResult(error);
+            }
+            if (response.status >= 400 && response.status < 500) {
+              await restoreProjectMetadata(new Error(`Dashi PATCH failed with HTTP ${response.status}`));
+            } else if (response.status >= 500) {
+              return reconcileUncertainResult(new Error(`Dashi PATCH failed with HTTP ${response.status}`));
+            }
+            return response;
+          }
         }
       }
-      if (body && "developmentContext" in body) {
-        const context = contracts.DevelopmentContextSchema.safeParse(body.developmentContext);
-        if (context.success) await assertDevelopmentContextCompatible(paseo, taskId!, context.data);
+      // 原版 iframe 也必须经过同一运行态门禁，不能借通用 HTTP 桥绕过归档/删除保护。
+      if (match && (input.method === "DELETE" || (input.method === "POST" && match[2] === "archive"))) {
+        await assertTaskAgentIdle(paseo, taskId!);
       }
-    }
-    // 原版 iframe 也必须经过同一运行态门禁，不能借通用 HTTP 桥绕过归档/删除保护。
-    if (match && (input.method === "DELETE" || (input.method === "POST" && match[2] === "archive"))) {
-      await assertTaskAgentIdle(paseo, taskId!);
-    }
-    return dashi.bridgeRequest(baseUrl, input);
+      return dashi.bridgeRequest(baseUrl, input);
     };
     const taskMutation = taskId !== null && (
       input.method === "PATCH"
@@ -628,9 +877,9 @@ export function registerHandlers(
   server.handle(contracts.retryTaskDispatch, async ({ id, version }, { paseo }) => {
     return withTaskMutation(id, async () => {
     const current = await dashi.getTask(baseUrl, id);
-    const projectSettings = (await plans.get(id)) ?? await settings.get(current.task.projectId);
+    const projectSettings = await taskDispatchConfiguration(current.task);
     const binding = await bindings.get(id);
-    if (!binding && !hasDispatchConfiguration(projectSettings)) {
+    if (!binding && !hasTaskDispatchConfiguration(current.task, projectSettings)) {
       return { task: current.task, dispatch: "needs_configuration" as const, dispatchMessage: "请先在项目设置中配置默认工作区和 Agent Profile。" };
     }
     const readiness = await canStartTaskDispatch(paseo, bindings, id);
@@ -719,17 +968,7 @@ export function registerHandlers(
   server.handle(contracts.getPaseoAutomation, async ({ projectId }, { paseo }) => {
     automationRuntime?.attach(paseo);
     const current = await settings.get(projectId);
-    return { automation: {
-      projectId,
-      enabledByUser: current?.enabledByUser ?? false,
-      intervalMinutes: current?.intervalMinutes ?? 5,
-      quotaAware: false,
-      status: current?.enabledByUser ? "ACTIVE" as const : "PAUSED" as const,
-      schedulerReady: automationRuntime?.ready() ?? false,
-      quotaAvailable: false as const,
-      lastRunAt: current?.lastRunAt ?? null,
-      lastError: current?.lastError ?? null,
-    } };
+    return { automation: automationState(projectId, current) };
   });
 
   server.handle(contracts.savePaseoAutomation, async (input, { paseo }) => {
@@ -737,10 +976,27 @@ export function registerHandlers(
     if (input.quotaAware) throw new Error("当前 Paseo SDK 无法可靠读取 provider 额度，额度开关暂不可用。 ");
     const save = async () => {
       const current = await settings.get(input.projectId);
+      const updatesDefaults = Object.hasOwn(input, "workspacePath") && Object.hasOwn(input, "profile");
+      let workspacePath = current?.workspacePath ?? null;
+      let profile = current?.profile ?? null;
+      if (updatesDefaults) {
+        if (input.workspacePath === null && input.profile === null) {
+          workspacePath = null;
+          profile = null;
+        } else if (input.profile) {
+          if (typeof input.workspacePath === "string") {
+            await assertKnownPaseoWorkspacePath(paseo, input.workspacePath);
+          }
+          workspacePath = input.workspacePath ?? null;
+          profile = await resolveCatalogModelProfile(paseo, workspacePath, input.profile);
+        } else {
+          throw new Error("默认 Agent 配置不能为空；清空时请同时清空工作区和 Agent 配置。");
+        }
+      }
       const saved = await settings.upsert({
         projectId: input.projectId,
-        workspacePath: current?.workspacePath ?? null,
-        profile: current?.profile ?? null,
+        workspacePath,
+        profile,
         enabledByUser: input.enabledByUser,
         intervalMinutes: input.intervalMinutes,
         quotaAware: false,
@@ -748,17 +1004,7 @@ export function registerHandlers(
         lastError: current?.lastError ?? null,
         updatedAt: new Date().toISOString(),
       });
-      return { automation: {
-        projectId: saved.projectId,
-        enabledByUser: saved.enabledByUser,
-        intervalMinutes: saved.intervalMinutes,
-        quotaAware: false,
-        status: saved.enabledByUser ? "ACTIVE" as const : "PAUSED" as const,
-        schedulerReady: automationRuntime?.ready() ?? false,
-        quotaAvailable: false as const,
-        lastRunAt: saved.lastRunAt,
-        lastError: saved.lastError,
-      } };
+      return { automation: automationState(saved.projectId, saved) };
     };
     const result = await (automationRuntime
       ? automationRuntime.withProjectLock(input.projectId, save)
@@ -771,6 +1017,32 @@ export function registerHandlers(
     return result;
   });
 
+  server.handle(contracts.savePaseoProjectDefaults, async (input, { paseo }) => {
+    automationRuntime?.attach(paseo);
+    const save = async () => {
+      const current = await settings.get(input.projectId);
+      if (input.workspacePath) {
+        await assertKnownPaseoWorkspacePath(paseo, input.workspacePath);
+      }
+      const profile = await resolveCatalogModelProfile(paseo, input.workspacePath, input.profile);
+      const saved = await settings.upsert({
+        projectId: input.projectId,
+        workspacePath: input.workspacePath,
+        profile,
+        enabledByUser: current?.enabledByUser ?? false,
+        intervalMinutes: current?.intervalMinutes ?? 5,
+        quotaAware: current?.quotaAware ?? false,
+        lastRunAt: current?.lastRunAt ?? null,
+        lastError: current?.lastError ?? null,
+        updatedAt: new Date().toISOString(),
+      });
+      return { projectId: saved.projectId, automation: automationState(saved.projectId, saved) };
+    };
+    return automationRuntime
+      ? automationRuntime.withProjectLock(input.projectId, save)
+      : save();
+  });
+
   server.handle(contracts.listBindings, async () => ({ bindings: await bindings.list() }));
 
   server.handle(contracts.listPaseoAssignmentOptions, async ({ projectId }, { paseo }) => {
@@ -778,9 +1050,9 @@ export function registerHandlers(
     if (projectId) {
       const { projects } = await dashi.listProjects(baseUrl);
       const configured = await settings.get(projectId);
-      defaultWorkspacePath = configured?.workspacePath
-        ?? projects.find((project) => project.id === projectId)?.workspacePath
-        ?? null;
+      defaultWorkspacePath = configured
+        ? configured.workspacePath
+        : projects.find((project) => project.id === projectId)?.workspacePath ?? null;
     }
     return { ...(await assignmentCatalog(paseo, defaultWorkspacePath)), defaultWorkspacePath };
   });
@@ -788,7 +1060,7 @@ export function registerHandlers(
   server.handle(contracts.getPaseoConfigurationOptions, async (input, { paseo }) => {
     let provider = input.provider;
     let modelId = input.model;
-    let workspacePath = input.workspacePath;
+    let workspacePath = input.workspacePath ?? null;
     let currentModeId = input.modeId;
     let currentThinkingOptionId = input.thinkingOptionId;
     let sessionModes: ReadonlyArray<{ id: string; label: string; description?: string }> | null = null;
@@ -803,21 +1075,22 @@ export function registerHandlers(
       }
       provider = agent.provider;
       modelId = agent.model ?? input.model;
-      workspacePath = agent.cwd || input.workspacePath;
+      workspacePath = agent.cwd || input.workspacePath || null;
       currentModeId = agent.currentModeId ?? undefined;
       currentThinkingOptionId = agent.thinkingOptionId ?? undefined;
       sessionModes = agent.availableModes;
     }
 
-    const snapshot = await paseo.providers.waitForReady({ cwd: workspacePath });
+    const providerOptions = workspacePath ? { cwd: workspacePath } : undefined;
+    const snapshot = await paseo.providers.waitForReady(providerOptions);
     const providerEntry = snapshot.entries.find((entry) => entry.provider === provider);
     if (!providerEntry || !providerEntry.enabled || providerEntry.status !== "ready") {
       throw new Error("所选 Paseo provider 当前不可用，请刷新后重试。");
     }
 
     const [modeResult, modelResult] = await Promise.all([
-      editable ? paseo.providers.listModes(provider, { cwd: workspacePath }) : Promise.resolve(null),
-      paseo.providers.listModels(provider, { cwd: workspacePath }),
+      editable ? paseo.providers.listModes(provider, providerOptions) : Promise.resolve(null),
+      paseo.providers.listModels(provider, providerOptions),
     ]);
     if (modeResult?.error) throw new Error(`无法读取 ${providerEntry.label ?? provider} 的 Mode：${modeResult.error}`);
     if (modelResult.error) throw new Error(`无法读取 ${providerEntry.label ?? provider} 的模型：${modelResult.error}`);
@@ -906,7 +1179,7 @@ export function registerHandlers(
 
   server.handle(contracts.saveTaskExecutionPlan, async (input, { paseo }) => {
     const save = () => withTaskMutation(input.taskId, async () => {
-    const { task } = await dashi.getTask(baseUrl, input.taskId);
+    let { task } = await dashi.getTask(baseUrl, input.taskId);
     if (task.archivedAt !== null) throw new Error("已归档任务不能保存新 Agent 计划；请先恢复任务。 ");
     if (task.projectId !== input.projectId) throw new Error("任务所属项目已变化，请刷新后重新选择新 Agent 计划。 ");
     const currentBinding = await bindings.get(task.id);
@@ -916,18 +1189,39 @@ export function registerHandlers(
     }
     const worktreePath = task.developmentContext?.type === "worktree" ? task.developmentContext.path : null;
     if (currentBinding && worktreePath) await assertWorktreeCompatibleWithTask(paseo, task.id, worktreePath);
-    // 表单可能仍带项目默认 cwd；任务级 Worktree 是唯一真实执行目录，服务端强制采用它。
-    const workspacePath = worktreePath ?? input.workspacePath;
-    if (worktreePath) {
-      const registered = await paseo.workspaces.list({ page: { limit: 200 } });
-      if (!registered.entries.some((workspace) => (
-        typeof workspace.workspaceDirectory === "string" && equalPath(workspace.workspaceDirectory, workspacePath)
-      ))) {
-        throw new Error("所选 Worktree 尚未登记为 Paseo 工作区，不能创建 Agent 计划。 ");
-      }
+    // 普通保存继续尊重任务 Worktree；只有详情显式 replaceWorkspace 才采用新目录。
+    const workspacePath = input.replaceWorkspace ? input.workspacePath : worktreePath ?? input.workspacePath;
+    if ((input.replaceWorkspace || worktreePath) && workspacePath) {
+      await assertKnownPaseoWorkspacePath(paseo, workspacePath);
     }
     const profile = await resolveCatalogModelProfile(paseo, workspacePath, input.profile);
-    const plan = await plans.upsert({ ...input, workspacePath, profile });
+    const previousPlan = await plans.get(task.id);
+    const plan = await plans.upsert({
+      taskId: input.taskId,
+      projectId: input.projectId,
+      workspacePath,
+      profile,
+    });
+    if (worktreePath && input.replaceWorkspace && (!workspacePath || !equalPath(worktreePath, workspacePath))) {
+      try {
+        task = (await dashi.updateTask(baseUrl, task.id, {
+          version: task.version,
+          developmentContext: null,
+        })).task;
+      } catch (error) {
+        if (previousPlan) {
+          await plans.upsert({
+            taskId: previousPlan.taskId,
+            projectId: previousPlan.projectId,
+            workspacePath: previousPlan.workspacePath,
+            profile: previousPlan.profile,
+          });
+        } else {
+          await plans.remove(task.id);
+        }
+        throw error;
+      }
+    }
     // 所有可能失败的校验和计划落盘完成后，才替换原绑定；失败必须保留原负责人。
     if (currentBinding) await bindings.remove(task.id);
     return {
@@ -937,12 +1231,85 @@ export function registerHandlers(
         workspacePath: plan.workspacePath,
         profile: plan.profile,
       },
+      task,
     };
     });
     return automationRuntime
       ? automationRuntime.withProjectLock(input.projectId, save)
       : save();
   });
+
+  server.handle(contracts.mergePaseoIdeas, async (input, { paseo }) => withTaskMutations(
+    [...input.sourceTaskIds, input.operationId],
+    async () => {
+      const sourceTaskIds = [...new Set(input.sourceTaskIds)];
+      if (sourceTaskIds.length !== input.sourceTaskIds.length) {
+        throw new Error("合并来源不能包含重复任务。");
+      }
+      const sourceBindings = await Promise.all(sourceTaskIds.map((taskId) => bindings.get(taskId)));
+      const bound = sourceBindings.find((binding) => binding !== null);
+      if (bound) {
+        throw new Error(`任务 ${bound.taskIdentifier} 已绑定 Paseo Agent，不能作为等待认领想法合并。`);
+      }
+      let existingTask: contracts.Task | null = null;
+      try {
+        existingTask = (await dashi.getTask(baseUrl, input.operationId)).task;
+      } catch (error) {
+        if (!(error instanceof dashi.DashiApiError) || error.code !== "TASK_NOT_FOUND") throw error;
+      }
+      if (existingTask) {
+        // 先由 Dashi 校验目标 UUID、项目、标题和全部来源关系；重试不能覆盖原计划。
+        const result = await dashi.mergeTasks(baseUrl, {
+          operationId: input.operationId,
+          projectId: input.projectId,
+          sourceTaskIds,
+          title: input.title,
+          ...(input.description !== undefined ? { description: input.description } : {}),
+        });
+        const plan = await plans.get(input.operationId);
+        if (!plan) {
+          throw new Error("合并任务已存在但缺少原执行计划；为避免覆盖配置，请人工检查后使用新的合并操作。");
+        }
+        return {
+          task: result.task,
+          assignment: {
+            kind: "planned" as const,
+            taskId: result.task.id,
+            workspacePath: plan.workspacePath,
+            profile: plan.profile,
+          },
+          sourceTaskIds: result.sourceTasks.map((task) => task.id),
+          replayed: true,
+        };
+      }
+      const profile = await resolveCatalogModelProfile(paseo, input.workspacePath, input.profile);
+      // 计划必须先于新任务可见，避免自动化在计划缺失窗口使用项目旧默认配置。
+      const plan = await plans.upsert({
+        taskId: input.operationId,
+        projectId: input.projectId,
+        workspacePath: input.workspacePath,
+        profile,
+      });
+      const result = await dashi.mergeTasks(baseUrl, {
+        operationId: input.operationId,
+        projectId: input.projectId,
+        sourceTaskIds,
+        title: input.title,
+        ...(input.description !== undefined ? { description: input.description } : {}),
+      });
+      return {
+        task: result.task,
+        assignment: {
+          kind: "planned" as const,
+          taskId: result.task.id,
+          workspacePath: plan.workspacePath,
+          profile: plan.profile,
+        },
+        sourceTaskIds: result.sourceTasks.map((task) => task.id),
+        replayed: result.replayed,
+      };
+    },
+  ));
 
   server.handle(contracts.getPaseoTaskAssignments, async ({ taskIds }, { paseo }) => {
     const [storedBindings, storedPlans] = await Promise.all([bindings.list(), plans.list(taskIds)]);

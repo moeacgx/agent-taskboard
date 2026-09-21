@@ -1,12 +1,13 @@
 import type { PluginTheme } from "@getpaseo/plugin";
 import { useRpc } from "@getpaseo/plugin/client";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Pressable, ScrollView, Text, TextInput, View } from "react-native";
 
 import * as contracts from "../shared/contracts";
 import type { TaskStatus } from "../shared/contracts";
 import { displayCommentBody } from "../shared/agent-comment";
 import { AgentPanel } from "./AgentPanel";
+import { NativeExecutionConfig } from "./NativeExecutionConfig";
 import { formatRelativeTime, PRIORITY_LABELS, STATUS_LABELS, STATUS_ORDER, statusColor } from "./format";
 import { useRpcQuery } from "./hooks";
 import type { PluginLayout, PluginNavigation } from "./types";
@@ -22,6 +23,7 @@ export function TaskDetail(props: {
   const { theme, layout, navigation, taskId, onBack, onEdit } = props;
   const [commentDraft, setCommentDraft] = useState("");
   const [actionError, setActionError] = useState<string | null>(null);
+  const [executionConfigReady, setExecutionConfigReady] = useState(false);
 
   const getTask = useRpc(contracts.getTask);
   const taskQuery = useRpcQuery(getTask, { id: taskId });
@@ -31,12 +33,27 @@ export function TaskDetail(props: {
 
   const getBinding = useRpc(contracts.getBinding);
   const bindingQuery = useRpcQuery(getBinding, { taskId });
+  const getAssignments = useRpc(contracts.getPaseoTaskAssignments);
+  const assignmentsQuery = useRpcQuery(getAssignments, { taskIds: [taskId] });
 
-  const moveTask = useRpc(contracts.moveTask);
+  const moveTaskBoard = useRpc(contracts.moveTaskBoard);
   const restoreTask = useRpc(contracts.restoreTask);
   const addComment = useRpc(contracts.addComment);
 
   const task = taskQuery.data?.task ?? null;
+  const assignment = assignmentsQuery.data?.assignments.find((candidate) => candidate.taskId === taskId) ?? null;
+
+  useEffect(() => {
+    if (
+      !executionConfigReady
+      && bindingQuery.data !== null
+      && assignmentsQuery.data !== null
+      && !bindingQuery.error
+      && !assignmentsQuery.error
+    ) {
+      setExecutionConfigReady(true);
+    }
+  }, [assignmentsQuery.data, assignmentsQuery.error, bindingQuery.data, bindingQuery.error, executionConfigReady]);
 
   const styles = useMemo(
     () => ({
@@ -100,7 +117,18 @@ export function TaskDetail(props: {
     if (!task || task.archivedAt || status === task.status) return;
     setActionError(null);
     try {
-      await moveTask({ id: task.id, version: task.version, status });
+      const result = await moveTaskBoard({ id: task.id, version: task.version, status });
+      if (result.dispatch === "needs_configuration" || result.dispatch === "skipped" || result.dispatch === "failed") {
+        setActionError(result.dispatchMessage ?? (
+          result.dispatch === "needs_configuration"
+            ? "请先配置任务或项目的 Agent 与代码目录。"
+            : result.dispatch === "skipped"
+              ? "任务当前状态不允许启动 Agent。"
+              : "Agent 启动失败，请检查配置后重试。"
+        ));
+      } else if (result.dispatchMessage) {
+        setActionError(result.dispatchMessage);
+      }
       taskQuery.refetch();
     } catch (error) {
       setActionError(error instanceof Error ? error.message : String(error));
@@ -165,30 +193,57 @@ export function TaskDetail(props: {
               <Text style={styles.description}>{task.description || "（无描述）"}</Text>
             </View>
 
-            {task.archivedAt ? null : bindingQuery.error ? (
+            {task.archivedAt ? null : !executionConfigReady ? (
               // A failed binding fetch is NOT the same thing as "no binding
               // exists" — showing the create-agent flow here would hide a
               // real error (e.g. a binding record this client can't parse)
               // behind what looks like a fresh, unstarted task.
               <View style={styles.card}>
-                <Text style={styles.errorText}>加载 Agent 绑定信息失败：{bindingQuery.error}</Text>
-                <Pressable accessibilityRole="button" onPress={bindingQuery.refetch}>
+                <Text style={bindingQuery.error || assignmentsQuery.error ? styles.errorText : styles.muted}>
+                  {bindingQuery.error
+                    ? `加载 Agent 绑定信息失败：${bindingQuery.error}`
+                    : assignmentsQuery.error
+                      ? `加载任务执行配置失败：${assignmentsQuery.error}`
+                      : "正在加载任务执行配置…"}
+                </Text>
+                {(bindingQuery.error || assignmentsQuery.error) && <Pressable accessibilityRole="button" onPress={() => {
+                  bindingQuery.refetch();
+                  assignmentsQuery.refetch();
+                }}>
                   <Text style={styles.editText}>重试</Text>
-                </Pressable>
+                </Pressable>}
               </View>
             ) : (
-              <AgentPanel
-                theme={theme}
-                layout={layout}
-                navigation={navigation}
-                task={task}
-                binding={bindingQuery.data?.binding ?? null}
-                onNeedsRefresh={() => {
-                  taskQuery.refetch();
-                  commentsQuery.refetch();
-                  bindingQuery.refetch();
-                }}
-              />
+              <>
+                {(bindingQuery.error || assignmentsQuery.error) && (
+                  <Text style={styles.errorText}>执行配置刷新失败，当前草稿已保留。</Text>
+                )}
+                <AgentPanel
+                  theme={theme}
+                  layout={layout}
+                  navigation={navigation}
+                  task={task}
+                  binding={bindingQuery.data?.binding ?? null}
+                  onNeedsRefresh={() => {
+                    taskQuery.refetch();
+                    commentsQuery.refetch();
+                    bindingQuery.refetch();
+                    assignmentsQuery.refetch();
+                  }}
+                />
+                {!bindingQuery.data?.binding && (
+                  <NativeExecutionConfig
+                    theme={theme}
+                    layout={layout}
+                    task={task}
+                    assignment={assignment}
+                    onSaved={() => {
+                      assignmentsQuery.refetch();
+                      taskQuery.refetch();
+                    }}
+                  />
+                )}
+              </>
             )}
 
             <View>

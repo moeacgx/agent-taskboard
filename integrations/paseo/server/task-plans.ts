@@ -48,6 +48,22 @@ export function createTaskPlansStore(options: { filePath?: string } = {}) {
         return taskIds ? values.filter((plan) => taskIds.includes(plan.taskId)) : values;
       });
     },
+    /** 任务换项目时只同步归属；没有显式计划时保持不存在。 */
+    setProjectId(taskId: string, projectId: string): Promise<TaskExecutionPlan | null> {
+      return enqueue(async () => {
+        const current = await readStore();
+        const existing = current.byTaskId[taskId];
+        if (!existing) return null;
+        if (existing.projectId === projectId) return existing;
+        const value = TaskExecutionPlanSchema.parse({
+          ...existing,
+          projectId,
+          updatedAt: new Date().toISOString(),
+        });
+        await writeStore({ byTaskId: { ...current.byTaskId, [taskId]: value } });
+        return value;
+      });
+    },
     upsert(input: Omit<TaskExecutionPlan, "updatedAt">): Promise<TaskExecutionPlan> {
       return enqueue(async () => {
         const value = TaskExecutionPlanSchema.parse({ ...input, updatedAt: new Date().toISOString() });

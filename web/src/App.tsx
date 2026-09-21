@@ -35,6 +35,7 @@ import {
   listProjects,
   listTasks,
   moveTask as moveTaskRequest,
+  moveTaskToProject as moveTaskToProjectRequest,
   publishHostRuntime,
   removeTaskRelation,
   resolveTaskboardUrl,
@@ -44,6 +45,7 @@ import {
   setCurrentUserActor,
   syncJiraConnection,
   uploadAttachment,
+  updateProjectName,
   updateTask as updateTaskRequest,
 } from "./api";
 import {
@@ -76,9 +78,15 @@ import {
   RelationIcon,
 } from "./components/SemanticIcons";
 import { ProjectAutomationMenu } from "./components/ProjectAutomationMenu";
+import {
+  PaseoProjectDefaultsDialog,
+  type PaseoProjectDefaultsCatalog,
+  type PaseoProjectDefaultsValue,
+} from "./components/PaseoProjectDefaultsDialog";
 import { TaskboardIcon } from "./components/TaskboardIcon";
 import { TaskContextMenu } from "./components/TaskContextMenu";
 import { TaskDetail } from "./components/TaskDetail";
+import { PaseoExecutionConfigDialog } from "./components/PaseoExecutionConfigDialog";
 import type { PaseoAssigneeOption } from "./components/PaseoAssigneePicker";
 import type { PaseoConfigurationSelection } from "./components/PaseoConfigurationFields";
 import {
@@ -104,6 +112,10 @@ import type {
   PaseoAssignmentOptions,
   PaseoConfigurationOptions,
   PaseoConfigurationOptionsRequest,
+  PaseoCopyRequest,
+  PaseoCopyResponse,
+  PaseoMergeIdeasRequest,
+  PaseoMergeIdeasResult,
   PaseoTaskAssignment,
 } from "./paseo-bridge";
 import { profileIconSource, providerIconSource } from "./providerIcons";
@@ -163,7 +175,26 @@ type DetailSourceScroll =
   | { projectId: string; view: "issues"; status: TaskStatus; scrollTop: number; scrollLeft: number }
   | { projectId: string; view: "list"; scrollTop: number };
 type GanttZoom = "day" | "week" | "month";
-type ActionError = string | readonly [string, string];
+type ActionError = string | readonly [string, string] | {
+  kind: "pending-task-sync";
+  message: string;
+  taskId: string;
+  previousVersion: number;
+};
+type PaseoExecutionDialogState = {
+  taskId: string;
+  projectId: string;
+  taskIdentifier: string;
+  initialChoiceId: string;
+  initialWorkspacePath: string | null;
+  initialProfile: Extract<PaseoTaskAssignment, { kind: "planned" }>["profile"] | null;
+  initialModeId?: string;
+  initialThinkingOptionId?: string;
+};
+
+function isPendingTaskSyncError(error: ActionError): error is Extract<ActionError, { kind: "pending-task-sync" }> {
+  return typeof error === "object" && "kind" in error && error.kind === "pending-task-sync";
+}
 type ProjectLoadError = {
   source: "projects";
   operation: "initial" | "refresh";
@@ -188,6 +219,10 @@ const GanttView = lazy(() => import("./components/GanttView").then((module) => (
 interface EditorState {
   status: TaskStatus;
   projectId?: string | null;
+  mergeSources?: Task[];
+  mergeRequestId?: string;
+  mergeOperationId?: string;
+  mergeStartAfterSave?: boolean;
 }
 
 interface ContextMenuState {
@@ -353,8 +388,25 @@ interface PendingPaseoAutomationRequest {
   timeoutId: number;
 }
 
+interface PendingPaseoProjectDefaultsRequest extends PendingPaseoAutomationRequest {
+  projectId: string;
+}
+
 interface PendingPaseoConfigurationRequest {
   resolve: (options: PaseoConfigurationOptions) => void;
+  reject: (error: Error) => void;
+  timeoutId: number;
+}
+
+interface PendingPaseoMergeRequest {
+  resolve: (result: PaseoMergeIdeasResult) => void;
+  reject: (error: Error) => void;
+  timeoutId: number;
+  sourceTaskIds: string[];
+}
+
+interface PendingPaseoCopyRequest {
+  resolve: (copiedText: string) => void;
   reject: (error: Error) => void;
   timeoutId: number;
 }
@@ -401,6 +453,14 @@ function paseoAssignmentActor(
       avatarUrl: providerIconSource(assignment.provider, assignmentProviderIcon(assignment.provider, providerIcons)),
     };
   }
+  if (!assignment.profile) {
+    return {
+      type: "agent",
+      id: `paseo-plan:project-default:${assignment.taskId}`,
+      name: "计划执行 · 使用项目默认 Agent",
+      avatarUrl: null,
+    };
+  }
   return {
     type: "agent",
     id: `paseo-plan:${assignment.profile.id}`,
@@ -443,7 +503,9 @@ function decoratePaseoTask(
 type PaseoAssignmentChoice =
   | { kind: "self" | "unassigned" }
   | { kind: "existing"; agentId: string }
-  | { kind: "planned"; profile: PaseoAssignmentOptions["profiles"][number] | PaseoAssignmentOptions["models"][number] };
+  | { kind: "planned"; profile: PaseoAssignmentOptions["profiles"][number] | PaseoAssignmentOptions["models"][number] | null };
+
+const PASEO_SAVED_TASK_PLAN_ID = "paseo:saved-task-plan";
 
 /** 请求已交给父端但 iframe 未在时限内收到回包；不能当成创建或保存失败。 */
 class PaseoAssignmentSavePendingError extends Error {
@@ -667,6 +729,8 @@ function isPaseoAutomationState(value: unknown): value is PaseoAutomationState {
   if (!value || typeof value !== "object") return false;
   const state = value as Partial<PaseoAutomationState>;
   return typeof state.projectId === "string"
+    && (state.workspacePath === null || typeof state.workspacePath === "string")
+    && (state.profile === null || typeof state.profile === "object")
     && typeof state.enabledByUser === "boolean"
     && isAutomationIntervalMinutes(state.intervalMinutes)
     && typeof state.quotaAware === "boolean"
@@ -942,6 +1006,7 @@ export function App() {
   const [paseoAssignmentOptions, setPaseoAssignmentOptions] = useState<PaseoAssignmentOptions | null>(null);
   const [paseoAssignmentOptionsLoading, setPaseoAssignmentOptionsLoading] = useState(false);
   const [paseoAssignmentOptionsError, setPaseoAssignmentOptionsError] = useState<string | null>(null);
+  const [paseoExecutionDialog, setPaseoExecutionDialog] = useState<PaseoExecutionDialogState | null>(null);
   const [recentProjectIds, setRecentProjectIds] = useState(readRecentProjectIds);
   const initialProjectId = query.get("project") ?? recentProjectIds[0] ?? ALL_PROJECTS_ID;
   const [projects, setProjects] = useState<Project[]>([]);
@@ -958,7 +1023,9 @@ export function App() {
     ? null
     : typeof actionError === "string"
       ? actionError
-      : text(actionError[0], actionError[1]);
+      : isPendingTaskSyncError(actionError)
+        ? actionError.message
+        : text(actionError[0], actionError[1]);
   const [connection, setConnection] = useState<ConnectionState>("connecting");
   const [search, setSearch] = useState("");
   const [filters, setFilters] = useState(readTaskFilters);
@@ -985,8 +1052,19 @@ export function App() {
   const [otherTasksTab, setOtherTasksTab] = useState<OtherTaskTab>("backlog");
   const [restoringTaskId, setRestoringTaskId] = useState<string | null>(null);
   const [pendingArchivedTaskDelete, setPendingArchivedTaskDelete] = useState<Task | null>(null);
+  const [pendingSelectedTaskDelete, setPendingSelectedTaskDelete] = useState<Task[] | null>(null);
+  const [pendingTaskProjectMove, setPendingTaskProjectMove] = useState<{
+    task: Task;
+    targetProjectId: string | null;
+  } | null>(null);
+  const [taskProjectMoveSearch, setTaskProjectMoveSearch] = useState("");
+  const [taskProjectMoveError, setTaskProjectMoveError] = useState<string | null>(null);
+  const [movingTaskProject, setMovingTaskProject] = useState(false);
   const [deletingArchivedTaskId, setDeletingArchivedTaskId] = useState<string | null>(null);
+  const batchDeleteInFlightRef = useRef(false);
   const [editor, setEditor] = useState<EditorState | null>(null);
+  const [ideaSelectionMode, setIdeaSelectionMode] = useState(false);
+  const [selectedIdeaIds, setSelectedIdeaIds] = useState<Set<string>>(() => new Set());
   const [newTaskDraft, setNewTaskDraft] = useState<{
     projectId: string;
     targetProjectId: string | null;
@@ -1000,9 +1078,11 @@ export function App() {
   const [readmeRevision, setReadmeRevision] = useState(0);
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
   const [draggedTaskId, setDraggedTaskId] = useState<string | null>(null);
+  const [draggedTaskIds, setDraggedTaskIds] = useState<Set<string>>(() => new Set());
   const [draggedTaskHeight, setDraggedTaskHeight] = useState(0);
   const [dropTarget, setDropTarget] = useState<TaskStatus | null>(null);
   const [movingTaskId, setMovingTaskId] = useState<string | null>(null);
+  const [batchMovingTaskIds, setBatchMovingTaskIds] = useState<Set<string>>(() => new Set());
   const [settlingTaskId, setSettlingTaskId] = useState<string | null>(null);
   const [openingProjectId, setOpeningProjectId] = useState<string | null>(null);
   const [openingThreadTaskId, setOpeningThreadTaskId] = useState<string | null>(null);
@@ -1013,6 +1093,15 @@ export function App() {
   const [projectContextMenu, setProjectContextMenu] = useState<ProjectContextMenuState | null>(null);
   const [projectCreateOpen, setProjectCreateOpen] = useState(false);
   const [projectName, setProjectName] = useState("");
+  const [projectCreateId, setProjectCreateId] = useState<string | null>(null);
+  const [projectCreateDefaults, setProjectCreateDefaults] = useState<PaseoProjectDefaultsValue>({
+    profile: null,
+    workspacePath: null,
+  });
+  const [projectCreateDefaultsOpen, setProjectCreateDefaultsOpen] = useState(false);
+  const [projectDefaultsProjectId, setProjectDefaultsProjectId] = useState<string | null>(null);
+  const [projectSettingsName, setProjectSettingsName] = useState("");
+  const [projectDefaultsLoading, setProjectDefaultsLoading] = useState(false);
   const [jiraDialogOpen, setJiraDialogOpen] = useState(false);
   const [jiraConnection, setJiraConnection] = useState<JiraConnection | null>(null);
   const [jiraSaving, setJiraSaving] = useState(false);
@@ -1037,6 +1126,9 @@ export function App() {
   const projectsRequestRef = useRef(0);
   const tasksRequestRef = useRef(0);
   const tasksRef = useRef<Task[]>([]);
+  const draggedTaskIdsRef = useRef<string[]>([]);
+  const batchMoveInFlightRef = useRef(false);
+  const paseoHostRouteInitializedRef = useRef(false);
   const paseoAssignmentOptionsRequestRef = useRef(0);
   const pendingPaseoAssignmentSaveRef = useRef(new Map<string, {
     resolve: (assignment: PaseoTaskAssignment | null) => void;
@@ -1072,7 +1164,11 @@ export function App() {
   }
   const pendingAutomationRequestsRef = useRef(new Map<string, PendingAutomationRequest>());
   const pendingPaseoAutomationRequestsRef = useRef(new Map<string, PendingPaseoAutomationRequest>());
+  const pendingPaseoProjectDefaultsRequestsRef = useRef(new Map<string, PendingPaseoProjectDefaultsRequest>());
   const pendingPaseoConfigurationRequestsRef = useRef(new Map<string, PendingPaseoConfigurationRequest>());
+  const pendingPaseoMergeRequestsRef = useRef(new Map<string, PendingPaseoMergeRequest>());
+  const pendingPaseoCopyRequestsRef = useRef(new Map<string, PendingPaseoCopyRequest>());
+  const copyActionErrorRef = useRef<string | null>(null);
   const paseoAutomationRequestGateRef = useRef<ReturnType<typeof createPaseoAutomationRequestGate> | null>(null);
   if (!paseoAutomationRequestGateRef.current) {
     paseoAutomationRequestGateRef.current = createPaseoAutomationRequestGate(setPaseoAutomationPending);
@@ -1427,17 +1523,55 @@ export function App() {
     ];
   }, [hostContext?.projects, projectCodexIdentities, projects, recentProjectIds, text]);
   const projectMenuCandidates = projectChoices.filter(
-    (project) => project.id !== GLOBAL_PROJECT_ID || project.issueCount > 0,
+    (project) => host === "paseo" || project.id !== GLOBAL_PROJECT_ID || project.issueCount > 0,
   );
+  const persistedProjectsById = new Map(projects.map((project) => [project.id, project]));
+  function projectActionsFor(project: ProjectChoice) {
+    const persistedProject = persistedProjectsById.get(project.id);
+    const isLocalProject = persistedProject?.source === "local";
+    return {
+      canEdit: host === "paseo" && isLocalProject,
+      canDelete: isLocalProject && (
+        host === "paseo"
+          ? project.id !== GLOBAL_PROJECT_ID
+          : project.id.startsWith("temp-")
+      ),
+    };
+  }
+  const projectSettingsProject = projectDefaultsProjectId
+    ? projects.find((project) => project.id === projectDefaultsProjectId) ?? null
+    : null;
+  const projectSettingsChoice = projectDefaultsProjectId
+    ? projectChoices.find((project) => project.id === projectDefaultsProjectId) ?? null
+    : null;
+  const projectSettingsCanDelete = projectSettingsChoice
+    ? projectActionsFor(projectSettingsChoice).canDelete
+    : false;
+  const projectContextActions = projectContextMenu
+    ? projectActionsFor(projectContextMenu.project)
+    : null;
   const projectMenuNeedle = projectMenuSearch.trim().toLocaleLowerCase();
   const projectMenuChoices = projectMenuNeedle
     ? projectMenuCandidates.filter((project) => project.name.toLocaleLowerCase().includes(projectMenuNeedle))
     : projectMenuCandidates;
+  const taskProjectMoveNeedle = taskProjectMoveSearch.trim().toLocaleLowerCase();
+  const taskProjectMoveTargets = pendingTaskProjectMove
+    ? projects.map((project) => ({
+        ...project,
+        name: projectChoices.find((choice) => choice.id === project.id)?.name ?? project.name,
+      })).filter((project) => (
+        project.source === "local"
+          && project.id !== pendingTaskProjectMove.task.projectId
+          && project.id !== ALL_PROJECTS_ID
+          && (!taskProjectMoveNeedle || project.name.toLocaleLowerCase().includes(taskProjectMoveNeedle))
+      ))
+    : [];
   const firstEmptyProjectId = projectMenuChoices.find((project) => project.issueCount === 0)?.id ?? null;
   const hasProjectsWithIssues = projectMenuChoices.some((project) => project.issueCount > 0);
   const editorProjectId = editor?.projectId
     ?? (newTaskDraft?.projectId === selectedProjectId ? newTaskDraft.targetProjectId : undefined)
     ?? (isAllProjects ? GLOBAL_PROJECT_ID : selectedProjectId);
+  const editorMergeSources = editor?.mergeSources ?? [];
   const developmentEditorProjectId = isAllProjects && editor ? editorProjectId : null;
   const paseoProviderIcons = useMemo(() => new Map(
     (paseoAssignmentOptions?.providers ?? []).map((provider) => [provider.id, provider.iconDataUrl]),
@@ -1450,21 +1584,28 @@ export function App() {
     const options: PaseoAssigneeOption[] = [
       { id: "paseo:self", label: `${currentUser.name}（我）`, group: "self" },
       { id: "paseo:unassigned", label: "未分配", detail: "仅保存任务，不绑定或创建 Agent", group: "self" },
+      {
+        id: "paseo:project-default",
+        label: "使用项目默认 Agent",
+        detail: "开始任务时读取项目当前默认配置",
+        group: "self",
+        requiresWorkspace: true,
+      },
     ];
     const choices = new Map<string, PaseoAssignmentChoice>([
       ["paseo:self", { kind: "self" }],
       ["paseo:unassigned", { kind: "unassigned" }],
+      ["paseo:project-default", { kind: "planned", profile: null }],
     ]);
     const catalog = paseoAssignmentOptions;
     if (!catalog) return { options, choices };
-    const hasWorkspace = catalog.workspaces.some((workspace) => Boolean(workspace.path));
     const providerChoices = new Map(catalog.providers.map((provider) => [provider.id, provider]));
     for (const [index, profile] of catalog.profiles.entries()) {
       const id = `paseo:profile:${profile.id}`;
       options.push({
         id,
         label: profile.name,
-        detail: `${profile.provider}${profile.model ? `/${profile.model}` : ""} · 选择后指定工作区`,
+        detail: `${profile.provider}${profile.model ? `/${profile.model}` : ""} · 可继承项目默认目录`,
         group: "profile",
         provider: profile.provider,
         model: profile.model,
@@ -1474,8 +1615,6 @@ export function App() {
         profileIcon: profile.icon,
         hiddenFromRoot: index >= 4,
         requiresWorkspace: true,
-        disabled: !hasWorkspace,
-        disabledReason: hasWorkspace ? undefined : "没有可用工作区，无法保存新 Agent 计划。",
       });
       choices.set(id, { kind: "planned", profile });
     }
@@ -1507,8 +1646,6 @@ export function App() {
         iconDataUrl: providerChoices.get(model.provider)?.iconDataUrl ?? null,
         hiddenFromRoot: true,
         requiresWorkspace: true,
-        disabled: !hasWorkspace,
-        disabledReason: hasWorkspace ? undefined : "没有可用工作区，无法保存新 Agent 计划。",
       });
       choices.set(id, { kind: "planned", profile: model });
     }
@@ -1543,7 +1680,11 @@ export function App() {
     }
     return { options, choices };
   }, [currentUser.name, paseoAssignmentOptions]);
-
+  const paseoAutomationProfiles = useMemo(() => new Map(
+    [...paseoAssigneeChoices.choices.entries()].flatMap(([id, choice]) => (
+      choice.kind === "planned" && choice.profile ? [[id, choice.profile] as const] : []
+    )),
+  ), [paseoAssigneeChoices]);
   function refreshPaseoAssignmentOptions(projectId = editorProjectId ?? detailTask?.projectId) {
     if (host !== "paseo" || !embeddedFrameChallenge || !projectId) return;
     const requestId = ++paseoAssignmentOptionsRequestRef.current;
@@ -1574,18 +1715,82 @@ export function App() {
     return response;
   }, [embeddedFrameChallenge, host]);
 
+  const paseoProjectDefaultsCatalog: PaseoProjectDefaultsCatalog = {
+    options: paseoAssigneeChoices.options.filter((option) => (
+      option.group === "profile" || option.group === "provider"
+    )),
+    profiles: paseoAutomationProfiles,
+    workspaces: (paseoAssignmentOptions?.workspaces ?? []).flatMap((workspace) => (
+      workspace.path ? [{ ...workspace, path: workspace.path }] : []
+    )),
+    loading: paseoAssignmentOptionsLoading,
+    error: paseoAssignmentOptionsError,
+    onRefresh: () => {
+      const projectId = projectDefaultsProjectId
+        ?? projectCreateId
+        ?? (selectedProjectId !== ALL_PROJECTS_ID ? selectedProjectId : undefined);
+      if (projectId) refreshPaseoAssignmentOptions(projectId);
+    },
+    loadConfigurationOptions: loadPaseoConfigurationOptions,
+  };
+
+  const requestPaseoMergeIdeas = useCallback((input: PaseoMergeIdeasRequest) => {
+    if (host !== "paseo" || !embeddedFrameChallenge) {
+      return Promise.reject(new Error("Paseo 合并桥尚未就绪。"));
+    }
+    const response = new Promise<PaseoMergeIdeasResult>((resolve, reject) => {
+      const timeoutId = window.setTimeout(() => {
+        pendingPaseoMergeRequestsRef.current.delete(input.requestId);
+        reject(new Error("合并请求仍在处理中。当前草稿和重试标识已保留，请稍后重试。"));
+      }, 15_000);
+      pendingPaseoMergeRequestsRef.current.set(input.requestId, {
+        resolve,
+        reject,
+        timeoutId,
+        sourceTaskIds: input.sourceTaskIds,
+      });
+    });
+    postEmbeddedHostMessage({
+      type: "taskboard:paseo-merge-ideas-request",
+      payload: input,
+    });
+    return response;
+  }, [embeddedFrameChallenge, host]);
+
+  const requestPaseoCopy = useCallback((input:
+    | { kind: "text"; text: string }
+    | { kind: "issue-link"; projectId: string; identifier: string }
+  ) => {
+    if (host !== "paseo" || !embeddedFrameChallenge) {
+      return Promise.reject(new Error("Paseo 剪贴板桥尚未就绪。"));
+    }
+    const requestId = crypto.randomUUID();
+    const payload = { requestId, ...input } as PaseoCopyRequest;
+    const response = new Promise<string>((resolve, reject) => {
+      const timeoutId = window.setTimeout(() => {
+        pendingPaseoCopyRequestsRef.current.delete(requestId);
+        reject(new Error("Paseo 剪贴板没有响应，请重试。"));
+      }, 10_000);
+      pendingPaseoCopyRequestsRef.current.set(requestId, { resolve, reject, timeoutId });
+    });
+    postEmbeddedHostMessage({
+      type: "taskboard:paseo-copy-request",
+      payload,
+    });
+    return response;
+  }, [embeddedFrameChallenge, host]);
+
   function savePaseoTaskAssignment(
-    task: Task,
+    task: Pick<Task, "id" | "projectId">,
     choiceId: string | undefined,
-    workspacePath?: string,
+    workspacePath?: string | null,
     configuration?: PaseoConfigurationSelection,
+    replaceWorkspace = false,
+    choiceOverride?: PaseoAssignmentChoice,
   ): Promise<PaseoTaskAssignment | null> {
-    const choice = choiceId ? paseoAssigneeChoices.choices.get(choiceId) : null;
+    const choice = choiceOverride ?? (choiceId ? paseoAssigneeChoices.choices.get(choiceId) : null);
     if (host !== "paseo" || !choice) {
       return Promise.resolve(null);
-    }
-    if (choice.kind === "planned" && !workspacePath) {
-      return Promise.reject(new Error("请选择新 Agent 的工作区。"));
     }
     const requestId = crypto.randomUUID();
     return new Promise<PaseoTaskAssignment | null>((resolve, reject) => {
@@ -1602,8 +1807,9 @@ export function App() {
           projectId: task.projectId,
           choice: choice.kind === "planned" ? {
             ...choice,
-            workspacePath,
-            profile: configuration && choice.profile.model ? {
+            workspacePath: workspacePath ?? null,
+            ...(replaceWorkspace ? { replaceWorkspace: true } : {}),
+            profile: configuration && choice.profile?.model ? {
               ...choice.profile,
               modeId: configuration.modeId,
               thinkingOptionId: configuration.thinkingOptionId,
@@ -1616,10 +1822,25 @@ export function App() {
 
   function paseoAssignmentValue(task: Task): string {
     const assignment = paseoAssignments[task.id];
-    if (!assignment) return task.assignee.id === PASEO_UNASSIGNED_ACTOR.id ? "paseo:unassigned" : "paseo:self";
+    if (!assignment) {
+      const projectDefaults = paseoAutomations[task.projectId];
+      if (projectDefaults?.profile || projectDefaults?.workspacePath) return "paseo:project-default";
+      return task.assignee.id === PASEO_UNASSIGNED_ACTOR.id ? "paseo:unassigned" : "paseo:self";
+    }
     if (assignment.kind === "existing") return `paseo:agent:${assignment.agentId}`;
+    if (!assignment.profile) return "paseo:project-default";
     for (const [id, choice] of paseoAssigneeChoices.choices) {
-      if (choice.kind === "planned" && choice.profile.id === assignment.profile.id) return id;
+      if (
+        choice.kind === "planned"
+        && choice.profile
+        && (
+          choice.profile.id === assignment.profile.id
+          || (
+            choice.profile.provider === assignment.profile.provider
+            && choice.profile.model === assignment.profile.model
+          )
+        )
+      ) return id;
     }
     return "paseo:self";
   }
@@ -1629,7 +1850,7 @@ export function App() {
   ): PaseoConfigurationOptionsRequest | null {
     if (!assignment) return null;
     if (assignment.kind === "planned") {
-      if (!assignment.profile.model) return null;
+      if (!assignment.profile?.model) return null;
       return {
         provider: assignment.profile.provider,
         model: assignment.profile.model,
@@ -1651,15 +1872,24 @@ export function App() {
   }
 
   async function changePaseoTaskAssignment(
-    task: Task,
+    task: Pick<Task, "id" | "projectId">,
     choiceId: string,
-    workspacePath?: string,
+    workspacePath?: string | null,
     configuration?: PaseoConfigurationSelection,
     propagateError = false,
+    replaceWorkspace = false,
+    choiceOverride?: PaseoAssignmentChoice,
   ) {
     setActionError(null);
     try {
-      const assignment = await savePaseoTaskAssignment(task, choiceId, workspacePath, configuration);
+      const assignment = await savePaseoTaskAssignment(
+        task,
+        choiceId,
+        workspacePath,
+        configuration,
+        replaceWorkspace,
+        choiceOverride,
+      );
       setPaseoAssignments((current) => {
         const next = { ...current };
         if (assignment) next[task.id] = assignment;
@@ -1670,6 +1900,42 @@ export function App() {
       setActionError(errorMessage(error));
       if (propagateError) throw error;
     }
+  }
+
+  function openPaseoExecutionDialog(task: Task, preferredChoiceId?: string) {
+    const assignment = paseoAssignments[task.id];
+    if (assignment?.kind === "existing") return;
+    const currentChoiceId = assignment?.kind === "planned" ? paseoAssignmentValue(task) : "";
+    const matchedChoiceId = preferredChoiceId
+      && paseoAssigneeChoices.choices.get(preferredChoiceId)?.kind === "planned"
+      ? preferredChoiceId
+      : currentChoiceId === "paseo:project-default"
+        || currentChoiceId.startsWith("paseo:profile:")
+        || currentChoiceId.startsWith("paseo:model:")
+        ? currentChoiceId
+        : "";
+    const choiceId = assignment?.kind === "planned"
+      ? assignment.profile ? PASEO_SAVED_TASK_PLAN_ID : "paseo:project-default"
+      : matchedChoiceId;
+    const selectedChoice = matchedChoiceId ? paseoAssigneeChoices.choices.get(matchedChoiceId) : null;
+    const initialProfile = assignment?.kind === "planned"
+      ? assignment.profile
+      : selectedChoice?.kind === "planned" ? selectedChoice.profile : null;
+    setPaseoExecutionDialog({
+      taskId: task.id,
+      projectId: task.projectId,
+      taskIdentifier: task.externalKey ?? task.identifier,
+      initialChoiceId: choiceId,
+      initialProfile,
+      initialWorkspacePath: assignment?.kind === "planned"
+        ? assignment.workspacePath
+        : task.developmentContext?.type === "worktree" ? task.developmentContext.path : null,
+      ...(initialProfile?.modeId ? { initialModeId: initialProfile.modeId } : {}),
+      ...(initialProfile?.thinkingOptionId
+        ? { initialThinkingOptionId: initialProfile.thinkingOptionId }
+        : {}),
+    });
+    refreshPaseoAssignmentOptions(task.projectId);
   }
   const createTargetProjects = projectChoices.flatMap((choice) => {
     const project = projects.find((candidate) => candidate.id === choice.id);
@@ -2018,6 +2284,8 @@ export function App() {
       enabledByUser: boolean;
       intervalMinutes: PaseoAutomationIntervalMinutes;
       quotaAware: boolean;
+      workspacePath?: string | null;
+      profile?: PaseoAssignmentOptions["profiles"][number] | null;
     },
   ) => {
     const requestId = window.crypto.randomUUID();
@@ -2042,6 +2310,51 @@ export function App() {
     });
     return response;
   }, []);
+
+  const savePaseoProjectDefaults = useCallback(async (
+    projectId: string,
+    value: PaseoProjectDefaultsValue,
+  ) => {
+    if (host !== "paseo" || !embeddedFrameChallenge) {
+      return Promise.reject(new Error("Paseo 项目默认配置桥尚未就绪。"));
+    }
+    const requestId = window.crypto.randomUUID();
+    const response = new Promise<PaseoAutomationState>((resolve, reject) => {
+      const timeoutId = window.setTimeout(() => {
+        pendingPaseoProjectDefaultsRequestsRef.current.delete(requestId);
+        reject(new Error("Paseo 项目默认配置没有响应，请重试。"));
+      }, 15_000);
+      pendingPaseoProjectDefaultsRequestsRef.current.set(requestId, {
+        resolve,
+        reject,
+        timeoutId,
+        projectId,
+      });
+    });
+    postEmbeddedHostMessage({
+      type: "taskboard:paseo-project-defaults-save",
+      payload: {
+        requestId,
+        projectId,
+        workspacePath: value.workspacePath,
+        profile: value.profile,
+      },
+    });
+    const requestGate = paseoAutomationRequestGateRef.current!;
+    const requestToken = requestGate.begin(false)!;
+    try {
+      const automation = await response;
+      if (automation.projectId !== projectId) {
+        throw new Error("Paseo 返回了其它项目的默认配置状态。");
+      }
+      if (requestGate.isCurrent(requestToken)) {
+        setPaseoAutomations((current) => ({ ...current, [projectId]: automation }));
+      }
+      return automation;
+    } finally {
+      requestGate.end(requestToken);
+    }
+  }, [embeddedFrameChallenge, host]);
 
   const refreshPaseoAutomation = useCallback(async (options: { quiet?: boolean } = {}) => {
     if (host !== "paseo" || !selectedProject || selectedProject.id === ALL_PROJECTS_ID) return;
@@ -2068,8 +2381,10 @@ export function App() {
     enabledByUser: boolean;
     intervalMinutes: PaseoAutomationIntervalMinutes;
     quotaAware: boolean;
+    workspacePath?: string | null;
+    profile?: PaseoAssignmentOptions["profiles"][number] | null;
   }) => {
-    if (host !== "paseo" || !selectedProject || selectedProject.id === ALL_PROJECTS_ID) return;
+    if (host !== "paseo" || !selectedProject || selectedProject.id === ALL_PROJECTS_ID) return false;
     const requestGate = paseoAutomationRequestGateRef.current!;
     const requestToken = requestGate.begin(false)!;
     setPaseoAutomationError(null);
@@ -2078,12 +2393,14 @@ export function App() {
       if (requestGate.isCurrent(requestToken)) {
         setPaseoAutomations((current) => ({ ...current, [automation.projectId]: automation }));
       }
+      return true;
     } catch (error) {
       if (requestGate.isCurrent(requestToken)) {
         setPaseoAutomationError(error instanceof Error
           ? error.message
           : textRef.current("无法更新 Paseo 自动认领。", "Could not update Paseo auto-claim."));
       }
+      return false;
     } finally {
       requestGate.end(requestToken);
     }
@@ -2116,6 +2433,7 @@ export function App() {
     closeContextMenu();
     setProjectMenuOpen(false);
     setDetailTaskIdentifier(task.identifier);
+    if (host === "paseo") return;
     const boardUrl = buildIssueUrl(window.location.href, selectedProjectId, null);
     if (!currentIssue) {
       window.history.replaceState(window.history.state, "", boardUrl);
@@ -2136,6 +2454,7 @@ export function App() {
       setSelectedProjectId(sourceProjectId);
       setBoardView(sourceProjectId === ALL_PROJECTS_ID ? "issues" : readProjectBoardView(sourceProjectId));
     }
+    if (host === "paseo") return;
     const url = buildIssueUrl(window.location.href, sourceProjectId, null);
     window.history.replaceState(window.history.state, "", url);
   }
@@ -2260,10 +2579,10 @@ export function App() {
     if (!projectMenuOpen) return;
     function closeProjectMenu(event: PointerEvent) {
       const target = event.target as HTMLElement;
-      if (!target.closest("[data-project-switcher]")) setProjectMenuOpen(false);
+      if (!target.closest("[data-project-switcher], [data-project-context-menu]")) setProjectMenuOpen(false);
     }
     function closeProjectMenuWithEscape(event: KeyboardEvent) {
-      if (event.key === "Escape") setProjectMenuOpen(false);
+      if (event.key === "Escape" && !projectContextMenu) setProjectMenuOpen(false);
     }
     document.addEventListener("pointerdown", closeProjectMenu);
     window.addEventListener("keydown", closeProjectMenuWithEscape);
@@ -2271,13 +2590,13 @@ export function App() {
       document.removeEventListener("pointerdown", closeProjectMenu);
       window.removeEventListener("keydown", closeProjectMenuWithEscape);
     };
-  }, [projectMenuOpen]);
+  }, [projectMenuOpen, projectContextMenu]);
 
   useEffect(() => {
     if (!projectContextMenu) return;
     function closeProjectContextMenu(event: PointerEvent) {
       const target = event.target as HTMLElement;
-      if (!target.closest("[data-project-context-menu]")) setProjectContextMenu(null);
+      if (!target.closest("[data-project-context-menu], .project-menu-more")) setProjectContextMenu(null);
     }
     function closeProjectContextMenuWithEscape(event: KeyboardEvent) {
       if (event.key === "Escape") setProjectContextMenu(null);
@@ -2385,6 +2704,32 @@ export function App() {
         return;
       }
 
+      if (message.type === "taskboard:paseo-project-defaults-saved" && message.payload) {
+        const payload = message.payload as {
+          requestId?: unknown;
+          projectId?: unknown;
+          automation?: unknown;
+          error?: unknown;
+        };
+        if (typeof payload.requestId !== "string") return;
+        const pending = pendingPaseoProjectDefaultsRequestsRef.current.get(payload.requestId);
+        if (!pending) return;
+        window.clearTimeout(pending.timeoutId);
+        pendingPaseoProjectDefaultsRequestsRef.current.delete(payload.requestId);
+        if (typeof payload.error === "string") {
+          pending.reject(new Error(payload.error));
+        } else if (
+          payload.projectId === pending.projectId
+          && isPaseoAutomationState(payload.automation)
+          && payload.automation.projectId === pending.projectId
+        ) {
+          pending.resolve(payload.automation);
+        } else {
+          pending.reject(new Error("Paseo 返回了无效的项目默认配置状态。"));
+        }
+        return;
+      }
+
       if (message.type === "taskboard:paseo-presentations" && message.payload) {
         const payload = message.payload as { presentations?: unknown };
         if (!Array.isArray(payload.presentations)) return;
@@ -2439,6 +2784,44 @@ export function App() {
         return;
       }
 
+      if (message.type === "taskboard:paseo-merge-ideas" && message.payload) {
+        const payload = message.payload as {
+          requestId?: unknown;
+          task?: unknown;
+          assignment?: unknown;
+          sourceTaskIds?: unknown;
+          replayed?: unknown;
+          error?: unknown;
+        };
+        if (typeof payload.requestId !== "string") return;
+        const pending = pendingPaseoMergeRequestsRef.current.get(payload.requestId);
+        if (!pending) return;
+        window.clearTimeout(pending.timeoutId);
+        pendingPaseoMergeRequestsRef.current.delete(payload.requestId);
+        if (typeof payload.error === "string") {
+          pending.reject(new Error(payload.error));
+          return;
+        }
+        const task = payload.task as Task | undefined;
+        const assignment = payload.assignment as PaseoTaskAssignment | undefined;
+        if (!task || typeof task.id !== "string" || assignment?.kind !== "planned") {
+          pending.reject(new Error("Paseo 返回了无效的想法合并结果。"));
+          return;
+        }
+        const returnedSourceTaskIds = Array.isArray(payload.sourceTaskIds)
+          ? payload.sourceTaskIds.filter((id): id is string => typeof id === "string")
+          : [];
+        pending.resolve({
+          task,
+          assignment,
+          sourceTaskIds: returnedSourceTaskIds.length >= 2
+            ? returnedSourceTaskIds
+            : pending.sourceTaskIds,
+          replayed: payload.replayed === true,
+        });
+        return;
+      }
+
       if (message.type === "taskboard:paseo-task-assignments" && message.payload) {
         const payload = message.payload as { assignments?: PaseoTaskAssignment[] };
         if (!Array.isArray(payload.assignments)) return;
@@ -2447,8 +2830,25 @@ export function App() {
       }
 
       if (message.type === "taskboard:paseo-assignment-saved" && message.payload) {
-        const payload = message.payload as { requestId?: unknown; taskId?: unknown; assignment?: PaseoTaskAssignment | null; error?: unknown };
+        const payload = message.payload as {
+          requestId?: unknown;
+          taskId?: unknown;
+          task?: Task;
+          assignment?: PaseoTaskAssignment | null;
+          error?: unknown;
+        };
         if (typeof payload.requestId !== "string") return;
+        if (payload.task && typeof payload.task.id === "string" && !payload.error) {
+          const savedTask = host === "paseo"
+            ? decoratePaseoTask(
+                payload.task,
+                payload.assignment ?? undefined,
+                paseoProviderIconsRef.current,
+              )
+            : payload.task;
+          setTasks((current) => current.map((task) => task.id === savedTask.id ? savedTask : task));
+          setArchivedTasks((current) => current.map((task) => task.id === savedTask.id ? savedTask : task));
+        }
         const pending = pendingPaseoAssignmentSaveRef.current.get(payload.requestId);
         if (!pending) {
           // iframe 已提示“仍在保存”后仍可能收到迟到成功；不可丢掉真实计划映射。
@@ -2470,11 +2870,39 @@ export function App() {
         return;
       }
 
+      if (message.type === "taskboard:paseo-copy-response" && message.payload) {
+        const payload = message.payload as Partial<PaseoCopyResponse>;
+        if (typeof payload.requestId !== "string") return;
+        const pending = pendingPaseoCopyRequestsRef.current.get(payload.requestId);
+        if (!pending) return;
+        window.clearTimeout(pending.timeoutId);
+        pendingPaseoCopyRequestsRef.current.delete(payload.requestId);
+        if (typeof payload.error === "string") pending.reject(new Error(payload.error));
+        else if (typeof payload.copiedText === "string") pending.resolve(payload.copiedText);
+        else pending.reject(new Error("Paseo 未确认剪贴板写入结果。"));
+        return;
+      }
+
       if (message.type !== "taskboard:host-context" || !message.payload) return;
       const payload = message.payload as HostContext;
       setHostContext(payload);
       setCurrentUserActor(payload.user);
       if (isTheme(payload.theme)) setTheme(payload.theme);
+      const routeProjectId = payload.route?.projectId?.trim() || null;
+      const routeIssueIdentifier = payload.route?.issueIdentifier?.trim() || null;
+      if (
+        host === "paseo"
+        && (routeProjectId || routeIssueIdentifier)
+        && !paseoHostRouteInitializedRef.current
+      ) {
+        paseoHostRouteInitializedRef.current = true;
+        detailSourceProjectIdRef.current = null;
+        if (routeProjectId) {
+          setSelectedProjectId(routeProjectId);
+          setBoardView(routeProjectId === ALL_PROJECTS_ID ? "issues" : readProjectBoardView(routeProjectId));
+        }
+        setDetailTaskIdentifier(routeIssueIdentifier);
+      }
       if (host === "codex") void publishHostRuntime(payload);
     }
 
@@ -2498,11 +2926,26 @@ export function App() {
         pending.reject(new Error(textRef.current("Paseo 自动认领桥已关闭", "Paseo auto-claim bridge closed.")));
       }
       pendingPaseoAutomationRequestsRef.current.clear();
+      for (const pending of pendingPaseoProjectDefaultsRequestsRef.current.values()) {
+        window.clearTimeout(pending.timeoutId);
+        pending.reject(new Error("Paseo 项目默认配置桥已关闭。"));
+      }
+      pendingPaseoProjectDefaultsRequestsRef.current.clear();
       for (const pending of pendingPaseoConfigurationRequestsRef.current.values()) {
         window.clearTimeout(pending.timeoutId);
         pending.reject(new Error("Paseo 配置桥已关闭。"));
       }
       pendingPaseoConfigurationRequestsRef.current.clear();
+      for (const pending of pendingPaseoMergeRequestsRef.current.values()) {
+        window.clearTimeout(pending.timeoutId);
+        pending.reject(new Error("Paseo 合并桥已关闭。当前草稿和重试标识已保留。"));
+      }
+      pendingPaseoMergeRequestsRef.current.clear();
+      for (const pending of pendingPaseoCopyRequestsRef.current.values()) {
+        window.clearTimeout(pending.timeoutId);
+        pending.reject(new Error("Paseo 剪贴板桥已关闭。"));
+      }
+      pendingPaseoCopyRequestsRef.current.clear();
       for (const pending of pendingPaseoAssignmentSaveRef.current.values()) {
         window.clearTimeout(pending.timeoutId);
         pending.reject(new Error(textRef.current("Paseo 负责人桥已关闭", "Paseo assignee bridge closed.")));
@@ -2689,6 +3132,13 @@ export function App() {
         : items;
       setTasks(sortTasks(decorate(nextTasks)));
       setArchivedTasks(sortTasks(decorate(nextArchivedTasks)));
+      setActionError((current) => {
+        if (!current || !isPendingTaskSyncError(current)) {
+          return current;
+        }
+        const synced = [...nextTasks, ...nextArchivedTasks].find((task) => task.id === current.taskId);
+        return synced && synced.version > current.previousVersion ? null : current;
+      });
       setProjects((current) => current.map((project) => {
         if (project.id !== projectId || project.source !== "jira") return project;
         const labels = [...new Set(nextTasks.flatMap((task) => task.labels))];
@@ -3019,6 +3469,134 @@ export function App() {
     ));
   }
 
+  function isMergeIdeaEligible(task: Task): boolean {
+    const assignment = paseoAssignments[task.id];
+    return task.archivedAt === null
+      && (task.status === "backlog" || task.status === "todo")
+      && assignment?.kind !== "existing";
+  }
+
+  function canSelectMergeIdea(task: Task): boolean {
+    if (!isMergeIdeaEligible(task)) return false;
+    if (!selectedIdeaIds.has(task.id) && selectedIdeaIds.size >= 50) return false;
+    const selectedProject = tasks.find((candidate) => selectedIdeaIds.has(candidate.id))?.projectId;
+    return !selectedProject || selectedProject === task.projectId;
+  }
+
+  function toggleMergeIdea(task: Task) {
+    if (!canSelectMergeIdea(task)) return;
+    setSelectedIdeaIds((current) => {
+      const next = new Set(current);
+      if (next.has(task.id)) next.delete(task.id);
+      else next.add(task.id);
+      return next;
+    });
+  }
+
+  function openSelectedTaskDeleteConfirmation() {
+    if (batchMoveInFlightRef.current || batchDeleteInFlightRef.current || selectedIdeaIds.size === 0) return;
+    const snapshot = tasks
+      .filter((task) => selectedIdeaIds.has(task.id) && isMergeIdeaEligible(task))
+      .map((task) => ({ ...task }));
+    if (snapshot.length === 0) return;
+    setPendingSelectedTaskDelete(snapshot);
+  }
+
+  async function deleteSelectedTasks() {
+    if (!pendingSelectedTaskDelete || deletingArchivedTaskId || batchDeleteInFlightRef.current) return;
+    const snapshot = pendingSelectedTaskDelete;
+    batchDeleteInFlightRef.current = true;
+    setDeletingArchivedTaskId("batch");
+    setActionError(null);
+    const failed: Array<{ task: Task; message: string }> = [];
+    const deletedIds = new Set<string>();
+    try {
+      for (const captured of snapshot) {
+        const current = tasksRef.current.find((task) => task.id === captured.id);
+        if (!current || current.version !== captured.version || current.status !== captured.status || current.archivedAt !== captured.archivedAt) {
+          failed.push({
+            task: captured,
+            message: text("任务已变化，请重新确认", "Task changed; confirm again"),
+          });
+          continue;
+        }
+        try {
+          const archived = await archiveTaskRequest(captured);
+          setTasks((currentTasks) => currentTasks.filter((task) => task.id !== archived.id));
+          setArchivedTasks((currentTasks) => sortTasks([
+            ...currentTasks.filter((task) => task.id !== archived.id),
+            archived,
+          ]));
+          try {
+            await deleteArchivedTaskRequest(archived);
+            deletedIds.add(captured.id);
+          } catch (error) {
+            failed.push({
+              task: captured,
+              message: text(`已归档，但永久删除失败；请到已归档列表重试：${errorMessage(error)}`, `Archived, but permanent deletion failed; retry it from Archived: ${errorMessage(error)}`),
+            });
+          }
+        } catch (error) {
+          failed.push({ task: captured, message: errorMessage(error) });
+        }
+      }
+      setTasks((current) => current.filter((task) => !deletedIds.has(task.id)));
+      setArchivedTasks((current) => current.filter((task) => !deletedIds.has(task.id)));
+      setPaseoAssignments((current) => Object.fromEntries(
+        Object.entries(current).filter(([taskId]) => !deletedIds.has(taskId)),
+      ));
+      setSelectedIdeaIds(new Set(failed.map(({ task }) => task.id)));
+      setPendingSelectedTaskDelete(null);
+      setIdeaSelectionMode(failed.length > 0);
+      if (failed.length === 0) {
+        setAnnouncement(text(`${deletedIds.size} 项任务已永久删除。`, `${deletedIds.size} tasks were permanently deleted.`));
+      } else {
+        setActionError(text(
+          `已删除 ${deletedIds.size} 项；${failed.map(({ task, message }) => `${task.externalKey ?? task.identifier}：${message}`).join("；")}`,
+          `${deletedIds.size} deleted; ${failed.map(({ task, message }) => `${task.externalKey ?? task.identifier}: ${message}`).join("; ")}`,
+        ));
+      }
+      if (taskScopeProjectId) void refreshTasks(taskScopeProjectId, { quiet: true });
+    } finally {
+      batchDeleteInFlightRef.current = false;
+      setDeletingArchivedTaskId(null);
+    }
+  }
+
+  function openMergeIdeasEditorForSources(sourceSnapshot: Task[], startAfterSave = false) {
+    const sources = sourceSnapshot.filter((task) => isMergeIdeaEligible(task));
+    const projectId = sources[0]?.projectId;
+    if (!projectId || sources.length < 2 || sources.some((task) => task.projectId !== projectId)) return;
+    setEditor({
+      status: "todo",
+      projectId,
+      mergeSources: [...sources],
+      mergeRequestId: crypto.randomUUID(),
+      mergeOperationId: crypto.randomUUID(),
+      mergeStartAfterSave: startAfterSave,
+    });
+  }
+
+  function openMergeIdeasEditor() {
+    openMergeIdeasEditorForSources(tasks.filter((task) => selectedIdeaIds.has(task.id)));
+  }
+
+  useEffect(() => {
+    if (host !== "paseo") {
+      setIdeaSelectionMode(false);
+      setSelectedIdeaIds((current) => current.size === 0 ? current : new Set());
+      return;
+    }
+    if (batchMoveInFlightRef.current) return;
+    setSelectedIdeaIds((current) => {
+      const candidates = tasks.filter((task) => current.has(task.id) && isMergeIdeaEligible(task));
+      const projectId = candidates[0]?.projectId;
+      const valid = projectId ? candidates.filter((task) => task.projectId === projectId) : [];
+      const next = new Set(valid.map((task) => task.id));
+      return next.size === current.size && [...next].every((id) => current.has(id)) ? current : next;
+    });
+  }, [host, paseoAssignments, selectedProjectId, tasks]);
+
   function mainColumnLabel(status: TaskStatus): string | undefined {
     if (!usesPaseoDefaultBoard) return undefined;
     if (status === "todo") return text("等待认领", "Ideas");
@@ -3072,6 +3650,12 @@ export function App() {
     if (otherTaskTabs.includes(otherTasksTab)) return;
     setOtherTasksTab(otherTaskTabs[0]);
   }, [otherTaskTabsKey, otherTasksAvailable, otherTasksTab]);
+
+  function toggleOtherTasks(tab: OtherTaskTab) {
+    const closingCurrentTab = otherTasksOpen && otherTasksTab === tab;
+    setOtherTasksTab(tab);
+    setOtherTasksOpen(!closingCurrentTab);
+  }
 
   const aiThreadsByTask = useMemo(() => indexAiThreadsByTask(aiThreads), [aiThreads]);
   function paseoWorkspaceDisplay(task: Task, assignment: PaseoTaskAssignment | undefined): TaskCardPresentation["workspaceDisplay"] {
@@ -3327,9 +3911,10 @@ export function App() {
     beforeTaskId: string | null = null,
     useDropPosition = false,
   ) {
-    if (movingTaskId) {
+    if (movingTaskId || batchMoveInFlightRef.current) {
       setDropTarget(null);
       setDraggedTaskId(null);
+      setDraggedTaskIds(new Set());
       setDraggedTaskHeight(0);
       return;
     }
@@ -3358,6 +3943,7 @@ export function App() {
     ) {
       setDropTarget(null);
       setDraggedTaskId(null);
+      setDraggedTaskIds(new Set());
       setDraggedTaskHeight(0);
       return;
     }
@@ -3397,34 +3983,241 @@ export function App() {
           "该议题已在其他位置更新，看板已重新同步。",
           "This issue changed elsewhere. The board has been synced.",
         )
-        : errorMessage(error));
+        : host === "paseo"
+          && error instanceof ApiError
+          && error.status === 0
+          && error.code === "SERVICE_UNAVAILABLE"
+          ? {
+              kind: "pending-task-sync",
+              message: errorMessage(error),
+              taskId: task.id,
+              previousVersion: task.version,
+            }
+          : errorMessage(error));
       if (taskScopeProjectId) void refreshTasks(taskScopeProjectId, { quiet: true });
     } finally {
       setMovingTaskId(null);
       setDropTarget(null);
       setDraggedTaskId(null);
+      setDraggedTaskIds(new Set());
+      setDraggedTaskHeight(0);
+    }
+  }
+
+  function taskBelongsToVisualColumn(taskStatus: TaskStatus, columnStatus: TaskStatus): boolean {
+    if (!usesPaseoDefaultBoard) return taskStatus === columnStatus;
+    if (columnStatus === "todo") return taskStatus === "backlog" || taskStatus === "todo";
+    if (columnStatus === "in_progress") return taskStatus === "in_progress" || taskStatus === "blocked";
+    return taskStatus === columnStatus;
+  }
+
+  async function moveSelectedTasks(
+    taskIds: string[],
+    destination: TaskStatus,
+    beforeTaskId: string | null,
+  ) {
+    if (batchMoveInFlightRef.current || movingTaskId) return;
+    const snapshot = taskIds
+      .map((id) => tasksRef.current.find((task) => task.id === id))
+      .filter((task): task is Task => Boolean(task));
+    if (snapshot.length < 2) return;
+
+    const projectId = snapshot[0].projectId;
+    if (snapshot.some((task) => task.projectId !== projectId)) {
+      setActionError(text("只能整组移动同一项目的议题。", "Only issues from the same project can be moved together."));
+      return;
+    }
+
+    const selectedIds = new Set(snapshot.map((task) => task.id));
+    const ordered = [...snapshot].sort((left, right) => (
+      left.sortOrder - right.sortOrder || left.createdAt.localeCompare(right.createdAt)
+    ));
+    const destinationTasks = tasksRef.current
+      .filter((task) => (
+        task.projectId === projectId
+        && !selectedIds.has(task.id)
+        && taskBelongsToVisualColumn(task.status, destination)
+      ))
+      .sort((left, right) => left.sortOrder - right.sortOrder || left.createdAt.localeCompare(right.createdAt));
+    const requestedIndex = beforeTaskId
+      ? destinationTasks.findIndex((task) => task.id === beforeTaskId)
+      : destinationTasks.length;
+    const insertionIndex = requestedIndex < 0 ? destinationTasks.length : requestedIndex;
+    const previousTask = destinationTasks[insertionIndex - 1] ?? null;
+    const nextTask = destinationTasks[insertionIndex] ?? null;
+    const orders = ordered.map((_, index) => {
+      if (previousTask && nextTask) {
+        return previousTask.sortOrder
+          + ((nextTask.sortOrder - previousTask.sortOrder) * (index + 1)) / (ordered.length + 1);
+      }
+      if (previousTask) return previousTask.sortOrder + 1024 * (index + 1);
+      if (nextTask) return nextTask.sortOrder - 1024 * (ordered.length - index);
+      return 1024 * (index + 1);
+    });
+    const moves = ordered.map((task, index) => {
+      const staysInMergedColumn = usesPaseoDefaultBoard
+        && taskBelongsToVisualColumn(task.status, destination);
+      return {
+        task,
+        status: staysInMergedColumn ? task.status : destination,
+        sortOrder: orders[index],
+        configured: destination !== "in_progress" || paseoAssignments[task.id]?.kind === "planned",
+      };
+    });
+
+    batchMoveInFlightRef.current = true;
+    setActionError(null);
+    setBatchMovingTaskIds(new Set(taskIds));
+    setTasks((current) => sortTasks(current.map((task) => {
+      const move = moves.find((candidate) => candidate.task.id === task.id && candidate.configured);
+      return move ? { ...task, status: move.status, sortOrder: move.sortOrder } : task;
+    })));
+
+    const successfulIds = new Set<string>();
+    const failures: Array<{ task: Task; message: string; retryable: boolean }> = moves
+      .filter((move) => !move.configured)
+      .map((move) => ({
+        task: move.task,
+        message: text("尚未保存 Agent 配置", "Agent configuration has not been saved"),
+        retryable: true,
+      }));
+    const uncertain: Array<{ task: Task; message: string }> = [];
+    let needsRefresh = false;
+
+    try {
+      for (const move of moves) {
+        if (!move.configured) continue;
+        try {
+          const moved = await moveTaskRequest(move.task, move.status, move.sortOrder);
+          if (move.status === "in_progress" && moved.status === "blocked") {
+            setTasks((current) => sortTasks(current.map((task) => task.id === moved.id ? moved : task)));
+            failures.push({
+              task: moved,
+              message: text("Agent 启动失败，任务已进入阻塞状态", "Agent start failed and the issue is blocked"),
+              retryable: false,
+            });
+            continue;
+          }
+          successfulIds.add(move.task.id);
+          setTasks((current) => sortTasks(current.map((task) => task.id === moved.id ? moved : task)));
+        } catch (error) {
+          let reconciled: Task | null = null;
+          if (error instanceof ApiError && error.status === 0 && error.code === "SERVICE_UNAVAILABLE") {
+            needsRefresh = true;
+            try {
+              const latest = (await listTasks(projectId)).find((task) => task.id === move.task.id) ?? null;
+              const continuedAfterStart = move.status === "in_progress"
+                && latest
+                && latest.version > move.task.version
+                && ["in_progress", "in_review", "done"].includes(latest.status);
+              if (latest && latest.version > move.task.version
+                && (latest.status === move.status || continuedAfterStart)) {
+                reconciled = latest;
+              } else if (latest?.status === "blocked" && latest.version > move.task.version) {
+                setTasks((current) => sortTasks(current.map((task) => task.id === latest.id ? latest : task)));
+                failures.push({
+                  task: latest,
+                  message: text("Paseo 已将任务标记为阻塞，未成功启动", "Paseo marked the issue blocked; it did not start successfully"),
+                  retryable: false,
+                });
+                continue;
+              }
+            } catch {
+              // 保留失败项，等待正常任务轮询确认后再由用户重试。
+            }
+          }
+          if (reconciled) {
+            successfulIds.add(move.task.id);
+            setTasks((current) => sortTasks(current.map((task) => task.id === reconciled!.id ? reconciled! : task)));
+          } else {
+            setTasks((current) => sortTasks(current.map((task) => task.id === move.task.id ? move.task : task)));
+            if (error instanceof ApiError && error.status === 0 && error.code === "SERVICE_UNAVAILABLE") {
+              uncertain.push({
+                task: move.task,
+                message: text("网络结果待刷新确认，请勿立即重试", "Network result awaits refresh; do not retry yet"),
+              });
+            } else {
+              failures.push({ task: move.task, message: errorMessage(error), retryable: true });
+            }
+          }
+        }
+      }
+
+      const failedIds = new Set(failures.filter((failure) => failure.retryable).map((failure) => failure.task.id));
+      setSelectedIdeaIds((current) => new Set([...current].filter((id) => (
+        !selectedIds.has(id) || failedIds.has(id)
+      ))));
+      if (failures.length === 0 && uncertain.length === 0) {
+        setIdeaSelectionMode(false);
+        setAnnouncement(text(
+          `已移动 ${successfulIds.size} 项议题。`,
+          `${successfulIds.size} issues moved.`,
+        ));
+      } else {
+        const resultDetails = [
+          ...failures.map(({ task, message }) => `${task.externalKey ?? task.identifier}：${message}`),
+          ...uncertain.map(({ task, message }) => `${task.externalKey ?? task.identifier}：${message}`),
+        ].join("；");
+        setActionError(text(
+          `已移动 ${successfulIds.size} 项。${resultDetails}${failedIds.size > 0 ? "；可重试的失败项已保留选择。" : ""}`,
+          `${successfulIds.size} moved. ${resultDetails}${failedIds.size > 0 ? "; retryable failures remain selected." : ""}`,
+        ));
+      }
+      if (needsRefresh && taskScopeProjectId) void refreshTasks(taskScopeProjectId, { quiet: true });
+    } finally {
+      batchMoveInFlightRef.current = false;
+      setBatchMovingTaskIds(new Set());
+      setDropTarget(null);
+      setDraggedTaskId(null);
+      setDraggedTaskIds(new Set());
       setDraggedTaskHeight(0);
     }
   }
 
   function startTaskDrag(task: Task, height: number) {
+    const snapshot = ideaSelectionMode && selectedIdeaIds.has(task.id)
+      ? tasks
+          .filter((candidate) => selectedIdeaIds.has(candidate.id) && isMergeIdeaEligible(candidate))
+          .sort((left, right) => left.sortOrder - right.sortOrder || left.createdAt.localeCompare(right.createdAt))
+      : [task];
+    draggedTaskIdsRef.current = snapshot.map((candidate) => candidate.id);
     setDraggedTaskId(task.id);
+    setDraggedTaskIds(new Set(draggedTaskIdsRef.current));
     setDraggedTaskHeight(height);
     setDropTarget(task.status);
   }
 
   function endTaskDrag() {
+    draggedTaskIdsRef.current = [];
     setDraggedTaskId(null);
+    setDraggedTaskIds(new Set());
     setDraggedTaskHeight(0);
     setDropTarget(null);
   }
 
   function finishTaskDrop(destination: TaskStatus, taskId: string, beforeTaskId: string | null = null) {
     const task = tasks.find((candidate) => candidate.id === taskId);
+    const taskIds = draggedTaskIdsRef.current.includes(taskId)
+      ? [...draggedTaskIdsRef.current]
+      : [taskId];
+    draggedTaskIdsRef.current = [];
     setDraggedTaskId(null);
+    setDraggedTaskIds(new Set());
     setDraggedTaskHeight(0);
     setDropTarget(null);
     if (!task) return;
+    if (taskIds.length > 1) {
+      if (host === "paseo" && destination === "in_progress") {
+        openMergeIdeasEditorForSources(
+          taskIds.map((id) => tasksRef.current.find((candidate) => candidate.id === id))
+            .filter((candidate): candidate is Task => Boolean(candidate)),
+          true,
+        );
+        return;
+      }
+      void moveSelectedTasks(taskIds, destination, beforeTaskId);
+      return;
+    }
     setSettlingTaskId(task.id);
     window.setTimeout(() => {
       setSettlingTaskId((current) => current === task.id ? null : current);
@@ -3436,6 +4229,105 @@ export function App() {
       ? "blocked"
       : destination;
     void moveTask(task, effectiveDestination, beforeTaskId, true);
+  }
+
+  async function saveMergeIdeasDraft(
+    draft: TaskDraft,
+    inlineFiles: PendingInlineAttachment[],
+    inlineImages: PendingInlineImage[],
+    createOptions?: NewTaskCreateOptions,
+  ) {
+    if (!editor?.mergeSources || !editor.mergeRequestId || !editor.mergeOperationId || !editor.projectId) {
+      throw new Error("合并草稿已失效，请重新选择来源想法。");
+    }
+    if (inlineFiles.length > 0 || inlineImages.length > 0) {
+      throw new Error("合并任务的补充要求暂不支持附件，请移除附件后重试。");
+    }
+    const choice = createOptions?.paseoAssigneeId
+      ? paseoAssigneeChoices.choices.get(createOptions.paseoAssigneeId)
+      : null;
+    if (choice?.kind !== "planned" || !choice.profile) {
+      throw new Error("请选择用于新任务的新建 Agent 配置。");
+    }
+    const workspacePath = createOptions?.paseoWorkspacePath;
+    if (!workspacePath) throw new Error("请选择新 Agent 的项目或工作区。");
+    const sourceTaskIds = editor.mergeSources.map((source) => source.id);
+    if (sourceTaskIds.length < 2 || sourceTaskIds.length > 50) {
+      throw new Error("请选择 2 至 50 个来源想法。");
+    }
+    const result = await requestPaseoMergeIdeas({
+      requestId: editor.mergeRequestId,
+      operationId: editor.mergeOperationId,
+      projectId: editor.projectId,
+      sourceTaskIds,
+      title: draft.title,
+      ...(draft.description.trim() ? { description: draft.description } : {}),
+      workspacePath,
+      profile: {
+        ...choice.profile,
+        modeId: createOptions?.paseoModeId,
+        thinkingOptionId: createOptions?.paseoThinkingOptionId,
+      },
+    });
+    const archivedSourceIds = new Set(result.sourceTaskIds);
+    setTasks((current) => sortTasks([
+      ...current.filter((task) => !archivedSourceIds.has(task.id) && task.id !== result.task.id),
+      result.task,
+    ]));
+    setPaseoAssignments((current) => ({
+      ...Object.fromEntries(Object.entries(current).filter(([taskId]) => !archivedSourceIds.has(taskId))),
+      [result.task.id]: result.assignment,
+    }));
+    const startAfterSave = editor.mergeStartAfterSave === true;
+    let startedTask: Task | null = null;
+    let startError: unknown = null;
+    let startUnconfirmed = false;
+    if (startAfterSave) {
+      if (["in_progress", "in_review", "done"].includes(result.task.status)) {
+        startedTask = result.task;
+      } else if (result.task.status === "blocked") {
+        startError = new Error("blocked");
+      } else {
+        try {
+          startedTask = await moveTaskRequest(result.task, "in_progress");
+          if (startedTask.status === "blocked") startError = new Error("blocked");
+        } catch (error) {
+          startError = error;
+          startUnconfirmed = error instanceof ApiError
+            && error.status === 0
+            && error.code === "SERVICE_UNAVAILABLE";
+        }
+      }
+    }
+    const finalTask = startedTask ?? result.task;
+    setTasks((current) => sortTasks(current.map((task) => task.id === finalTask.id ? finalTask : task)));
+    setSelectedIdeaIds(new Set());
+    setIdeaSelectionMode(false);
+    setNewTaskDraft(null);
+    setEditor(null);
+    setActionError(null);
+    if (startAfterSave && startError) {
+      setActionError(text(
+        startUnconfirmed
+          ? `${result.task.identifier} 已合并，启动尚未确认；请打开详情刷新后再决定是否重试。`
+          : `${result.task.identifier} 已合并，启动失败，请打开详情重试。`,
+        startUnconfirmed
+          ? `${result.task.identifier} was merged, but start is not yet confirmed. Refresh the detail before retrying.`
+          : `${result.task.identifier} was merged, but starting failed. Open the detail to retry.`,
+      ));
+      requestAnimationFrame(() => openTaskDetail(finalTask));
+    } else if (startAfterSave) {
+      setAnnouncement(text(
+        `${result.task.identifier} 已合并并开始；来源想法已保留记录并归档。`,
+        `${result.task.identifier} was merged and started; source ideas kept their history and were archived.`,
+      ));
+    } else {
+      setAnnouncement(text(
+        `${result.task.identifier} 已创建；${archivedSourceIds.size} 个来源想法已保留记录并归档。`,
+        `${result.task.identifier} was created; ${archivedSourceIds.size} source ideas kept their history and were archived.`,
+      ));
+    }
+    void refreshTasks(editor.projectId, { quiet: true });
   }
 
   async function updateTaskProperties(task: Task, changes: Partial<TaskDraft>): Promise<Task> {
@@ -3668,10 +4560,111 @@ export function App() {
 
   async function copyText(content: string, message: string) {
     try {
-      await navigator.clipboard.writeText(content);
+      if (host === "paseo") await requestPaseoCopy({ kind: "text", text: content });
+      else await navigator.clipboard.writeText(content);
+      const previousCopyError = copyActionErrorRef.current;
+      copyActionErrorRef.current = null;
+      if (previousCopyError) {
+        setActionError((current) => current === previousCopyError ? null : current);
+      }
       setAnnouncement(message);
-    } catch {
-      setActionError(text("无法写入剪贴板。", "Could not write to the clipboard."));
+    } catch (error) {
+      const copyError = error instanceof Error
+        ? error.message
+        : text("无法写入剪贴板。", "Could not write to the clipboard.");
+      copyActionErrorRef.current = copyError;
+      setActionError(copyError);
+    }
+  }
+
+  function openTaskProjectMove(task: Task) {
+    if (task.source === "jira") return;
+    setPendingTaskProjectMove({ task, targetProjectId: null });
+    setTaskProjectMoveSearch("");
+    setTaskProjectMoveError(null);
+  }
+
+  function closeTaskProjectMove() {
+    if (movingTaskProject) return;
+    setPendingTaskProjectMove(null);
+    setTaskProjectMoveSearch("");
+    setTaskProjectMoveError(null);
+  }
+
+  async function confirmTaskProjectMove() {
+    if (!pendingTaskProjectMove?.targetProjectId || movingTaskProject) return;
+    const { task, targetProjectId } = pendingTaskProjectMove;
+    const targetProject = projects.find((project) => project.id === targetProjectId);
+    if (!targetProject || targetProject.source !== "local" || targetProject.id === task.projectId) return;
+    const targetProjectName = projectChoices.find((project) => project.id === targetProjectId)?.name ?? targetProject.name;
+    setMovingTaskProject(true);
+    setTaskProjectMoveError(null);
+    try {
+      const moved = await moveTaskToProjectRequest(task, targetProjectId);
+      setTasks((current) => {
+        if (selectedProjectId !== ALL_PROJECTS_ID && selectedProjectId !== moved.projectId) {
+          return current.filter((candidate) => candidate.id !== moved.id);
+        }
+        return sortTasks([
+          ...current.filter((candidate) => candidate.id !== moved.id),
+          moved,
+        ]);
+      });
+      setProjects((current) => current.map((project) => {
+        if (project.id === task.projectId) {
+          return { ...project, issueCount: Math.max(0, project.issueCount - 1) };
+        }
+        if (project.id === moved.projectId) {
+          return { ...project, issueCount: project.issueCount + 1 };
+        }
+        return project;
+      }));
+      if (detailTaskIdentifier === task.identifier && selectedProjectId !== ALL_PROJECTS_ID) {
+        closeTaskDetail();
+      }
+      setPendingTaskProjectMove(null);
+      setTaskProjectMoveSearch("");
+      setAnnouncement(text(
+        `${moved.identifier} 已移动到“${targetProjectName}”。`,
+        `${moved.identifier} moved to “${targetProjectName}”.`,
+      ));
+      void refreshProjectList();
+    } catch (error) {
+      setTaskProjectMoveError(error instanceof ApiError && error.code === "CROSS_PROJECT_RELATION"
+        ? text("该议题有父子、依赖或相关任务，请先解除这些关联，再移动到其他项目。", "Remove this issue's parent, dependency, and related issue links before moving it to another project.")
+        : error instanceof ApiError && error.code === "AI_CHAT_PROJECT_MOVE_BLOCKED"
+          ? text("该议题已关联原项目的内置 AI 对话，暂不支持跨项目移动。", "This issue has linked AI conversations in its original project and cannot be moved yet.")
+          : error instanceof ApiError && error.code === "VERSION_CONFLICT"
+            ? text("议题已发生变化，请重新打开移动窗口后重试。", "This issue has changed. Reopen the move dialog and try again.")
+            : errorMessage(error));
+    } finally {
+      setMovingTaskProject(false);
+    }
+  }
+
+  async function copyIssueLink(projectId: string, identifier: string, message: string) {
+    try {
+      if (host === "paseo") {
+        await requestPaseoCopy({ kind: "issue-link", projectId, identifier });
+      } else {
+        await navigator.clipboard.writeText(buildIssueUrl(
+          document.baseURI,
+          projectId,
+          identifier,
+        ).href);
+      }
+      const previousCopyError = copyActionErrorRef.current;
+      copyActionErrorRef.current = null;
+      if (previousCopyError) {
+        setActionError((current) => current === previousCopyError ? null : current);
+      }
+      setAnnouncement(message);
+    } catch (error) {
+      const copyError = error instanceof Error
+        ? error.message
+        : text("无法复制议题链接。", "Could not copy the issue link.");
+      copyActionErrorRef.current = copyError;
+      setActionError(copyError);
     }
   }
 
@@ -3944,6 +4937,7 @@ export function App() {
     setActionError(null);
     undoStackRef.current = [];
     setUndoNotice(null);
+    if (host === "paseo") return;
     const url = buildIssueUrl(window.location.href, projectId, null);
     window.history.replaceState(null, "", url);
   }
@@ -4044,6 +5038,9 @@ export function App() {
     setProjectMenuOpen(false);
     setProjectContextMenu(null);
     setProjectName("");
+    setProjectCreateId(`temp-${window.crypto.randomUUID()}`);
+    setProjectCreateDefaults({ profile: null, workspacePath: null });
+    setProjectCreateDefaultsOpen(false);
     setActionError(null);
     setProjectCreateOpen(true);
   }
@@ -4051,6 +5048,8 @@ export function App() {
   function closeCreateProjectDialog() {
     if (openingProjectId) return;
     setProjectCreateOpen(false);
+    setProjectCreateId(null);
+    setProjectCreateDefaultsOpen(false);
     setActionError(null);
   }
 
@@ -4058,17 +5057,32 @@ export function App() {
     if (openingProjectId) return;
     const name = projectName.trim();
     if (!name) return;
-    const projectId = `temp-${window.crypto.randomUUID()}`;
+    const projectId = projectCreateId;
+    if (!projectId) return;
     setOpeningProjectId(projectId);
     setActionError(null);
     try {
-      const project = await createProjectRequest({
-        id: projectId,
-        name,
-        workspacePath: null,
-      });
-      setProjects((current) => [...current, project]);
+      if (host === "paseo") {
+        await savePaseoProjectDefaults(projectId, projectCreateDefaults);
+      }
+      let project: Project;
+      try {
+        project = await createProjectRequest({
+          id: projectId,
+          name,
+          workspacePath: null,
+        });
+      } catch (error) {
+        if (!(error instanceof ApiError) || error.code !== "PROJECT_EXISTS") throw error;
+        const nextProjects = await listProjects();
+        project = nextProjects.find((candidate) => candidate.id === projectId)
+          ?? (() => { throw error; })();
+      }
+      setProjects((current) => current.some((candidate) => candidate.id === project.id)
+        ? current.map((candidate) => candidate.id === project.id ? project : candidate)
+        : [...current, project]);
       setProjectCreateOpen(false);
+      setProjectCreateId(null);
       changeProject(project.id);
     } catch (error) {
       setActionError(errorMessage(error));
@@ -4077,11 +5091,50 @@ export function App() {
     }
   }
 
+  async function openProjectDefaultsDialog(projectId: string) {
+    if (host !== "paseo" || projectDefaultsLoading) return;
+    setProjectMenuOpen(false);
+    setProjectContextMenu(null);
+    setProjectDefaultsLoading(true);
+    setActionError(null);
+    refreshPaseoAssignmentOptions(projectId);
+    try {
+      const automation = await requestPaseoAutomation("get", projectId);
+      setPaseoAutomations((current) => ({ ...current, [automation.projectId]: automation }));
+      setProjectSettingsName(
+        projects.find((project) => project.id === projectId)?.name
+          ?? projectChoices.find((project) => project.id === projectId)?.name
+          ?? "",
+      );
+      setProjectDefaultsProjectId(projectId);
+    } catch (error) {
+      setActionError(errorMessage(error));
+    } finally {
+      setProjectDefaultsLoading(false);
+    }
+  }
+
   function requestProjectDelete(project: ProjectChoice) {
     setProjectMenuOpen(false);
     setProjectContextMenu(null);
     setProjectDeleteIssueCount(null);
     setPendingProjectDelete(project);
+  }
+
+  function openProjectContextMenu(project: ProjectChoice, x: number, y: number) {
+    const actions = projectActionsFor(project);
+    if (!actions.canEdit && !actions.canDelete) return;
+    const menuWidth = 190;
+    if (projectContextMenu?.project.id === project.id) {
+      setProjectContextMenu(null);
+      return;
+    }
+    const menuHeight = (Number(actions.canEdit) + 1) * 32 + 12 + (actions.canDelete ? 0 : 40);
+    setProjectContextMenu({
+      project,
+      x: Math.max(8, Math.min(x, window.innerWidth - menuWidth - 8)),
+      y: Math.max(8, Math.min(y, window.innerHeight - menuHeight - 8)),
+    });
   }
 
   function closeProjectDeleteDialog() {
@@ -4243,35 +5296,60 @@ export function App() {
                           <div className="project-menu-divider" role="separator" />
                         </>
                       )}
-                      {projectMenuChoices.map((project) => (
-                        <Fragment key={project.id}>
+                      {projectMenuChoices.map((project) => {
+                        const actions = projectActionsFor(project);
+                        return (
+                          <Fragment key={project.id}>
                           {hasProjectsWithIssues && project.id === firstEmptyProjectId && (
                             <div className="project-menu-divider" role="separator" />
                           )}
-                          <button
-                            type="button"
-                            role="menuitemradio"
-                            aria-checked={project.id === selectedProjectId}
-                            disabled={openingProjectId !== null}
-                            onContextMenu={project.id.startsWith("temp-") ? (event) => {
-                              event.preventDefault();
-                              setProjectContextMenu({
-                                project,
-                                x: event.clientX,
-                                y: event.clientY,
-                              });
-                            } : undefined}
-                            onClick={() => {
-                              if (project.id === selectedProjectId) setProjectMenuOpen(false);
-                              else void selectProject(project);
-                            }}
-                          >
-                            <TaskboardIcon className="project-avatar" name="projectFolder" />
-                            <span>{project.name}</span>
-                            {project.id === selectedProjectId && <span className="project-menu-check" aria-hidden="true"><LinearIcon name="check" /></span>}
-                          </button>
-                        </Fragment>
-                      ))}
+                          <div className="project-menu-row">
+                            <button
+                              className="project-menu-select"
+                              type="button"
+                              role="menuitemradio"
+                              aria-checked={project.id === selectedProjectId}
+                              disabled={openingProjectId !== null}
+                              onContextMenu={(event) => {
+                                if (!actions.canEdit && !actions.canDelete) return;
+                                event.preventDefault();
+                                openProjectContextMenu(project, event.clientX, event.clientY);
+                              }}
+                              onClick={() => {
+                                if (project.id === selectedProjectId) setProjectMenuOpen(false);
+                                else void selectProject(project);
+                              }}
+                            >
+                              <TaskboardIcon className="project-avatar" name="projectFolder" />
+                              <span title={project.name}>{project.name}</span>
+                              {project.id === selectedProjectId && <span className="project-menu-check" aria-hidden="true"><LinearIcon name="check" /></span>}
+                            </button>
+                            {(actions.canEdit || actions.canDelete) && (
+                              <button
+                                className="project-menu-more"
+                                type="button"
+                                role="menuitem"
+                                aria-haspopup="menu"
+                                aria-expanded={projectContextMenu?.project.id === project.id}
+                                aria-label={text(`管理项目“${project.name}”`, `Manage project “${project.name}”`)}
+                                title={text("更多", "More")}
+                                disabled={openingProjectId !== null}
+                                onClick={(event) => {
+                                  const rect = event.currentTarget.getBoundingClientRect();
+                                  const parentRect = event.currentTarget.closest(".header-project-menu")?.getBoundingClientRect();
+                                  const right = (parentRect?.right ?? rect.right) + 6;
+                                  const left = (parentRect?.left ?? rect.left) - 196;
+                                  const x = right + 190 <= window.innerWidth - 8 || left < 8 ? right : left;
+                                  openProjectContextMenu(project, x, rect.top);
+                                }}
+                              >
+                                <MoreIcon color="currentColor" />
+                              </button>
+                            )}
+                          </div>
+                          </Fragment>
+                        );
+                      })}
                       {projectMenuNeedle && projectMenuChoices.length === 0 && (
                         <div className="project-menu-empty">{text("没有匹配项目", "No matching projects")}</div>
                       )}
@@ -4310,6 +5388,18 @@ export function App() {
           <div ref={dragRegionRef} className="workspace-drag-region" aria-hidden="true" />
 
           <div className="header-actions">
+            {host === "paseo" && selectedProject && selectedProject.id !== ALL_PROJECTS_ID && (
+              <button
+                className="icon-button project-settings-trigger"
+                type="button"
+                disabled={projectDefaultsLoading}
+                aria-label={text("项目设置", "Project settings")}
+                title={text("项目设置", "Project settings")}
+                onClick={() => void openProjectDefaultsDialog(selectedProject.id)}
+              >
+                <LinearIcon name="displayOptions" />
+              </button>
+            )}
             {selectedProject && (
               <ProjectAutomationMenu
                 automation={host === "paseo" ? selectedPaseoAutomation : selectedProjectAutomation}
@@ -4327,15 +5417,20 @@ export function App() {
                     : null
                   : automationProjectContext.unavailableReason}
                 onOpen={() => {
-                  if (host === "paseo") void refreshPaseoAutomation();
+                  if (host === "paseo") {
+                    void refreshPaseoAutomation();
+                    refreshPaseoAssignmentOptions(selectedProject.id);
+                  }
                   else void reconcileProjectAutomation();
                 }}
                 onChange={(options) => {
                   if (host === "paseo") {
-                    void savePaseoAutomation({
+                    return savePaseoAutomation({
                       enabledByUser: options.enabledByUser,
                       intervalMinutes: options.intervalMinutes,
                       quotaAware: options.quotaAware,
+                      ...(Object.hasOwn(options, "workspacePath") ? { workspacePath: options.workspacePath ?? null } : {}),
+                      ...(Object.hasOwn(options, "profile") ? { profile: options.profile ?? null } : {}),
                     });
                   } else if (options.model && options.reasoningEffort) {
                     void saveProjectAutomation({
@@ -4347,6 +5442,11 @@ export function App() {
                     });
                   }
                 }}
+                onSaveDefaults={host === "paseo" ? async (value) => {
+                  await savePaseoProjectDefaults(selectedProject.id, value);
+                  return true;
+                } : undefined}
+                paseoDefaults={host === "paseo" ? paseoProjectDefaultsCatalog : undefined}
               />
             )}
             {isJiraProject && (
@@ -4416,7 +5516,7 @@ export function App() {
                 aria-pressed={boardView === "readme"}
                 onClick={() => selectBoardView("readme")}
               >
-                {text("项目文档", "Project Docs")}
+                {text(host === "paseo" ? "项目说明" : "项目文档", host === "paseo" ? "Project Instructions" : "Project Docs")}
               </button>
             )}
           </div>
@@ -4536,6 +5636,7 @@ export function App() {
             onOpenLegacyLocalThread={openLegacyLocalThread}
             onOpenInThread={openTaskInThread}
             onCopy={(text, message) => void copyText(text, message)}
+            onCopyIssueLink={(projectId, identifier, message) => void copyIssueLink(projectId, identifier, message)}
             openingThread={openingThreadTaskId === detailTask.id}
             onError={setActionError}
             paseoAssignment={host === "paseo" ? paseoAssignments[detailTask.id] ?? null : null}
@@ -4555,13 +5656,23 @@ export function App() {
               onChange: (choiceId) => {
                 const currentAssignment = paseoAssignments[detailTask.id];
                 const choice = paseoAssigneeChoices.choices.get(choiceId);
-                const workspacePath = choice?.kind === "planned"
-                  ? (currentAssignment?.kind === "planned"
-                    ? currentAssignment.workspacePath
-                    : paseoAssignmentOptions?.workspaces.find((workspace) => workspace.path === paseoAssignmentOptions.defaultWorkspacePath)?.path ?? null)
-                  : undefined;
-                void changePaseoTaskAssignment(detailTask, choiceId, workspacePath ?? undefined);
+                if (choice?.kind === "planned") {
+                  openPaseoExecutionDialog(detailTask, choiceId);
+                  return;
+                }
+                void changePaseoTaskAssignment(
+                  detailTask,
+                  choiceId,
+                  currentAssignment?.kind === "planned" ? currentAssignment.workspacePath : undefined,
+                );
               },
+            } : undefined}
+            paseoExecutionConfig={host === "paseo" && paseoAssignments[detailTask.id]?.kind !== "existing" ? {
+              onOpen: () => openPaseoExecutionDialog(detailTask),
+            } : undefined}
+            paseoProjectDefaults={host === "paseo" ? {
+              profile: paseoAutomations[detailTask.projectId]?.profile ?? null,
+              workspacePath: paseoAutomations[detailTask.projectId]?.workspacePath ?? null,
             } : undefined}
             paseoConfiguration={host === "paseo" ? (() => {
               const assignment = paseoAssignments[detailTask.id];
@@ -4587,7 +5698,25 @@ export function App() {
                 } : {}),
               };
             })() : undefined}
-            paseoWorktree={host === "paseo"}
+            paseoWorktree={host === "paseo" ? {
+              workspaces: (paseoAssignmentOptions?.workspaces ?? []).flatMap((workspace) => (
+                workspace.path ? [{ ...workspace, path: workspace.path }] : []
+              )),
+              onRefresh: () => refreshPaseoAssignmentOptions(detailTask.projectId),
+              onCreated: async (result) => {
+                const assignment = paseoAssignments[detailTask.id];
+                if (assignment?.kind !== "planned") return;
+                await changePaseoTaskAssignment(
+                  detailTask,
+                  paseoAssignmentValue(detailTask),
+                  result.workspace.path,
+                  undefined,
+                  true,
+                  true,
+                  { kind: "planned", profile: assignment.profile },
+                );
+              },
+            } : undefined}
           />
         ) : boardView !== "readme"
           && hasLoadedTasks
@@ -4632,6 +5761,7 @@ export function App() {
           <ProjectReadmeView
             key={selectedProjectId}
             project={selectedProject}
+            paseoMode={host === "paseo"}
             tasks={tasks.filter((task) => task.projectId === selectedProject.id)}
             referenceTasks={referenceTasks.filter((task) => task.projectId === selectedProject.id)}
             revision={readmeRevision}
@@ -4711,7 +5841,7 @@ export function App() {
                             className={`board-terminal-chip status-done${otherTasksOpen && otherTasksTab === "done" ? " is-active" : ""}`}
                             aria-controls="other-tasks-panel"
                             aria-pressed={otherTasksOpen && otherTasksTab === "done"}
-                            onClick={() => { setOtherTasksTab("done"); setOtherTasksOpen(true); }}
+                            onClick={() => toggleOtherTasks("done")}
                           >
                             <span>{text("已完成", "Done")}</span><b>{doneTaskCount}</b>
                           </button>
@@ -4722,7 +5852,7 @@ export function App() {
                             className={`board-terminal-chip status-canceled${otherTasksOpen && otherTasksTab === "canceled" ? " is-active" : ""}`}
                             aria-controls="other-tasks-panel"
                             aria-pressed={otherTasksOpen && otherTasksTab === "canceled"}
-                            onClick={() => { setOtherTasksTab("canceled"); setOtherTasksOpen(true); }}
+                            onClick={() => toggleOtherTasks("canceled")}
                           >
                             <span>{text("已取消", "Canceled")}</span><b>{canceledTaskCount}</b>
                           </button>
@@ -4733,7 +5863,7 @@ export function App() {
                             className={`board-terminal-chip status-archived${otherTasksOpen && otherTasksTab === "archived" ? " is-active" : ""}`}
                             aria-controls="other-tasks-panel"
                             aria-pressed={otherTasksOpen && otherTasksTab === "archived"}
-                            onClick={() => { setOtherTasksTab("archived"); setOtherTasksOpen(true); }}
+                            onClick={() => toggleOtherTasks("archived")}
                           >
                             <span>{text("已归档", "Archived")}</span><b>{archivedTaskCount}</b>
                           </button>
@@ -4765,8 +5895,10 @@ export function App() {
                         emptyMessage={mainColumnEmptyMessage(item)}
                         isDropTarget={dropTarget === item}
                         draggedTaskId={draggedTaskId}
+                        draggedTaskIds={draggedTaskIds}
                         draggedTaskHeight={draggedTaskHeight}
                         movingTaskId={movingTaskId}
+                        batchMovingTaskIds={batchMovingTaskIds}
                         settlingTaskId={settlingTaskId}
                         contextMenuTaskId={contextMenu?.taskId ?? null}
                         availableLabels={availableLabels}
@@ -4786,6 +5918,19 @@ export function App() {
                         onDragEnter={setDropTarget}
                         onDrop={finishTaskDrop}
                         onOpenConversation={openTaskConversation}
+                        ideaSelection={host === "paseo" && (item === "todo" || item === "backlog") ? {
+                          active: ideaSelectionMode,
+                          selectedIds: selectedIdeaIds,
+                          canSelect: canSelectMergeIdea,
+                          onToggleMode: () => {
+                            setIdeaSelectionMode((current) => !current);
+                            setSelectedIdeaIds(new Set());
+                          },
+                          onToggleTask: toggleMergeIdea,
+                          onMerge: openMergeIdeasEditor,
+                          onDelete: openSelectedTaskDeleteConfirmation,
+                          moving: batchMoveInFlightRef.current || deletingArchivedTaskId !== null,
+                        } : undefined}
                       />
                     ))}
                   </div>
@@ -4801,8 +5946,10 @@ export function App() {
                     hasActiveFilters={hasActiveTaskFilters}
                     isDropTarget={otherTasksTab !== "archived" && dropTarget === otherTasksTab}
                     draggedTaskId={draggedTaskId}
+                    draggedTaskIds={draggedTaskIds}
                     draggedTaskHeight={draggedTaskHeight}
                     movingTaskId={movingTaskId}
+                    batchMovingTaskIds={batchMovingTaskIds}
                     settlingTaskId={settlingTaskId}
                     contextMenuTaskId={contextMenu?.taskId ?? null}
                     availableLabels={availableLabels}
@@ -4813,6 +5960,7 @@ export function App() {
                     onCreateLabel={persistProjectLabel}
                     restoringTaskId={restoringTaskId}
                     deletingTaskId={deletingArchivedTaskId}
+                    onClose={() => setOtherTasksOpen(false)}
                     onTabChange={setOtherTasksTab}
                     onCreate={isJiraProject
                       ? undefined
@@ -4846,15 +5994,35 @@ export function App() {
           )}
           style={{ left: projectContextMenu.x, top: projectContextMenu.y }}
         >
-          <button
-            className="context-menu-item is-danger"
-            type="button"
-            role="menuitem"
-            onClick={() => requestProjectDelete(projectContextMenu.project)}
-          >
-            <span className="context-menu-icon" aria-hidden="true"><DeleteIcon color="currentColor" /></span>
-            <span className="context-menu-label">{text("删除项目", "Delete project")}</span>
-          </button>
+          {projectContextActions?.canEdit && (
+            <button
+              className="context-menu-item"
+              type="button"
+              role="menuitem"
+              disabled={projectDefaultsLoading}
+              onClick={() => void openProjectDefaultsDialog(projectContextMenu.project.id)}
+            >
+              <span className="context-menu-icon" aria-hidden="true"><LinearIcon name="displayOptions" /></span>
+              <span className="context-menu-label">{text("编辑项目", "Edit project")}</span>
+            </button>
+          )}
+          {projectContextActions && (
+            <button
+              className="context-menu-item is-danger"
+              type="button"
+              role="menuitem"
+              disabled={!projectContextActions.canDelete}
+              onClick={() => requestProjectDelete(projectContextMenu.project)}
+            >
+              <span className="context-menu-icon" aria-hidden="true"><DeleteIcon color="currentColor" /></span>
+              <span className="context-menu-label">{text("删除项目", "Delete project")}</span>
+            </button>
+          )}
+          {projectContextActions && !projectContextActions.canDelete && (
+            <p className="project-context-menu-note">{projectContextMenu.project.id === GLOBAL_PROJECT_ID
+              ? text("系统默认项目，不能删除。", "The default system project cannot be deleted.")
+              : text("此项目由系统管理，不能删除。", "This project is managed by the system and cannot be deleted.")}</p>
+          )}
         </div>
       )}
 
@@ -4901,8 +6069,37 @@ export function App() {
                 onChange={(event) => setProjectName(event.target.value)}
               />
             </label>
+            {host === "paseo" && (
+              <div className="project-create-defaults">
+                <div>
+                  <strong>{text("默认执行配置", "Default execution settings")}</strong>
+                  <span>{[
+                    projectCreateDefaults.profile?.name ?? text("未指定 Agent", "No Agent"),
+                    projectCreateDefaults.profile?.thinkingOptionId
+                      ? `Thinking ${projectCreateDefaults.profile.thinkingOptionId}`
+                      : null,
+                    projectCreateDefaults.profile?.modeId
+                      ? `Mode ${projectCreateDefaults.profile.modeId}`
+                      : null,
+                    projectCreateDefaults.workspacePath
+                      ? projectCreateDefaults.workspacePath.split(/[\\/]/).filter(Boolean).at(-1)
+                      : text("未指定目录", "No directory"),
+                  ].filter(Boolean).join(" · ")}</span>
+                </div>
+                <button
+                  type="button"
+                  disabled={openingProjectId !== null}
+                  onClick={() => {
+                    if (projectCreateId) refreshPaseoAssignmentOptions(projectCreateId);
+                    setProjectCreateDefaultsOpen(true);
+                  }}
+                >
+                  {text("配置", "Configure")}
+                </button>
+              </div>
+            )}
             {actionErrorText && <p className="project-dialog-error">{actionErrorText}</p>}
-            <div>
+            <div className="project-create-actions">
               <button
                 className="button secondary"
                 type="button"
@@ -4923,6 +6120,63 @@ export function App() {
             </div>
           </form>
         </div>
+      )}
+
+      {projectCreateDefaultsOpen && host === "paseo" && (
+        <PaseoProjectDefaultsDialog
+          key={`create:${projectCreateId ?? "new"}`}
+          title={text("项目默认执行配置", "Project default execution settings")}
+          description={text(
+            "可全部留空。手动开始和自动认领都会使用这里的当前配置。",
+            "Everything is optional. Manual start and auto-claim use the current settings here.",
+          )}
+          value={projectCreateDefaults}
+          catalog={paseoProjectDefaultsCatalog}
+          onClose={() => setProjectCreateDefaultsOpen(false)}
+          onSave={(value) => {
+            setProjectCreateDefaults(value);
+            return true;
+          }}
+        />
+      )}
+
+      {projectDefaultsProjectId && host === "paseo" && (
+        <PaseoProjectDefaultsDialog
+          key={`settings:${projectDefaultsProjectId}`}
+          title={text("项目设置", "Project settings")}
+          description={text(
+            "修改项目名称、默认 Agent 和代码目录；任务自己的执行配置优先。",
+            "Edit the project name, default Agent, and code directory; task-level settings take priority.",
+          )}
+          projectName={projectSettingsProject ? projectSettingsName : undefined}
+          onProjectNameChange={projectSettingsProject ? setProjectSettingsName : undefined}
+          value={{
+            profile: paseoAutomations[projectDefaultsProjectId]?.profile ?? null,
+            workspacePath: paseoAutomations[projectDefaultsProjectId]?.workspacePath ?? null,
+          }}
+          catalog={paseoProjectDefaultsCatalog}
+          onClose={() => setProjectDefaultsProjectId(null)}
+          onSave={async (value) => {
+            const name = projectSettingsName.trim();
+            if (projectSettingsProject && !name) {
+              throw new Error(text("请输入项目名称。", "Enter a project name."));
+            }
+            if (projectSettingsProject && name !== projectSettingsProject.name) {
+              const updated = await updateProjectName(projectSettingsProject.id, name);
+              setProjects((current) => current.map((project) => (
+                project.id === updated.id ? updated : project
+              )));
+            }
+            await savePaseoProjectDefaults(projectDefaultsProjectId, value);
+            return true;
+          }}
+          onDelete={projectSettingsCanDelete && projectSettingsChoice
+            ? () => {
+                setProjectDefaultsProjectId(null);
+                requestProjectDelete(projectSettingsChoice);
+              }
+            : undefined}
+        />
       )}
 
       {pendingProjectDelete && (
@@ -5048,9 +6302,151 @@ export function App() {
         </div>
       )}
 
+      {pendingSelectedTaskDelete && (
+        <div
+          className="delete-backdrop"
+          onPointerDown={(event) => {
+            if (event.target === event.currentTarget && !deletingArchivedTaskId) {
+              setPendingSelectedTaskDelete(null);
+            }
+          }}
+        >
+          <div
+            className="delete-dialog batch-delete-dialog"
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="selected-task-delete-title"
+            onKeyDown={(event) => {
+              if (event.key === "Escape" && !deletingArchivedTaskId) setPendingSelectedTaskDelete(null);
+            }}
+          >
+            <h2 id="selected-task-delete-title">{text(
+              `永久删除 ${pendingSelectedTaskDelete.length} 项任务？`,
+              `Permanently delete ${pendingSelectedTaskDelete.length} tasks?`,
+            )}</h2>
+            <p>{text(
+              "以下任务、评论和附件将被永久删除，无法撤销。请确认任务列表没有变化。",
+              "The following tasks, comments, and attachments will be permanently deleted and cannot be undone. Confirm that the list has not changed.",
+            )}</p>
+            <ul className="batch-delete-list">
+              {pendingSelectedTaskDelete.map((task) => (
+                <li key={task.id}>
+                  <strong>{task.externalKey ?? task.identifier}</strong>
+                  <span>{task.title}</span>
+                </li>
+              ))}
+            </ul>
+            <div>
+              <button
+                className="button secondary"
+                type="button"
+                disabled={deletingArchivedTaskId !== null}
+                onClick={() => setPendingSelectedTaskDelete(null)}
+              >
+                {text("取消", "Cancel")}
+              </button>
+              <button
+                className="button danger"
+                type="button"
+                disabled={deletingArchivedTaskId !== null}
+                onClick={() => void deleteSelectedTasks()}
+              >
+                {deletingArchivedTaskId
+                  ? text("删除中…", "Deleting…")
+                  : text("永久删除", "Delete permanently")}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {pendingTaskProjectMove && (
+        <div
+          className="delete-backdrop"
+          onPointerDown={(event) => {
+            if (event.target === event.currentTarget) closeTaskProjectMove();
+          }}
+        >
+          <form
+            className="delete-dialog move-task-project-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="move-task-project-title"
+            onSubmit={(event) => {
+              event.preventDefault();
+              void confirmTaskProjectMove();
+            }}
+            onKeyDown={(event) => {
+              if (event.key === "Escape") closeTaskProjectMove();
+            }}
+          >
+            <h2 id="move-task-project-title">{text(
+              `移动 ${pendingTaskProjectMove.task.externalKey ?? pendingTaskProjectMove.task.identifier} 到其他项目`,
+              `Move ${pendingTaskProjectMove.task.externalKey ?? pendingTaskProjectMove.task.identifier} to another project`,
+            )}</h2>
+            <p>{text(
+              "保留议题内容和已设执行配置；未单独配置的想法改用目标项目默认值。移动本身不会启动 Agent。",
+              "Keep the issue content and explicit execution settings; unset fields inherit the destination project's defaults. Moving does not start an Agent.",
+            )}</p>
+            <label className="move-task-project-search">
+              <span className="sr-only">{text("搜索目标项目", "Search target projects")}</span>
+              <TaskboardIcon name="search" />
+              <input
+                autoFocus
+                type="search"
+                value={taskProjectMoveSearch}
+                placeholder={text("搜索项目…", "Search projects…")}
+                disabled={movingTaskProject}
+                onChange={(event) => setTaskProjectMoveSearch(event.target.value)}
+              />
+            </label>
+            <div className="move-task-project-list" role="radiogroup" aria-label={text("目标项目", "Target project")}>
+              {taskProjectMoveTargets.map((project) => (
+                <button
+                  key={project.id}
+                  type="button"
+                  role="radio"
+                  aria-checked={pendingTaskProjectMove.targetProjectId === project.id}
+                  className={pendingTaskProjectMove.targetProjectId === project.id ? "is-selected" : ""}
+                  disabled={movingTaskProject}
+                  onClick={() => {
+                    setPendingTaskProjectMove((current) => current
+                      ? { ...current, targetProjectId: project.id }
+                      : current);
+                    setTaskProjectMoveError(null);
+                  }}
+                >
+                  <TaskboardIcon name="projectFolder" />
+                  <span title={project.name}>{project.name}</span>
+                  {pendingTaskProjectMove.targetProjectId === project.id && <LinearIcon name="check" />}
+                </button>
+              ))}
+              {taskProjectMoveTargets.length === 0 && (
+                <p className="move-task-project-empty">{taskProjectMoveNeedle
+                  ? text("没有匹配的本地项目。", "No matching local projects.")
+                  : text("没有其他可移动到的本地项目。", "No other local projects are available.")}</p>
+              )}
+            </div>
+            {taskProjectMoveError && <p className="project-dialog-error" role="alert">{taskProjectMoveError}</p>}
+            <div className="move-task-project-actions">
+              <button className="button secondary" type="button" disabled={movingTaskProject} onClick={closeTaskProjectMove}>
+                {text("取消", "Cancel")}
+              </button>
+              <button
+                className="button primary"
+                type="submit"
+                disabled={!pendingTaskProjectMove.targetProjectId || movingTaskProject}
+              >
+                {movingTaskProject ? text("移动中…", "Moving…") : text("确认移动", "Move issue")}
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+
       {editor && (
         <TaskEditor
-          key={`new-${selectedProjectId}-${editor.status}`}
+          key={`new-${selectedProjectId}-${editor.status}-${editor.mergeRequestId ?? "single"}`}
           projectId={editorProjectId}
           projectOptions={isAllProjects ? createTargetProjects : undefined}
           onProjectChange={(projectId) => setEditor((current) => (
@@ -5059,7 +6455,7 @@ export function App() {
           tasks={tasks.filter((task) => task.projectId === editorProjectId)}
           referenceTasks={referenceTasks.filter((task) => task.projectId === editorProjectId)}
           initialStatus={editor.status}
-          initialDraft={newTaskDraft?.projectId !== selectedProjectId
+          initialDraft={editor.mergeSources || newTaskDraft?.projectId !== selectedProjectId
             ? null
             : newTaskDraft.draft}
           labels={projects.find((project) => project.id === editorProjectId)?.labels ?? []}
@@ -5067,7 +6463,9 @@ export function App() {
           developmentScan={developmentScan}
           developmentScanLoading={developmentScanLoading}
           paseoAssignee={host === "paseo" ? {
-            options: paseoAssigneeChoices.options,
+            options: editor.mergeSources
+              ? paseoAssigneeChoices.options.filter((option) => option.group === "profile" || option.group === "provider")
+              : paseoAssigneeChoices.options,
             loading: paseoAssignmentOptionsLoading,
             error: paseoAssignmentOptionsError,
             onRefresh: refreshPaseoAssignmentOptions,
@@ -5084,18 +6482,75 @@ export function App() {
           paseoWorkspaces={host === "paseo"
             ? (paseoAssignmentOptions?.workspaces ?? []).flatMap((workspace) => workspace.path ? [{ ...workspace, path: workspace.path }] : [])
             : undefined}
-          paseoDefaultWorkspacePath={host === "paseo" ? paseoAssignmentOptions?.defaultWorkspacePath ?? null : undefined}
           paseoWorktree={host === "paseo" ? { onCreated: () => {} } : undefined}
+          mergeSources={editorMergeSources}
+          mergeStartAfterSave={editor.mergeStartAfterSave === true}
           onCreateLabel={(label) => persistProjectLabel(label, editorProjectId ?? selectedProjectId)}
           onCancel={(draft) => {
-            setNewTaskDraft(draft ? {
-              projectId: selectedProjectId,
-              targetProjectId: editorProjectId,
-              draft,
-            } : null);
+            setNewTaskDraft(editor.mergeSources
+              ? null
+              : draft ? {
+                  projectId: selectedProjectId,
+                  targetProjectId: editorProjectId,
+                  draft,
+                } : null);
             setEditor(null);
           }}
-          onSave={saveEditor}
+          onSave={editor.mergeSources ? saveMergeIdeasDraft : saveEditor}
+        />
+      )}
+
+      {paseoExecutionDialog && (
+        <PaseoExecutionConfigDialog
+          taskIdentifier={paseoExecutionDialog.taskIdentifier}
+          options={[
+            ...(paseoExecutionDialog.initialProfile
+              && paseoExecutionDialog.initialChoiceId === PASEO_SAVED_TASK_PLAN_ID ? [{
+                id: PASEO_SAVED_TASK_PLAN_ID,
+                label: paseoExecutionDialog.initialProfile.name,
+                detail: "当前已保存的执行计划",
+                group: "profile" as const,
+                provider: paseoExecutionDialog.initialProfile.provider,
+                model: paseoExecutionDialog.initialProfile.model,
+                modeId: paseoExecutionDialog.initialProfile.modeId,
+                thinkingOptionId: paseoExecutionDialog.initialProfile.thinkingOptionId,
+              }] : []),
+            ...paseoAssigneeChoices.options.filter((option) => (
+              option.id === "paseo:project-default"
+              || option.group === "profile"
+              || option.group === "provider"
+            )),
+          ]}
+          workspaces={(paseoAssignmentOptions?.workspaces ?? []).flatMap((workspace) => (
+            workspace.path ? [{ ...workspace, path: workspace.path }] : []
+          ))}
+          loading={paseoAssignmentOptionsLoading}
+          error={paseoAssignmentOptionsError}
+          initialChoiceId={paseoExecutionDialog.initialChoiceId}
+          initialWorkspacePath={paseoExecutionDialog.initialWorkspacePath}
+          initialModeId={paseoExecutionDialog.initialModeId}
+          initialThinkingOptionId={paseoExecutionDialog.initialThinkingOptionId}
+          onRefresh={() => refreshPaseoAssignmentOptions(paseoExecutionDialog.projectId)}
+          loadOptions={loadPaseoConfigurationOptions}
+          onCancel={() => setPaseoExecutionDialog(null)}
+          onSave={async (choiceId, workspacePath, configuration) => {
+            const choice = choiceId === PASEO_SAVED_TASK_PLAN_ID && paseoExecutionDialog.initialProfile
+              ? { kind: "planned" as const, profile: paseoExecutionDialog.initialProfile }
+              : paseoAssigneeChoices.choices.get(choiceId);
+            if (choice?.kind !== "planned") {
+              throw new Error("当前 Agent 计划已不在可用目录中，请重新选择。");
+            }
+            await changePaseoTaskAssignment(
+              { id: paseoExecutionDialog.taskId, projectId: paseoExecutionDialog.projectId },
+              choiceId,
+              workspacePath,
+              configuration,
+              true,
+              true,
+              choice,
+            );
+            setPaseoExecutionDialog(null);
+          }}
         />
       )}
 
@@ -5116,6 +6571,7 @@ export function App() {
             { labels },
           ).catch(() => {})}
           onDuplicate={(task) => void duplicateTask(task)}
+          onMoveToProject={contextMenuTask.source === "local" ? openTaskProjectMove : undefined}
           onCopy={(text, message) => void copyText(text, message)}
           openInThreadDisabled={developmentScanLoading}
           onOpenInThread={openTaskInThread}

@@ -206,6 +206,7 @@ export function IssuePicker({
       </button>
       {open && (
         <div className="issue-relation-popover">
+          <div className="issue-relation-popover-title">{label}</div>
           <IssuePickerContent
             candidates={candidates}
             disabled={disabled}
@@ -412,9 +413,9 @@ export function IssueSubIssues({
 }
 
 const RELATION_GROUPS = [
-  { type: "blocked_by", field: "blockedBy", chineseLabel: "阻塞于", englishLabel: "Blocked by", chineseAddLabel: "添加阻塞议题", englishAddLabel: "Add blocker", tone: "blocked-by" },
-  { type: "blocks", field: "blocks", chineseLabel: "阻塞", englishLabel: "Blocks", chineseAddLabel: "添加被阻塞议题", englishAddLabel: "Add blocked issue", tone: "blocks" },
-  { type: "related", field: "related", chineseLabel: "相关议题", englishLabel: "Related issues", chineseAddLabel: "添加相关议题", englishAddLabel: "Add related issue", tone: "related" },
+  { type: "blocked_by", field: "blockedBy", chineseLabel: "需要先完成", englishLabel: "Complete first", chineseDescription: "先完成这些任务，再做当前任务。", englishDescription: "Finish these tasks before working on the current task.", chineseAddLabel: "添加需要先完成的任务", englishAddLabel: "Add task to complete first", tone: "blocked-by" },
+  { type: "blocks", field: "blocks", chineseLabel: "后续依赖任务", englishLabel: "Downstream dependent tasks", chineseDescription: "这些任务需要等当前任务完成。", englishDescription: "These tasks should wait for the current task to be completed.", chineseAddLabel: "添加后续依赖任务", englishAddLabel: "Add downstream dependent task", tone: "blocks" },
+  { type: "related", field: "related", chineseLabel: "相关任务", englishLabel: "Related tasks", chineseDescription: "仅供参考，没有先后顺序。", englishDescription: "For reference only; there is no required order.", chineseAddLabel: "添加相关任务", englishAddLabel: "Add related task", tone: "related" },
 ] as const;
 
 export function IssueRelationSidebar({
@@ -423,13 +424,20 @@ export function IssueRelationSidebar({
   onOpenTask,
   onAddRelation,
   onRemoveRelation,
-}: RelationActions) {
+  paseoMode = false,
+}: RelationActions & { paseoMode?: boolean }) {
   const { text } = useTaskboardI18n();
   const [savingKey, setSavingKey] = useState<string | null>(null);
 
   return (
     <section className="issue-relation-sidebar" aria-labelledby="relations-heading">
-      <h2 id="relations-heading">{text("关系", "Relations")}</h2>
+      <h2 id="relations-heading">{text("任务关系", "Task relationships")}</h2>
+      {paseoMode && (
+        <p className="issue-relation-scope-note">{text(
+          "目前仅记录先后关系，不会自动阻止或启动 Agent。",
+          "These relationships are informational only; they do not automatically block or start an Agent.",
+        )}</p>
+      )}
       {RELATION_GROUPS.map((group) => {
         const label = text(group.chineseLabel, group.englishLabel);
         const issues = task.relations[group.field];
@@ -442,14 +450,17 @@ export function IssueRelationSidebar({
         return (
           <div className={`issue-relation-group is-${group.tone}`} key={group.type}>
             <header>
-              <span>
-                {group.type === "related" ? (
-                  <RelationIcon color="currentColor" size={14} />
-                ) : (
-                  <BlockingRelationIcon type={group.type} color="currentColor" />
-                )}
-                {label}
-              </span>
+              <div className="issue-relation-heading">
+                <span>
+                  {group.type === "related" ? (
+                    <RelationIcon color="currentColor" size={14} />
+                  ) : (
+                    <BlockingRelationIcon type={group.type} color="currentColor" />
+                  )}
+                  {label}
+                </span>
+                <small>{text(group.chineseDescription, group.englishDescription)}</small>
+              </div>
               <IssuePicker
                 label={text(group.chineseAddLabel, group.englishAddLabel)}
                 candidates={candidates}

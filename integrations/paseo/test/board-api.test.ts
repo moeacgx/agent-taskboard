@@ -100,14 +100,61 @@ async function harness() {
   let readFeatures: () => Promise<unknown> = async () => ({
     features: [{ id: "auto_accept", value: false }],
   });
+  const projectEntries: Array<{
+    projectId: string;
+    projectDisplayName: string;
+    projectCustomName?: string | null;
+    projectRootPath: string;
+    projectKind: "directory" | "git" | "non_git";
+  }> = [];
   const workspaceEntries: Array<{ id: string; projectId?: string; workspaceDirectory?: string; name?: string | null }> = [];
+  const workspaceListCursors: Array<string | null> = [];
+  const createdWorkspaceSources: Array<{
+    cwd: string;
+    projectId?: string;
+    action: "branch-off" | "checkout";
+    branchName?: string;
+    refName?: string;
+    baseBranch?: string;
+  }> = [];
+  const openedWorkspacePaths: string[] = [];
+  const createdAgentConfigs: Array<{ provider: string; modeId?: string; thinkingOptionId?: string }> = [];
   let createdWorkspace = 0;
   const paseo = {
+    projects: {
+      list: async () => ({ projects: projectEntries }),
+    },
     workspaces: {
-      open: async () => ({ id: "workspace-handler-test", agents: { create: async () => { creates += 1; if (failCreate) throw new Error("模拟 Agent 创建失败"); return agent; } } }),
-      list: async () => ({ entries: workspaceEntries }),
+      open: async (workspacePath: string) => {
+        openedWorkspacePaths.push(workspacePath);
+        return {
+          id: "workspace-handler-test",
+          agents: {
+            create: async ({ config }: { config: { provider: string; modeId?: string; thinkingOptionId?: string } }) => {
+              creates += 1;
+              createdAgentConfigs.push(config);
+              if (failCreate) throw new Error("模拟 Agent 创建失败");
+              return agent;
+            },
+          },
+        };
+      },
+      list: async (options?: { page?: { limit?: number; cursor?: string } }) => {
+        const offset = Number(options?.page?.cursor ?? 0);
+        const limit = options?.page?.limit ?? 200;
+        const nextOffset = Math.min(offset + limit, workspaceEntries.length);
+        workspaceListCursors.push(options?.page?.cursor ?? null);
+        return {
+          entries: workspaceEntries.slice(offset, nextOffset),
+          pageInfo: {
+            hasMore: nextOffset < workspaceEntries.length,
+            nextCursor: nextOffset < workspaceEntries.length ? String(nextOffset) : null,
+          },
+        };
+      },
       ref: (id: string) => ({ refresh: async () => workspaceEntries.find((workspace) => workspace.id === id) ?? null }),
-      create: async ({ source, title }: { source: { cwd: string; action: "branch-off" | "checkout"; branchName?: string; refName?: string; baseBranch?: string }; title?: string }) => {
+      create: async ({ source, title }: { source: { cwd: string; projectId?: string; action: "branch-off" | "checkout"; branchName?: string; refName?: string; baseBranch?: string }; title?: string }) => {
+        createdWorkspaceSources.push(source);
         const branch = source.action === "branch-off" ? source.branchName! : source.refName!;
         const target = path.join(path.dirname(source.cwd), `.paseo-handler-${createdWorkspace += 1}-${randomUUID()}-${branch.replace(/[^a-zA-Z0-9._-]+/g, "-")}`);
         const args = source.action === "branch-off"
@@ -136,6 +183,12 @@ async function harness() {
     plans,
     handlers,
     paseo,
+    projectEntries,
+    workspaceEntries,
+    workspaceListCursors,
+    createdWorkspaceSources,
+    openedWorkspacePaths,
+    createdAgentConfigs,
     setFailCreate: (value: boolean) => { failCreate = value; },
     setAgentStatus: (value: "idle" | "running") => { agentStatus = value; },
     setPendingPermissions: (value: string[]) => { pendingPermissions = value; },
@@ -145,6 +198,7 @@ async function harness() {
     getSends: () => sends,
     getCreates: () => creates,
     automation,
+    mutationLock,
     sentPrompts,
   };
 }
@@ -388,6 +442,24 @@ test("Paseo Worktree：仅 Git 根可创建、daemon 登记返回目录、已检
   const repository = await initializeGitRepository();
   const nonGitDirectory = await mkdtemp(path.join(os.tmpdir(), "dashi-paseo-not-git-"));
   try {
+    h.projectEntries.push({
+      projectId: "project-worktree-source",
+      projectDisplayName: "Worktree source",
+      projectRootPath: repository,
+      projectKind: "git",
+    });
+    for (let index = 0; index < 200; index += 1) {
+      h.workspaceEntries.push({
+        id: `workspace-before-source-${index}`,
+        projectId: `project-before-source-${index}`,
+        workspaceDirectory: path.join(repository, `.unused-${index}`),
+      });
+    }
+    h.workspaceEntries.push({
+      id: "workspace-source-on-second-page",
+      projectId: "workspace-project-fallback",
+      workspaceDirectory: repository,
+    });
     const inspect = h.handlers.get(contracts.inspectPaseoWorktree.name)!;
     const create = h.handlers.get(contracts.createPaseoWorktree.name)!;
     const nonGit = await inspect({ workspacePath: nonGitDirectory }, { paseo: h.paseo });
@@ -407,6 +479,8 @@ test("Paseo Worktree：仅 Git 根可创建、daemon 登记返回目录、已检
     assert.equal(created.context.type, "worktree");
     assert.equal(created.context.path, created.workspace.path);
     assert.equal(created.workspace.branch, "feature/worktree-qa");
+    assert.equal(h.createdWorkspaceSources.at(-1)?.projectId, "project-worktree-source");
+    assert.deepEqual(h.workspaceListCursors.slice(0, 2), [null, "200"]);
     assert.equal((await execFile("git", ["-C", created.workspace.path, "branch", "--show-current"], { windowsHide: true })).stdout.trim(), "feature/worktree-qa");
     assert.ok(created.scan.worktrees.some((worktree: { path: string }) => worktree.path === created.workspace.path));
     await assert.rejects(() => create({
@@ -510,6 +584,238 @@ test("完整属性 PATCH 不得绕过处理中派发与权限门禁", async () =
   assert.equal(response.body.kind, "json");
   assert.equal((response.body.value as { error?: { code?: string } }).error?.code, "TASK_STATUS_REQUIRES_MOVE");
   assert.equal((await dashi.getTask(baseUrl, task.id)).task.status, "todo");
+  assert.equal(h.getSends(), 0);
+});
+
+test("跨项目 PATCH 同步计划与绑定，并让无计划任务继承目标项目默认配置", async () => {
+  const h = await harness();
+  const sourceProjectId = await createFixtureProject("Move source fixture");
+  const targetProjectId = await createFixtureProject("Move target fixture");
+  const profile = { id: "target-default", name: "Target default", provider: "grok", model: "grok-4.6" };
+  await h.settings.upsert({
+    projectId: targetProjectId,
+    workspacePath: directory,
+    profile,
+    updatedAt: new Date().toISOString(),
+  });
+  const bridge = h.handlers.get(contracts.bridgeRequest.name)!;
+
+  const inherited = (await dashi.createTask(baseUrl, {
+    projectId: sourceProjectId,
+    title: "Move then inherit target defaults",
+    status: "todo",
+  })).task;
+  const movedWithoutPlan = await bridge({
+    method: "PATCH",
+    path: `/api/tasks/${inherited.id}`,
+    headers: { "content-type": "application/json" },
+    body: { kind: "text", value: JSON.stringify({ version: inherited.version, projectId: targetProjectId }) },
+  }, { paseo: h.paseo });
+  assert.equal(movedWithoutPlan.status, 200);
+  assert.equal((await dashi.getTask(baseUrl, inherited.id)).task.projectId, targetProjectId);
+  assert.equal(await h.plans.get(inherited.id), null);
+  assert.equal(await h.bindings.get(inherited.id), null);
+  assert.equal(h.getCreates(), 0);
+  assert.equal(h.getSends(), 0);
+
+  const movedTask = (await dashi.getTask(baseUrl, inherited.id)).task;
+  const started = await h.handlers.get(contracts.moveTaskBoard.name)!({
+    id: movedTask.id,
+    version: movedTask.version,
+    status: "in_progress",
+  }, { paseo: h.paseo });
+  assert.equal(started.dispatch, "started");
+  assert.equal(h.openedWorkspacePaths.at(-1), directory);
+  assert.equal(h.createdAgentConfigs.at(-1)?.provider, "grok/grok-4.6");
+
+  const explicitResponse = await fetch(`${baseUrl}/api/tasks`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      projectId: sourceProjectId,
+      title: "Preserve explicit Paseo metadata",
+      status: "todo",
+      developmentContext: { type: "worktree", path: directory, branch: "main" },
+    }),
+  });
+  assert.equal(explicitResponse.status, 201);
+  const explicit = (await explicitResponse.json() as { task: contracts.Task }).task;
+  const explicitProfile = { id: "explicit", name: "Explicit", provider: "codex", model: "gpt-5.6-sol", modeId: "auto-review", thinkingOptionId: "low" };
+  await h.plans.upsert({
+    taskId: explicit.id,
+    projectId: sourceProjectId,
+    workspacePath: directory,
+    profile: explicitProfile,
+  });
+  await h.bindings.upsert({
+    taskId: explicit.id,
+    taskIdentifier: explicit.identifier,
+    projectId: sourceProjectId,
+    workspaceId: "workspace-existing",
+    agentId: "agent-handler-test",
+    provider: "codex/gpt-5.6-sol",
+    agentTitle: "Existing agent",
+    agentModel: "gpt-5.6-sol",
+  });
+  await h.bindings.armDispatch(explicit.id, "agent-handler-test");
+  await h.bindings.acceptStartedTurn(explicit.id, "agent-handler-test", "owned-turn", "owned-turn", false);
+  const bindingBefore = (await h.bindings.get(explicit.id))!;
+
+  const movedExplicit = await bridge({
+    method: "PATCH",
+    path: `/api/tasks/${explicit.id}`,
+    headers: { "content-type": "application/json" },
+    body: { kind: "text", value: JSON.stringify({ version: explicit.version, projectId: targetProjectId }) },
+  }, { paseo: h.paseo });
+  assert.equal(movedExplicit.status, 200);
+  const movedExplicitTask = (await dashi.getTask(baseUrl, explicit.id)).task;
+  assert.equal(movedExplicitTask.projectId, targetProjectId);
+  assert.deepEqual(movedExplicitTask.developmentContext, explicit.developmentContext);
+  assert.deepEqual(await h.plans.get(explicit.id), {
+    ...(await h.plans.get(explicit.id))!,
+    projectId: targetProjectId,
+    workspacePath: directory,
+    profile: explicitProfile,
+  });
+  const bindingAfter = (await h.bindings.get(explicit.id))!;
+  assert.equal(bindingAfter.projectId, targetProjectId);
+  for (const field of ["taskId", "taskIdentifier", "workspaceId", "agentId", "provider", "agentTitle", "agentModel", "lastOutcome", "pendingWriteback", "dispatchArmed", "acceptedTurnId", "turnGeneration"] as const) {
+    assert.deepEqual(bindingAfter[field], bindingBefore[field]);
+  }
+
+  h.setPendingPermissions(["permission"]);
+  const rejected = await bridge({
+    method: "PATCH",
+    path: `/api/tasks/${explicit.id}`,
+    headers: { "content-type": "application/json" },
+    body: { kind: "text", value: JSON.stringify({ version: movedExplicitTask.version, projectId: sourceProjectId }) },
+  }, { paseo: h.paseo });
+  assert.equal(rejected.status, 409);
+  assert.equal(rejected.body.kind, "json");
+  assert.equal((rejected.body.value as { error?: { code?: string } }).error?.code, "TASK_AGENT_BUSY");
+  assert.equal((await dashi.getTask(baseUrl, explicit.id)).task.projectId, targetProjectId);
+  assert.equal((await h.plans.get(explicit.id))?.projectId, targetProjectId);
+  assert.equal((await h.bindings.get(explicit.id))?.projectId, targetProjectId);
+
+  const related = (await dashi.createTask(baseUrl, { projectId: sourceProjectId, title: "Related move source", status: "todo" })).task;
+  const peer = (await dashi.createTask(baseUrl, { projectId: sourceProjectId, title: "Related move peer", status: "todo" })).task;
+  await h.plans.upsert({
+    taskId: related.id,
+    projectId: sourceProjectId,
+    workspacePath: directory,
+    profile: explicitProfile,
+  });
+  const relationResponse = await fetch(`${baseUrl}/api/tasks/${related.id}/relations/related/${peer.id}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ version: related.version }),
+  });
+  assert.equal(relationResponse.status, 200);
+  const relatedCurrent = (await dashi.getTask(baseUrl, related.id)).task;
+  const relationBlocked = await bridge({
+    method: "PATCH",
+    path: `/api/tasks/${related.id}`,
+    headers: { "content-type": "application/json" },
+    body: { kind: "text", value: JSON.stringify({ version: relatedCurrent.version, projectId: targetProjectId }) },
+  }, { paseo: h.paseo });
+  assert.equal(relationBlocked.status, 409);
+  assert.equal(relationBlocked.body.kind, "json");
+  const relationError = (relationBlocked.body.value as { error?: { code?: string; message?: string } }).error;
+  assert.equal(relationError?.code, "CROSS_PROJECT_RELATION");
+  assert.match(relationError?.message ?? "", /先移除关联关系/);
+  assert.equal((await dashi.getTask(baseUrl, related.id)).task.projectId, sourceProjectId);
+  assert.equal((await h.plans.get(related.id))?.projectId, sourceProjectId);
+});
+
+test("跨项目 PATCH 响应丢失后按真实任务归属保留目标 metadata", async () => {
+  const h = await harness();
+  const sourceProjectId = await createFixtureProject("Lost response source");
+  const targetProjectId = await createFixtureProject("Lost response target");
+  const task = (await dashi.createTask(baseUrl, { projectId: sourceProjectId, title: "Lost PATCH response", status: "todo" })).task;
+  await h.plans.upsert({
+    taskId: task.id,
+    projectId: sourceProjectId,
+    workspacePath: directory,
+    profile: { id: "lost-response", name: "Lost response", provider: "grok", model: "grok-4.6" },
+  });
+  const bridge = h.handlers.get(contracts.bridgeRequest.name)!;
+  const originalFetch = globalThis.fetch;
+  let dropped = false;
+  globalThis.fetch = async (...args) => {
+    const response = await originalFetch(...args);
+    const method = args[1]?.method ?? "GET";
+    if (!dropped && method === "PATCH" && String(args[0]).includes(`/api/tasks/${task.id}`)) {
+      dropped = true;
+      await response.arrayBuffer();
+      throw new Error("模拟 PATCH 已落盘但响应丢失");
+    }
+    return response;
+  };
+  try {
+    const response = await bridge({
+      method: "PATCH",
+      path: `/api/tasks/${task.id}`,
+      headers: { "content-type": "application/json" },
+      body: { kind: "text", value: JSON.stringify({ version: task.version, projectId: targetProjectId }) },
+    }, { paseo: h.paseo });
+    assert.equal(dropped, true);
+    assert.equal(response.status, 200);
+    assert.equal(response.body.kind, "json");
+    assert.equal((response.body.value as { task?: { projectId?: string } }).task?.projectId, targetProjectId);
+    assert.equal((await dashi.getTask(baseUrl, task.id)).task.projectId, targetProjectId);
+    assert.equal((await h.plans.get(task.id))?.projectId, targetProjectId);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("自动化取得任务锁后跳过已经移到其他项目的候选", async () => {
+  const h = await harness();
+  const sourceProjectId = await createFixtureProject("Automation move source");
+  const targetProjectId = await createFixtureProject("Automation move target");
+  await h.settings.upsert({
+    projectId: sourceProjectId,
+    workspacePath: directory,
+    profile: { id: "source-auto", name: "Source auto", provider: "grok", model: "grok-4.6" },
+    enabledByUser: true,
+    intervalMinutes: 5,
+    quotaAware: false,
+    lastRunAt: null,
+    lastError: null,
+    updatedAt: new Date().toISOString(),
+  });
+  const task = (await dashi.createTask(baseUrl, { projectId: sourceProjectId, title: "Move while automation waits", status: "todo" })).task;
+  await h.handlers.get(contracts.checkConnection.name)!({}, { paseo: h.paseo });
+
+  const releaseMove = deferred();
+  const moveStarted = deferred();
+  const moving = h.mutationLock.run(task.id, async () => {
+    moveStarted.resolve();
+    await releaseMove.promise;
+    await dashi.updateTask(baseUrl, task.id, { version: task.version, projectId: targetProjectId });
+  });
+  await moveStarted.promise;
+
+  const listed = deferred();
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (...args) => {
+    const response = await originalFetch(...args);
+    if (String(args[0]).includes(`/api/tasks?projectId=${sourceProjectId}`)) listed.resolve();
+    return response;
+  };
+  try {
+    const run = h.automation.runNow(Date.now());
+    await listed.promise;
+    await new Promise((resolve) => setImmediate(resolve));
+    releaseMove.resolve();
+    await Promise.all([moving, run]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    releaseMove.resolve();
+  }
+  assert.equal((await dashi.getTask(baseUrl, task.id)).task.projectId, targetProjectId);
+  assert.equal((await dashi.getTask(baseUrl, task.id)).task.status, "todo");
+  assert.equal(h.getCreates(), 0);
   assert.equal(h.getSends(), 0);
 });
 
@@ -651,6 +957,63 @@ test("Paseo 自动化默认关闭；启用每 tick 仅领取一项，关闭在�
   await h.automation.runNow(Date.now() + 12 * 60_000);
   assert.equal(h.getSends(), 1);
   assert.equal((await dashi.getTask(baseUrl, waiting.id)).task.status, "todo");
+});
+
+test("项目 defaults 独立保存：允许未知项目与单字段配置，不启用自动化或写任务计划", async () => {
+  const h = await harness();
+  const saveDefaults = h.handlers.get(contracts.savePaseoProjectDefaults.name)!;
+  const pendingProjectId = `pending-project-${randomUUID()}`;
+  const projectId = await createFixtureProject("Project defaults fixture");
+  const profile = { id: "defaults-profile", name: "Defaults profile", provider: "codex", model: "gpt-5.6-sol" };
+
+  const profileOnly = await saveDefaults({ projectId: pendingProjectId, workspacePath: null, profile }, { paseo: h.paseo });
+  assert.equal(profileOnly.projectId, pendingProjectId);
+  assert.equal(profileOnly.automation.enabledByUser, false);
+  assert.equal(profileOnly.automation.workspacePath, null);
+  assert.deepEqual(profileOnly.automation.profile, profile);
+  assert.deepEqual(await h.plans.list(), []);
+
+  const knownWorkspace = path.join(directory, "defaults-workspace");
+  h.workspaceEntries.push({ id: "defaults-workspace", workspaceDirectory: knownWorkspace, name: "Defaults workspace" });
+  const workspaceOnly = await saveDefaults({ projectId, workspacePath: knownWorkspace, profile: null }, { paseo: h.paseo });
+  assert.equal(workspaceOnly.automation.enabledByUser, false);
+  assert.equal(workspaceOnly.automation.workspacePath, knownWorkspace);
+  assert.equal(workspaceOnly.automation.profile, null);
+  assert.deepEqual(await h.plans.list(), []);
+
+  await saveDefaults({ projectId, workspacePath: null, profile }, { paseo: h.paseo });
+  const inherited = (await dashi.createTask(baseUrl, { projectId, title: "Inherit defaults by field", status: "todo" })).task;
+  await h.plans.upsert({
+    taskId: inherited.id,
+    projectId,
+    workspacePath: knownWorkspace,
+    profile: null,
+  });
+  const move = h.handlers.get(contracts.moveTaskBoard.name)!;
+  const started = await move({ id: inherited.id, version: inherited.version, status: "in_progress" }, { paseo: h.paseo });
+  assert.equal(started.dispatch, "started");
+  assert.equal(h.openedWorkspacePaths.at(-1), knownWorkspace);
+  assert.equal(h.createdAgentConfigs.at(-1)?.provider, "codex/gpt-5.6-sol");
+
+  const taskProfile = { id: "task-profile", name: "Task profile", provider: "grok", model: "grok-4.6" };
+  await saveDefaults({ projectId, workspacePath: knownWorkspace, profile }, { paseo: h.paseo });
+  const profileOverride = (await dashi.createTask(baseUrl, { projectId, title: "Task profile override", status: "todo" })).task;
+  await h.plans.upsert({
+    taskId: profileOverride.id,
+    projectId,
+    workspacePath: null,
+    profile: taskProfile,
+  });
+  const profileStarted = await move({ id: profileOverride.id, version: profileOverride.version, status: "in_progress" }, { paseo: h.paseo });
+  assert.equal(profileStarted.dispatch, "started");
+  assert.equal(h.openedWorkspacePaths.at(-1), knownWorkspace);
+  assert.equal(h.createdAgentConfigs.at(-1)?.provider, "grok/grok-4.6");
+
+  await saveDefaults({ projectId, workspacePath: null, profile: null }, { paseo: h.paseo });
+  const freeTask = (await dashi.createTask(baseUrl, { projectId, title: "Explicitly free project", status: "todo" })).task;
+  const missing = await move({ id: freeTask.id, version: freeTask.version, status: "in_progress" }, { paseo: h.paseo });
+  assert.equal(missing.dispatch, "needs_configuration");
+  assert.equal(missing.task.status, "todo");
 });
 
 test("取消轮次消费后可移回 todo 再派发新 generation，等待权限仍保持门禁", async () => {

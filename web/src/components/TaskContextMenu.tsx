@@ -19,6 +19,7 @@ import {
 import { labelPresentation } from "../labels";
 import { taskPriorityLabel, taskStatusLabel, useTaskboardI18n } from "../i18n";
 import { LinearIcon } from "./LinearIcon";
+import { TaskboardIcon } from "./TaskboardIcon";
 import {
   DeleteIcon,
   EditIcon,
@@ -40,6 +41,7 @@ interface TaskContextMenuProps {
   onPriorityChange: (task: Task, priority: TaskPriority) => void;
   onLabelsChange: (task: Task, labels: string[]) => void;
   onDuplicate: (task: Task) => void;
+  onMoveToProject?: (task: Task) => void;
   onCopy: (text: string, announcement: string) => void;
   openInThreadDisabled?: boolean;
   onOpenInThread: (task: Task) => void;
@@ -113,6 +115,7 @@ export function TaskContextMenu({
   onPriorityChange,
   onLabelsChange,
   onDuplicate,
+  onMoveToProject,
   onCopy,
   openInThreadDisabled = false,
   onOpenInThread,
@@ -375,12 +378,22 @@ export function TaskContextMenu({
           onClick={() => closeThen(() => onEdit(task))}
         />
         {task.source !== "jira" && (
-          <MenuItem
-            label={text("创建副本", "Create copy")}
-            icon={<LinearIcon name="copy" />}
-            onPointerEnter={closeSubmenu}
-            onClick={() => closeThen(() => onDuplicate(task))}
-          />
+          <>
+            <MenuItem
+              label={text("创建副本", "Create copy")}
+              icon={<LinearIcon name="copy" />}
+              onPointerEnter={closeSubmenu}
+              onClick={() => closeThen(() => onDuplicate(task))}
+            />
+            {onMoveToProject && (
+              <MenuItem
+                label={text("移动到其他项目", "Move to another project")}
+                icon={<TaskboardIcon name="projectFolder" />}
+                onPointerEnter={closeSubmenu}
+                onClick={() => closeThen(() => onMoveToProject(task))}
+              />
+            )}
+          </>
         )}
         <MenuItem
           label={text("复制", "Copy")}

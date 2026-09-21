@@ -58,10 +58,13 @@ export function AgentPanel(props: {
   const paseo = usePaseo();
   const listProjects = useRpc(contracts.listProjects);
   const projectsQuery = useRpcQuery(listProjects, {});
-  const bindAgentRpc = useRpc(contracts.bindAgent);
   const continueTaskAgentRpc = useRpc(contracts.continueTaskAgent);
   const unbindAgentRpc = useRpc(contracts.unbindAgent);
   const retryWritebackRpc = useRpc(contracts.retryWriteback);
+  const getAutomation = useRpc(contracts.getPaseoAutomation);
+  const automationQuery = useRpcQuery(getAutomation, { projectId: task.projectId });
+  const getPresentations = useRpc(contracts.getPaseoPresentations);
+  const presentationQuery = useRpcQuery(getPresentations, { taskIds: [task.id] });
 
   const [availableProviders, setAvailableProviders] = useState<string[]>([]);
   const [models, setModels] = useState<ModelOption[]>([]);
@@ -81,6 +84,7 @@ export function AgentPanel(props: {
   function resolveCwd(): string | null {
     if (manualCwd) return manualCwd;
     if (task.developmentContext?.type === "worktree") return task.developmentContext.path;
+    if (automationQuery.data?.automation.workspacePath) return automationQuery.data.automation.workspacePath;
     const project = projectsQuery.data?.projects.find((entry) => entry.id === task.projectId);
     return project?.workspacePath ?? null;
   }
@@ -94,7 +98,7 @@ export function AgentPanel(props: {
         if (cancelled) return;
         const list = result.providers.filter((entry) => entry.available).map((entry) => entry.provider);
         setAvailableProviders(list);
-        setSelectedProvider((current) => current ?? list[0] ?? null);
+        setSelectedProvider((current) => current ?? automationQuery.data?.automation.profile?.provider ?? null);
       } catch (err) {
         if (!cancelled) setError(err instanceof Error ? err.message : String(err));
       }
@@ -109,7 +113,17 @@ export function AgentPanel(props: {
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [automationQuery.data?.automation.profile?.provider]);
+
+  useEffect(() => {
+    const saved = automationQuery.data?.automation.profile;
+    if (!saved) return;
+    setSelectedProvider(saved.provider);
+    setSelectedModel(saved.model);
+    setSelectedModeId(saved.modeId);
+    setSelectedThinkingOptionId(saved.thinkingOptionId);
+    setSelectedFeatureValues(saved.featureValues);
+  }, [automationQuery.data?.automation.profile]);
 
   useEffect(() => {
     if (!selectedProvider) {
@@ -173,7 +187,10 @@ export function AgentPanel(props: {
       } catch {
         // agent may be archived or unreachable; keep the last known status
       }
-      if (!cancelled) onNeedsRefresh();
+      if (!cancelled) {
+        presentationQuery.refetch();
+        onNeedsRefresh();
+      }
     }
 
     void poll();
@@ -251,40 +268,9 @@ export function AgentPanel(props: {
   }
 
   async function handleCreateAndBind() {
-    if (!selectedProvider) {
-      setError("请先选择 provider");
-      return;
-    }
-    if (!cwd) {
-      setError("请先选择一个工作区。");
-      return;
-    }
     setBusy(true);
     setError(null);
     try {
-      const workspace = await paseo.workspaces.open(cwd);
-      const providerModel = selectedModel ? `${selectedProvider}/${selectedModel}` : selectedProvider;
-      // Create without a prompt, persist the binding, THEN send the first
-      // message — otherwise a fast first turn could end (and fire
-      // agent.turn_ended) before the binding exists to receive the write-back.
-      const agent = await workspace.agents.create({
-        config: {
-          provider: providerModel,
-          modeId: selectedModeId,
-          thinkingOptionId: selectedThinkingOptionId,
-          featureValues: selectedFeatureValues,
-        },
-        title: `${task.identifier}: ${task.title}`,
-      });
-      await bindAgentRpc({
-        taskId: task.id,
-        taskIdentifier: task.identifier,
-        projectId: task.projectId,
-        workspaceId: workspace.id,
-        agentId: agent.id,
-        provider: providerModel,
-      });
-      // 服务端在移动、武装和发送之前读取最新项目文档与人工评论并构造首轮提示词。
       await continueTaskAgentRpc({ taskId: task.id });
       onNeedsRefresh();
     } catch (err) {
@@ -342,86 +328,28 @@ export function AgentPanel(props: {
       <View style={styles.section}>
         <Text style={styles.sectionTitle}>执行 Agent</Text>
         {error && <Text style={styles.errorText}>{error}</Text>}
-
-        {!cwd && (
-          <View>
-            <Text style={styles.label}>
-              该任务所属项目没有配置工作区路径，且任务未绑定 worktree。请选择一个已有的 Paseo 工作区来关联：
-            </Text>
-            <View style={styles.row}>
-              {existingWorkspaces.map((workspace) => (
-                <Pressable
-                  key={workspace.id}
-                  style={styles.chip(manualCwd === workspace.workspaceDirectory)}
-                  onPress={() => setManualCwd(workspace.workspaceDirectory ?? null)}
-                >
-                  <Text style={styles.chipText(manualCwd === workspace.workspaceDirectory)}>
-                    {workspace.name}
-                    {workspace.workspaceDirectory ? ` (${workspace.workspaceDirectory})` : ""}
-                  </Text>
-                </Pressable>
-              ))}
-              {existingWorkspaces.length === 0 && (
-                <Text style={styles.label}>没有找到可用的工作区，请先在 Paseo 中打开一个工作区。</Text>
-              )}
-            </View>
-          </View>
-        )}
-
-        {profiles.length > 0 && (
-          <View>
-            <Text style={styles.label}>Profile（可选，优先使用）</Text>
-            <View style={styles.row}>
-              {profiles.map((profile) => (
-                <Pressable
-                  key={profile.id}
-                  style={styles.chip(selectedProvider === profile.provider && selectedModel === (profile.model ?? null))}
-                  onPress={() => applyProfile(profile)}
-                >
-                  <Text style={styles.chipText(false)}>{profile.name}</Text>
-                </Pressable>
-              ))}
-            </View>
-          </View>
-        )}
-
-        <View>
-          <Text style={styles.label}>Provider</Text>
-          <View style={styles.row}>
-            {availableProviders.map((provider) => (
-              <Pressable key={provider} style={styles.chip(selectedProvider === provider)} onPress={() => setSelectedProvider(provider)}>
-                <Text style={styles.chipText(selectedProvider === provider)}>{provider}</Text>
-              </Pressable>
-            ))}
-          </View>
-        </View>
-
-        {models.length > 0 && (
-          <View>
-            <Text style={styles.label}>Model</Text>
-            <View style={styles.row}>
-              {models.map((model) => (
-                <Pressable key={model.id} style={styles.chip(selectedModel === model.id)} onPress={() => setSelectedModel(model.id)}>
-                  <Text style={styles.chipText(selectedModel === model.id)}>{model.label}</Text>
-                </Pressable>
-              ))}
-            </View>
-          </View>
-        )}
-
-        <Pressable accessibilityRole="button" style={styles.button} onPress={handleCreateAndBind} disabled={busy || !cwd}>
-          <Text style={styles.buttonText}>{busy ? "创建中…" : "创建并绑定 Agent"}</Text>
+        <Text style={styles.label}>启动时由服务端读取下方任务执行配置；留空字段继承项目当前默认值。</Text>
+        <Pressable accessibilityRole="button" style={styles.button} onPress={handleCreateAndBind} disabled={busy}>
+          <Text style={styles.buttonText}>{busy ? "启动中…" : "按任务或项目配置启动"}</Text>
         </Pressable>
       </View>
     );
   }
 
   const state = describeState(theme, liveStatus, binding.lastOutcome, task.status);
+  const presentation = presentationQuery.data?.presentations.find((item) => item.taskId === task.id) ?? null;
 
   return (
     <View style={styles.section}>
       <Text style={styles.sectionTitle}>执行 Agent</Text>
       {error && <Text style={styles.errorText}>{error}</Text>}
+      {presentation?.attentionReason === "permission" && (
+        <View style={styles.section}>
+          <Text style={styles.errorText}>等待你的授权</Text>
+          <Text style={styles.label}>Agent 正在等待 Paseo 权限确认。</Text>
+          {navigation?.openAgent && <Pressable accessibilityRole="button" style={styles.secondaryButton} onPress={() => navigation.openAgent?.({ agentId: binding.agentId })}><Text style={styles.secondaryButtonText}>打开会话处理权限</Text></Pressable>}
+        </View>
+      )}
       <View style={styles.statusRow}>
         <View style={styles.statusDot(state.color)} />
         <Text style={styles.label}>{state.label}</Text>

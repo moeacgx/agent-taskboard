@@ -14,6 +14,7 @@ import {
 import { labelPresentation } from "../labels";
 import { taskPriorityLabel, useTaskboardI18n } from "../i18n";
 import { CODEX_AGENT_ACTOR, actorKey, assigneeTargetForActor } from "../actors";
+import { ProviderIcon } from "../providerIcons";
 import type {
   TaskCardPresentation,
   TaskConversationItem,
@@ -21,17 +22,22 @@ import type {
 import { ActorAvatar } from "./ActorAvatar";
 import { LinearIcon } from "./LinearIcon";
 import { DueDateIcon, PriorityIcon, ProjectIcon } from "./SemanticIcons";
+import { RelationIcon } from "./SemanticIcons";
 import { LabelPicker } from "./LabelPicker";
 import { TaskPropertyPicker } from "./TaskPropertyPicker";
 import { TaskConversationMenu } from "./TaskConversationMenu";
 import completeIcon from "../assets/figma-taskboard/card-complete.svg";
 import processingAnimation from "../assets/figma-taskboard/loading-16.svg";
+import { parseMergedTaskDescription, taskCardDescription } from "../mergeTaskPresentation";
 
 interface TaskCardProps {
   task: Task;
   variant?: "main" | "sidebar";
   presentation: TaskCardPresentation;
   isDragging: boolean;
+  batchDragMember?: boolean;
+  batchDragSource?: boolean;
+  selectionCount?: number;
   dragShift: number;
   isMoving: boolean;
   isSettling: boolean;
@@ -49,6 +55,10 @@ interface TaskCardProps {
   onDragStart: (task: Task, height: number) => void;
   onDragEnd: () => void;
   onOpenConversation: (conversation: TaskConversationItem) => void;
+  selectionMode?: boolean;
+  selected?: boolean;
+  selectable?: boolean;
+  onToggleSelection?: (task: Task) => void;
 }
 
 interface TaskCardMarkdownNode {
@@ -218,16 +228,27 @@ function ProcessingLabel({ processing }: { processing: TaskCardPresentation["pro
 
 function ProcessingStatusRow({
   presentation,
+  assignee,
   onOpenConversation,
 }: {
   presentation: TaskCardPresentation;
+  assignee: ActorIdentity;
   onOpenConversation: (conversation: TaskConversationItem) => void;
 }) {
   const running = presentation.processing.running && !presentation.processing.awaitingPermission;
+  const awaitingPermission = presentation.processing.awaitingPermission;
   return (
-    <div className={`task-processing-row${running ? " is-running" : " is-paused"}`}>
+    <div className={`task-processing-row${running ? " is-running" : " is-paused"}${awaitingPermission ? " is-awaiting-permission" : ""}`}>
       {running && <img className="task-processing-glyph" src={processingAnimation} alt="" aria-hidden="true" />}
-      <ProcessingLabel processing={presentation.processing} />
+      {awaitingPermission ? (
+        <>
+          <ProviderIcon
+            className="task-permission-provider-icon"
+            iconDataUrl={assignee.avatarUrl}
+          />
+          <span className="task-processing-label">等待你的授权</span>
+        </>
+      ) : <ProcessingLabel processing={presentation.processing} />}
       <span className="task-processing-spacer" aria-hidden="true" />
       {presentation.conversations.length > 0 && (
         <TaskConversationMenu
@@ -408,6 +429,9 @@ export function TaskCard({
   variant = "main",
   presentation,
   isDragging,
+  batchDragMember = false,
+  batchDragSource = false,
+  selectionCount = 0,
   dragShift,
   isMoving,
   isSettling,
@@ -425,6 +449,10 @@ export function TaskCard({
   onDragStart,
   onDragEnd,
   onOpenConversation,
+  selectionMode = false,
+  selected = false,
+  selectable = true,
+  onToggleSelection,
 }: TaskCardProps) {
   const { locale, text } = useTaskboardI18n();
   const displayIdentifier = task.externalKey ?? task.identifier;
@@ -435,6 +463,7 @@ export function TaskCard({
     .trim() ?? "";
   const [propertyMenu, setPropertyMenu] = useState<"priority" | "labels" | "assignee" | null>(null);
   const [savingProperty, setSavingProperty] = useState<"priority" | "labels" | "dueDate" | "assignee" | null>(null);
+  const suppressSelectionClickRef = useRef(false);
   const creator: ActorIdentity = {
     type: task.creatorType,
     id: task.creatorId,
@@ -451,8 +480,12 @@ export function TaskCard({
   const showsInlineParticipants = variant === "main"
     && task.participants.length > 0;
   const image = showCover ? firstTaskImage(task) : null;
+  const mergedPresentation = useMemo(
+    () => parseMergedTaskDescription(task.description),
+    [task.description],
+  );
   const body = useMemo(
-    () => showBody ? taskBodyText(task.description) : "",
+    () => showBody ? taskBodyText(taskCardDescription(task.description)) : "",
     [showBody, task.description],
   );
   const hasProperties = task.priority !== "none" || task.labels.length > 0 || task.dueDate;
@@ -469,36 +502,65 @@ export function TaskCard({
 
   return (
     <article
-      className={`task-card task-card-${variant} status-${task.status}${processingCard ? " is-processing-card" : ""}${processingCard && presentation.processing.running && !presentation.processing.awaitingPermission ? " is-running-card" : ""}${image ? " has-media" : ""}${presentation.unread ? " is-unread" : ""}${isDragging ? " is-dragging" : ""}${dragShift ? " is-drag-shifted" : ""}${isMoving ? " is-moving" : ""}${isSettling ? " is-settling" : ""}${isContextMenuOpen ? " is-context-open" : ""}${propertyMenu ? " is-property-menu-open" : ""}`}
+      className={`task-card task-card-${variant} status-${task.status}${processingCard ? " is-processing-card" : ""}${processingCard && presentation.processing.running && !presentation.processing.awaitingPermission ? " is-running-card" : ""}${image ? " has-media" : ""}${presentation.unread ? " is-unread" : ""}${isDragging ? " is-dragging" : ""}${batchDragMember ? " is-batch-drag-member" : ""}${batchDragSource ? " is-batch-drag-source" : ""}${dragShift ? " is-drag-shifted" : ""}${isMoving ? " is-moving" : ""}${isSettling ? " is-settling" : ""}${isContextMenuOpen ? " is-context-open" : ""}${propertyMenu ? " is-property-menu-open" : ""}${selectionMode ? " is-selection-mode" : ""}${selected ? " is-selected" : ""}${selectionMode && !selectable ? " is-selection-disabled" : ""}`}
       style={{
         viewTransitionName: task.status === "in_review" ? `review-task-${task.id}` : "none",
         ...(dragShift ? { transform: `translate3d(0, ${dragShift}px, 0)` } : {}),
       }}
-      draggable={!isMoving}
+      draggable={!isMoving && (!selectionMode || (selected && selectable))}
       aria-labelledby={`task-${task.id}-title`}
       data-task-id={task.id}
       data-drag-shift={dragShift || undefined}
       onContextMenu={(event) => {
         event.preventDefault();
         event.stopPropagation();
+        if (selectionMode) return;
         onContextMenu(task, { x: event.clientX, y: event.clientY });
       }}
       onDragStart={(event) => {
+        suppressSelectionClickRef.current = selectionMode;
         event.dataTransfer.effectAllowed = "move";
         event.dataTransfer.setData("text/plain", task.id);
         event.dataTransfer.setData("application/x-taskboard-task", task.id);
+        if (selectionMode && selected && selectionCount > 1) {
+          const preview = document.createElement("div");
+          preview.className = "task-batch-drag-preview";
+          preview.textContent = text(`移动 ${selectionCount} 项议题`, `Move ${selectionCount} issues`);
+          document.body.append(preview);
+          event.dataTransfer.setDragImage(preview, 18, 18);
+          window.setTimeout(() => preview.remove(), 0);
+        }
         onDragStart(task, event.currentTarget.offsetHeight);
       }}
-      onDragEnd={onDragEnd}
+      onDragEnd={() => {
+        onDragEnd();
+        window.setTimeout(() => { suppressSelectionClickRef.current = false; }, 0);
+      }}
     >
       <button
         className="task-card-open"
         type="button"
-        aria-label={text(`打开 ${displayIdentifier}: ${task.title}`, `Open ${displayIdentifier}: ${task.title}`)}
-        onClick={() => onEdit(task)}
+        aria-label={selectionMode
+          ? text(`${selected ? "取消选择" : "选择"} ${displayIdentifier}: ${task.title}`, `${selected ? "Deselect" : "Select"} ${displayIdentifier}: ${task.title}`)
+          : text(`打开 ${displayIdentifier}: ${task.title}`, `Open ${displayIdentifier}: ${task.title}`)}
+        aria-pressed={selectionMode ? selected : undefined}
+        disabled={selectionMode && !selectable}
+        onClick={() => {
+          if (selectionMode && suppressSelectionClickRef.current) return;
+          if (selectionMode) onToggleSelection?.(task);
+          else onEdit(task);
+        }}
       />
 
       <div className="card-topline">
+        {selectionMode && (
+          <span className="task-card-selection-mark" aria-hidden="true">
+            {selected && <LinearIcon name="check" />}
+          </span>
+        )}
+        {batchDragSource && selectionCount > 1 && (
+          <span className="task-card-batch-drag-count" aria-hidden="true">{selectionCount}</span>
+        )}
         {paseoEmbedded && presentation.workspaceDisplay && workspaceReference ? (
           <span
             className="card-reference is-workspace-reference"
@@ -553,6 +615,13 @@ export function TaskCard({
       <h3 id={`task-${task.id}-title`}>{task.title}</h3>
 
       {body && <p className="task-card-description">{body}</p>}
+
+      {mergedPresentation && (
+        <span className="task-card-merge-summary">
+          <RelationIcon color="currentColor" />
+          {text(`已合并 ${mergedPresentation.sources.length} 个想法`, `Merged ${mergedPresentation.sources.length} ideas`)}
+        </span>
+      )}
 
       {image && (
         <TaskCardMedia key={image} src={image} />
@@ -639,6 +708,7 @@ export function TaskCard({
           <ProcessingProgress presentation={presentation} />
           <ProcessingStatusRow
             presentation={presentation}
+            assignee={task.assignee}
             onOpenConversation={onOpenConversation}
           />
         </>

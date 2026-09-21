@@ -16,6 +16,7 @@ concurrency:
 jobs:
   release-preflight:
     name: Validate release tag and versions
+    if: github.repository == 'chuspeeism/dashi-taskboard'
     runs-on: ubuntu-24.04
     outputs:
       release_tag: ${{ steps.validate.outputs.release_tag }}

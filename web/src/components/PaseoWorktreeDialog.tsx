@@ -4,14 +4,18 @@ import { createPaseoWorktree, inspectPaseoWorktree } from "../api";
 import { useTaskboardI18n } from "../i18n";
 import type { PaseoCreatedWorktree, PaseoWorktreeScan } from "../paseo-bridge";
 import { LinearIcon } from "./LinearIcon";
+import { PaseoWorkspacePicker, type PaseoWorkspaceOption } from "./PaseoWorkspacePicker";
 
 interface PaseoWorktreeDialogProps {
   open: boolean;
-  workspacePath: string | null;
+  workspaces: PaseoWorkspaceOption[];
+  initialWorkspacePath: string | null;
   taskId?: string;
   onClose: () => void;
   onCreated: (result: PaseoCreatedWorktree) => void | Promise<void>;
 }
+
+const INITIAL_WORKSPACE_ID = "paseo:worktree-source";
 
 function folderName(value: string): string {
   return value.split(/[\\/]/).filter(Boolean).at(-1) ?? value;
@@ -23,7 +27,8 @@ function folderName(value: string): string {
  */
 export function PaseoWorktreeDialog({
   open,
-  workspacePath,
+  workspaces,
+  initialWorkspacePath,
   taskId,
   onClose,
   onCreated,
@@ -36,18 +41,39 @@ export function PaseoWorktreeDialog({
   const [error, setError] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
   const [createdResult, setCreatedResult] = useState<PaseoCreatedWorktree | null>(null);
+  const dialogWorkspaces = useMemo(() => {
+    if (!initialWorkspacePath) return workspaces;
+    return [{
+      id: INITIAL_WORKSPACE_ID,
+      name: text("当前任务目录", "Current task directory"),
+      path: initialWorkspacePath,
+      projectWorkspace: false,
+      kind: "workspace" as const,
+    }, ...workspaces.filter((workspace) => workspace.path !== initialWorkspacePath)];
+  }, [initialWorkspacePath, text, workspaces]);
+  const [workspaceId, setWorkspaceId] = useState("");
+  const selectedWorkspace = dialogWorkspaces.find((workspace) => workspace.id === workspaceId) ?? null;
 
   useEffect(() => {
     if (!open) return;
+    setWorkspaceId(initialWorkspacePath ? INITIAL_WORKSPACE_ID : "");
     setScan(null);
     setError(null);
     setBranch("");
     setMode("new");
     setCreatedResult(null);
-    if (!workspacePath) {
-      setError(text("当前项目没有可用的工作区路径。", "The current project has no workspace path."));
-      return;
-    }
+  }, [initialWorkspacePath, open]);
+
+  useEffect(() => {
+    if (!open) return;
+    const workspacePath = selectedWorkspace?.path ?? null;
+    setScan(null);
+    setError(null);
+    setBranch("");
+    setMode("new");
+    setCreatedResult(null);
+    setLoading(false);
+    if (!workspacePath) return;
     let active = true;
     setLoading(true);
     void inspectPaseoWorktree(workspacePath).then(
@@ -63,7 +89,7 @@ export function PaseoWorktreeDialog({
       if (active) setLoading(false);
     });
     return () => { active = false; };
-  }, [open, text, workspacePath]);
+  }, [open, selectedWorkspace?.path]);
 
   const worktreeByBranch = useMemo(() => new Map(
     (scan?.worktrees ?? []).flatMap((worktree) => worktree.branch ? [[worktree.branch, worktree.path] as const] : []),
@@ -103,13 +129,31 @@ export function PaseoWorktreeDialog({
         <header>
           <div>
             <h2 id="paseo-worktree-title">{text("创建 Worktree", "Create worktree")}</h2>
-            <p>{workspacePath ?? text("未选择工作区", "No workspace selected")}</p>
+            <p>{selectedWorkspace?.path ?? text("先选择源项目或工作区", "Select a source project or workspace")}</p>
           </div>
           <button type="button" className="icon-button" aria-label={text("关闭创建 Worktree", "Close create worktree")} disabled={creating} onClick={onClose}>
             <LinearIcon name="close" />
           </button>
         </header>
 
+        <label className="paseo-worktree-source">
+          <span>{text("源项目 / 工作区", "Source project / workspace")}</span>
+          <PaseoWorkspacePicker
+            options={dialogWorkspaces}
+            value={workspaceId}
+            disabled={creating || Boolean(createdResult)}
+            ariaLabel={text("选择 Worktree 源项目或工作区", "Select worktree source project or workspace")}
+            placeholder={text("选择源项目或工作区", "Select source project or workspace")}
+            onChange={setWorkspaceId}
+          />
+        </label>
+
+        {!selectedWorkspace && !loading && (
+          <p className="paseo-worktree-loading">{text(
+            "请选择一个真实项目或工作区作为 Worktree 来源。",
+            "Select a real project or workspace as the worktree source.",
+          )}</p>
+        )}
         {loading && <p className="paseo-worktree-loading">{text("正在检查 Git 仓库…", "Checking Git repository…")}</p>}
         {!loading && error && <p className="paseo-worktree-error" role="alert">{error}</p>}
         {!loading && scan?.gitRoot && !scan.isGitRoot && (

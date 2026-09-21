@@ -1,3 +1,5 @@
+import type { Task } from "./types";
+
 /**
  * Desktop Paseo srcDoc bridge. It intercepts only same-frame /api requests;
  * the parent validates channel, nonce, source and the RPC allowlist before
@@ -100,10 +102,38 @@ export interface PaseoConfigurationOptions {
 export interface PaseoConfigurationOptionsRequest {
   provider: string;
   model: string;
-  workspacePath: string;
+  workspacePath?: string | null;
   agentId?: string;
   modeId?: string;
   thinkingOptionId?: string;
+}
+
+export interface PaseoMergeIdeasRequest {
+  requestId: string;
+  operationId: string;
+  projectId: string;
+  sourceTaskIds: string[];
+  title: string;
+  description?: string;
+  workspacePath: string;
+  profile: PaseoAgentProfile;
+}
+
+export interface PaseoMergeIdeasResult {
+  task: Task;
+  assignment: Extract<PaseoTaskAssignment, { kind: "planned" }>;
+  sourceTaskIds: string[];
+  replayed: boolean;
+}
+
+export type PaseoCopyRequest =
+  | { requestId: string; kind: "text"; text: string }
+  | { requestId: string; kind: "issue-link"; projectId: string; identifier: string };
+
+export interface PaseoCopyResponse {
+  requestId: string;
+  copiedText?: string;
+  error?: string;
 }
 
 /** Paseo daemon 的 Git 根/分支/Worktree 扫描结果。 */
@@ -128,6 +158,8 @@ export type PaseoAutomationIntervalMinutes = 5 | 10 | 15 | 30 | 60;
 /** Paseo daemon 持久化的项目自动认领状态；不依赖 Codex 项目身份。 */
 export interface PaseoAutomationState {
   projectId: string;
+  workspacePath: string | null;
+  profile: PaseoAgentProfile | null;
   enabledByUser: boolean;
   intervalMinutes: PaseoAutomationIntervalMinutes;
   quotaAware: boolean;
@@ -150,6 +182,7 @@ export type PaseoTaskAssignment =
       agentId: string;
       workspaceId: string;
       workspaceName: string | null;
+      workspacePath: string | null;
       provider: string;
       model: string | null;
       title: string | null;
@@ -158,8 +191,8 @@ export type PaseoTaskAssignment =
   | {
       kind: "planned";
       taskId: string;
-      workspacePath: string;
-      profile: PaseoAgentProfile;
+      workspacePath: string | null;
+      profile: PaseoAgentProfile | null;
     };
 
 function paseoBridgeConfig(): { channel: string; nonce: string } | null {
@@ -168,6 +201,20 @@ function paseoBridgeConfig(): { channel: string; nonce: string } | null {
   const channel = query.get("channel") ?? "";
   const nonce = query.get("nonce") ?? "";
   return channel && nonce ? { channel, nonce } : null;
+}
+
+/** 沙箱 iframe 不能直接打开新窗口；由父页面校验 GitHub 仓库 URL 后再打开。 */
+export function openPaseoExternalUrl(url: string): void {
+  const config = paseoBridgeConfig();
+  if (!config || window.parent === window) {
+    window.open(url, "_blank", "noopener,noreferrer");
+    return;
+  }
+  window.parent.postMessage({
+    type: "taskboard:paseo-open-url",
+    challenge: config.nonce,
+    payload: { url },
+  }, "*");
 }
 
 /** 供原版 DOM 使用的 Paseo 专用 RPC；不会退回到客户端 git 或 localhost。 */

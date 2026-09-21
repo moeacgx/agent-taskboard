@@ -12,6 +12,11 @@ Paseo 支持任务与真实 Agent 绑定、提供方和模型选择、Thinking /
 
 ## 在 Paseo 中安装和使用
 
+**正式版：[v0.2.0 下载与更新说明](https://github.com/moeacgx/agent-taskboard/releases/tag/v0.2.0)。**
+下载 `agent-taskboard-paseo-v0.2.0.zip`，解压到稳定目录后，在解压目录运行
+`paseo plugin install .`。安装会自动准备依赖及后台服务；无需克隆完整仓库。
+升级现有安装时保留原数据目录，详见[插件安装说明](integrations/paseo/README.md#使用正式版安装包)。
+
 ### 准备环境
 
 - 安装 [Paseo](https://paseo.sh/download)，插件要求 Paseo 0.8 或更高版本。
@@ -19,33 +24,35 @@ Paseo 支持任务与真实 Agent 绑定、提供方和模型选择、Thinking /
 - 在 Paseo 的 **Settings → Plugins** 中启用插件，并配置至少一个可用的 Agent 提供方。
 - 以下命令在运行 Paseo daemon 的同一台机器上执行；使用与该 daemon 版本匹配的 `paseo` CLI。
 
-### 1. 启动看板数据服务
+### 1. 准备插件
 
-在终端中克隆本仓库，然后安装依赖并启动服务：
+在终端中克隆本仓库，然后安装插件依赖并准备后台运行文件：
 
 ```bash
 git clone https://github.com/moeacgx/agent-taskboard.git
 cd agent-taskboard
-npm ci
-npm run build:web
-npm start
+cd integrations/paseo
+npm ci --ignore-scripts
+npm run prepare:runtime
 ```
 
-保留这个终端运行。服务默认监听 `http://127.0.0.1:47823`，负责保存任务、评论和项目文档。
+不需要保留终端运行。插件加载时自动启动本地后台，默认监听 `http://127.0.0.1:47823`，已有健康服务会直接复用。
 
 ### 2. 安装 Paseo 插件
 
-另开一个终端，在刚才克隆的 `agent-taskboard` 目录中执行：
+继续在 `integrations/paseo` 目录中执行：
 
 ```bash
-cd integrations/paseo
-npm ci --ignore-scripts
 npm run typecheck
 paseo plugin install .
 paseo plugin ls
 ```
 
 确认 `dashi-taskboard` 状态为 `running`，然后打开 Paseo 侧栏的 **任务看板**。仓库已包含插件所需的自包含页面，无需另外启动前端开发服务器。
+
+Windows 默认沿用 `%LOCALAPPDATA%/DashiPaseo` 数据目录。已有数据存放在其它位置时，先通过
+`DASHI_TASKBOARD_DATA_DIR` 指定原目录；不要删除数据库。若设置 `DASHI_TASKBOARD_URL`，表示连接自行管理的外部服务，
+插件不会启动或停止该服务。
 
 ### 3. 创建并执行任务
 
@@ -71,9 +78,9 @@ paseo plugin ls
 1. 使用稳定的本地目录克隆仓库；如果已有克隆或安装，先检查状态，保留已有修改和任务数据。
 2. 检查 Node.js 版本要求，以及与 daemon 匹配的 Paseo CLI。
    缺少依赖时明确说明；涉及全局安装、系统配置或启用可信插件时，先征得我同意。
-3. 在仓库根目录安装依赖、构建页面并启动 Dashi 数据服务。
-   若已有服务，先核对归属和可用性，避免重复启动或覆盖数据；不要终止不属于本次安装的进程。
-4. 在 integrations/paseo 安装依赖、运行 typecheck，
+3. 核对已有数据库位置，必要时指定 DASHI_TASKBOARD_DATA_DIR，保留已有项目和任务。
+   若已有服务，先核对归属和可用性；不要终止不属于本次安装的进程。
+4. 在 integrations/paseo 安装依赖、运行 prepare:runtime 和 typecheck，
    再使用 Paseo CLI 安装或重新加载 dashi-taskboard 插件，不要重启整个 daemon。
 5. 确认数据服务可访问、插件状态为 running。
    有界面操作能力时，打开 Paseo 侧栏“任务看板”验证；没有则明确列出尚未验证的界面步骤。
@@ -84,14 +91,14 @@ paseo plugin ls
 - 哪些检查实际通过，哪些仍需我操作；
 - 日常如何启动、如何停止本次启动的数据服务、如何更新插件。
 
-请明确说明：插件由 Paseo 加载，但当前仍需要独立运行 Dashi 数据服务，
-不需要打开原版看板窗口，也不是仅启动 Paseo 就能自动启动数据服务。
+请验证插件能自动启动本地 Dashi 服务，不需要保留终端或打开原版看板窗口。
+只有显式配置 DASHI_TASKBOARD_URL 时才使用自行管理的外部服务。
 不要在回复中输出密钥、令牌或其他凭据。
 ```
 
 ### 日常启动与更新
 
-**插件由 Paseo 自动加载，不需要单独打开原版看板窗口；但目前仍须单独运行看板数据服务。** 仅打开 Paseo 不会自动启动 `npm start`。
+**插件由 Paseo 自动加载并启动本地看板数据服务，不需要单独打开原版看板窗口或保留终端。** 外部 URL 模式由用户自行管理服务。
 
 安装后不要移动或删除插件源码目录。拉取更新后，按上述步骤更新依赖、运行类型检查，再执行：
 
