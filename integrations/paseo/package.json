@@ -1,13 +1,29 @@
 {
   "name": "dashi-taskboard-paseo-plugin",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "license": "Apache-2.0",
   "type": "module",
+  "files": [
+    "paseo-plugin.json",
+    "index.client.tsx",
+    "index.server.ts",
+    "client/",
+    "server/",
+    "shared/",
+    "scripts/",
+    "runtime/"
+  ],
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "node --test --test-timeout=60000 test/dashi-api.test.ts test/board.test.ts test/dispatch.test.ts test/board-api.test.ts test/lifecycle.test.ts test/turn-ownership.test.ts",
+    "test": "node --test --test-timeout=60000 test/dashi-api.test.ts test/board.test.ts test/dispatch.test.ts test/board-api.test.ts test/lifecycle.test.ts test/turn-ownership.test.ts test/plugin-update.test.ts",
+    "prepare:runtime": "node scripts/prepare-runtime.mjs",
     "build:original-srcdoc": "npx vite build --config ../../web/vite.paseo.config.ts && node ../../scripts/build-paseo-srcdoc.mjs"
+  },
+  "dependencies": {
+    "smol-toml": "^1.8.0",
+    "ws": "^8.21.3",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
     "@getpaseo/client": "0.8.0",
@@ -16,7 +32,6 @@
     "@types/react": "~19.1.17",
     "react": "~19.1.0",
     "react-native": "0.81.5",
-    "typescript": "^7.0.2",
-    "zod": "^4.4.3"
+    "typescript": "^7.0.2"
   }
 }

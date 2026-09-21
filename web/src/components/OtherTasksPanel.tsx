@@ -139,8 +139,10 @@ interface OtherTasksPanelProps {
   hasActiveFilters: boolean;
   isDropTarget: boolean;
   draggedTaskId: string | null;
+  draggedTaskIds?: ReadonlySet<string>;
   draggedTaskHeight: number;
   movingTaskId: string | null;
+  batchMovingTaskIds?: ReadonlySet<string>;
   settlingTaskId: string | null;
   contextMenuTaskId: string | null;
   availableLabels: string[];
@@ -151,6 +153,7 @@ interface OtherTasksPanelProps {
   onCreateLabel: (label: string, projectId?: string) => Promise<void>;
   restoringTaskId: string | null;
   deletingTaskId: string | null;
+  onClose: () => void;
   onTabChange: (tab: OtherTaskTab) => void;
   onCreate?: (status: Exclude<OtherTaskTab, "archived">) => void;
   onRestore: (task: Task) => void;
@@ -175,8 +178,10 @@ export function OtherTasksPanel({
   hasActiveFilters,
   isDropTarget,
   draggedTaskId,
+  draggedTaskIds = new Set<string>(),
   draggedTaskHeight,
   movingTaskId,
+  batchMovingTaskIds = new Set<string>(),
   settlingTaskId,
   contextMenuTaskId,
   availableLabels,
@@ -187,6 +192,7 @@ export function OtherTasksPanel({
   onCreateLabel,
   restoringTaskId,
   deletingTaskId,
+  onClose,
   onTabChange,
   onCreate,
   onRestore,
@@ -207,7 +213,7 @@ export function OtherTasksPanel({
     : taskStatusLabel(language, activeTab);
   const tasks = archived ? archivedTasks : tasksByStatus[activeTab];
   const { findDropBefore, clearDropPreview, updateDropPreview, leaveDropPreview, getTaskDragShift } =
-    useTaskCardDragPreview({ tasks, draggedTaskId, draggedTaskHeight, isDropTarget });
+    useTaskCardDragPreview({ tasks, draggedTaskId, draggedTaskIds, draggedTaskHeight, isDropTarget });
 
   function handleDrop(event: DragEvent<HTMLElement>) {
     event.preventDefault();
@@ -257,6 +263,15 @@ export function OtherTasksPanel({
             </button>
           );
         })}
+        <button
+          className="other-tasks-close"
+          type="button"
+          aria-label={text("关闭其他任务侧栏", "Close other issues panel")}
+          title={text("关闭侧栏", "Close panel")}
+          onClick={onClose}
+        >
+          <LinearIcon name="close" />
+        </button>
       </div>
 
       {!archived && onCreate && (
@@ -306,7 +321,7 @@ export function OtherTasksPanel({
               presentation={presentations[task.id]}
               isDragging={draggedTaskId === task.id}
               dragShift={dragShift}
-              isMoving={movingTaskId === task.id}
+              isMoving={movingTaskId === task.id || batchMovingTaskIds.has(task.id)}
               isSettling={settlingTaskId === task.id}
               isContextMenuOpen={contextMenuTaskId === task.id}
               availableLabels={availableLabels}

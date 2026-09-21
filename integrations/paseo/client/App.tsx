@@ -1,6 +1,6 @@
 import type { PluginSurfaceProps } from "@getpaseo/plugin/client";
 import { useRpc } from "@getpaseo/plugin/client";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Platform, Text, View } from "react-native";
 
 import * as contracts from "../shared/contracts";
@@ -24,6 +24,12 @@ export function TaskboardApp(props: PluginSurfaceProps) {
   const [route, setRoute] = useState<Route>({ kind: "projects" });
   const checkConnection = useRpc(contracts.checkConnection);
   const connection = useRpcQuery(checkConnection, {});
+
+  useEffect(() => {
+    if (connection.loading || (!connection.error && connection.data?.connected !== false)) return;
+    const timer = setTimeout(() => connection.refetch(), 3000);
+    return () => clearTimeout(timer);
+  }, [connection.loading, connection.error, connection.data?.connected, connection.refetch]);
 
   const styles = useMemo(
     () => ({

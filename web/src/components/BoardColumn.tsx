@@ -4,7 +4,8 @@ import type { ActorIdentity, Task, TaskDraft, TaskStatus } from "../types";
 import { taskStatusLabel, useTaskboardI18n } from "../i18n";
 import type { TaskCardPresentation, TaskConversationItem } from "../taskConversations";
 import { TaskCard } from "./TaskCard";
-import { PlusIcon, StatusIcon } from "./SemanticIcons";
+import { LinearIcon } from "./LinearIcon";
+import { DeleteIcon, PlusIcon, StatusIcon } from "./SemanticIcons";
 
 export const STATUS_DETAILS: Record<
   TaskStatus,
@@ -28,8 +29,10 @@ interface BoardColumnProps {
   emptyMessage: string;
   isDropTarget: boolean;
   draggedTaskId: string | null;
+  draggedTaskIds?: ReadonlySet<string>;
   draggedTaskHeight: number;
   movingTaskId: string | null;
+  batchMovingTaskIds?: ReadonlySet<string>;
   settlingTaskId: string | null;
   contextMenuTaskId: string | null;
   availableLabels: string[];
@@ -49,6 +52,16 @@ interface BoardColumnProps {
   onDragEnter: (status: TaskStatus) => void;
   onDrop: (status: TaskStatus, taskId: string, beforeTaskId: string | null) => void;
   onOpenConversation: (conversation: TaskConversationItem) => void;
+  ideaSelection?: {
+    active: boolean;
+    selectedIds: ReadonlySet<string>;
+    canSelect: (task: Task) => boolean;
+    onToggleMode: () => void;
+    onToggleTask: (task: Task) => void;
+    onMerge: () => void;
+    onDelete: () => void;
+    moving?: boolean;
+  };
 }
 
 export function BoardColumn({
@@ -60,8 +73,10 @@ export function BoardColumn({
   emptyMessage,
   isDropTarget,
   draggedTaskId,
+  draggedTaskIds = new Set<string>(),
   draggedTaskHeight,
   movingTaskId,
+  batchMovingTaskIds = new Set<string>(),
   settlingTaskId,
   contextMenuTaskId,
   availableLabels,
@@ -81,12 +96,13 @@ export function BoardColumn({
   onDragEnter,
   onDrop,
   onOpenConversation,
+  ideaSelection,
 }: BoardColumnProps) {
   const { language, text } = useTaskboardI18n();
   const details = STATUS_DETAILS[status];
   const label = labelOverride ?? taskStatusLabel(language, status);
   const { findDropBefore, clearDropPreview, updateDropPreview, leaveDropPreview, getTaskDragShift } =
-    useTaskCardDragPreview({ tasks, draggedTaskId, draggedTaskHeight, isDropTarget });
+    useTaskCardDragPreview({ tasks, draggedTaskId, draggedTaskIds, draggedTaskHeight, isDropTarget });
 
   function handleDrop(event: DragEvent<HTMLElement>) {
     event.preventDefault();
@@ -118,8 +134,44 @@ export function BoardColumn({
             {label}{tasks.length > 0 ? ` ${tasks.length}` : ""}
           </h2>
         </div>
-        {createEnabled && (
+        {(createEnabled || ideaSelection) && (
           <div className="column-actions">
+            {ideaSelection && (
+              <>
+                <button
+                  type="button"
+                  className={`column-selection-action${ideaSelection.active ? " is-active" : ""}`}
+                  aria-pressed={ideaSelection.active}
+                  disabled={ideaSelection.moving}
+                  onClick={ideaSelection.onToggleMode}
+                >
+                  {ideaSelection.active ? text("取消", "Cancel") : text("多选", "Select")}
+                </button>
+                {ideaSelection.active && ideaSelection.selectedIds.size >= 2 && (
+                  <button
+                    type="button"
+                    className="column-selection-action is-merge"
+                    disabled={ideaSelection.moving}
+                    onClick={ideaSelection.onMerge}
+                  >
+                    <LinearIcon name="check" />
+                    {text(`合并 ${ideaSelection.selectedIds.size} 项`, `Merge ${ideaSelection.selectedIds.size}`)}
+                  </button>
+                )}
+                {ideaSelection.active && ideaSelection.selectedIds.size >= 1 && (
+                  <button
+                    type="button"
+                    className="column-selection-action is-delete"
+                    disabled={ideaSelection.moving}
+                    onClick={ideaSelection.onDelete}
+                  >
+                    <DeleteIcon color="currentColor" size={12} />
+                    {text(`删除 ${ideaSelection.selectedIds.size} 项`, `Delete ${ideaSelection.selectedIds.size}`)}
+                  </button>
+                )}
+              </>
+            )}
+            {createEnabled && (
             <button
               type="button"
               className="icon-button add-task-button"
@@ -129,6 +181,7 @@ export function BoardColumn({
             >
               <PlusIcon color="var(--column-status-color)" size={12} />
             </button>
+            )}
           </div>
         )}
       </header>
@@ -142,8 +195,11 @@ export function BoardColumn({
               task={task}
               presentation={presentations[task.id]}
               isDragging={draggedTaskId === task.id}
+              batchDragMember={draggedTaskIds.size > 1 && draggedTaskIds.has(task.id)}
+              batchDragSource={draggedTaskIds.size > 1 && draggedTaskId === task.id}
+              selectionCount={ideaSelection?.selectedIds.size ?? 0}
               dragShift={dragShift}
-              isMoving={movingTaskId === task.id}
+              isMoving={movingTaskId === task.id || batchMovingTaskIds.has(task.id)}
               isSettling={settlingTaskId === task.id}
               isContextMenuOpen={contextMenuTaskId === task.id}
               availableLabels={availableLabels}
@@ -159,6 +215,10 @@ export function BoardColumn({
               onDragStart={onDragStart}
               onDragEnd={onDragEnd}
               onOpenConversation={onOpenConversation}
+              selectionMode={ideaSelection?.active}
+              selected={ideaSelection?.selectedIds.has(task.id)}
+              selectable={ideaSelection?.canSelect(task)}
+              onToggleSelection={ideaSelection?.onToggleTask}
             />
           );
         })}

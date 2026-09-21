@@ -6,7 +6,7 @@ import {
   buildTaskPrompt,
   canStartTaskDispatch,
   dispatchBoundTask,
-  hasDispatchConfiguration,
+  hasTaskDispatchConfiguration,
   recordDispatchFailure,
   type TaskDispatchCoordinator,
 } from "./dispatch.ts";
@@ -52,7 +52,9 @@ export function createPaseoAutomationRuntime(
     if (stopped || !api) return;
     const configured = (await settings.list()).filter((item) => item.enabledByUser);
     if (stopped || configured.length === 0) return;
-    const projectIds = new Set((await dashi.listProjects(dashi.resolveBaseUrl())).projects.map((project) => project.id));
+    const projects = (await dashi.listProjects(dashi.resolveBaseUrl())).projects;
+    const projectById = new Map(projects.map((project) => [project.id, project]));
+    const projectIds = new Set(projectById.keys());
     await Promise.all(configured
       .filter((item) => projectIds.has(item.projectId))
       .filter((item) => !item.lastRunAt || now - new Date(item.lastRunAt).getTime() >= item.intervalMinutes * 60_000)
@@ -70,11 +72,21 @@ export function createPaseoAutomationRuntime(
           await mutationLock.run(listed.id, async () => {
             if (stopped) return;
             const task = (await dashi.getTask(baseUrl, listed.id)).task;
-            if (task.archivedAt !== null || (task.status !== "backlog" && task.status !== "todo")) return;
+            if (
+              task.projectId !== snapshot.projectId
+              || task.archivedAt !== null
+              || (task.status !== "backlog" && task.status !== "todo")
+            ) return;
             const binding = await bindings.get(task.id);
             const plan = await plans.get(task.id);
-            const configuration = plan ?? currentPolicy;
-            if (!binding && !hasDispatchConfiguration(configuration)) {
+            const configuration = {
+              workspacePath: task.developmentContext?.type === "worktree"
+                ? task.developmentContext.path
+                : plan?.workspacePath ?? currentPolicy.workspacePath,
+              profile: plan?.profile ?? currentPolicy.profile,
+            };
+            const hasConfiguration = hasTaskDispatchConfiguration(task, configuration);
+            if (!binding && !hasConfiguration) {
               lastError = `任务 ${task.identifier} 缺少 Agent 计划或项目默认工作区/Profile，已跳过。`;
               return;
             }
@@ -86,8 +98,14 @@ export function createPaseoAutomationRuntime(
             const latestPolicy = await settings.get(snapshot.projectId);
             if (stopped || !latestPolicy?.enabledByUser) return;
             const latestPlan = await plans.get(task.id);
-            const latestConfiguration = latestPlan ?? latestPolicy;
-            if (!binding && !hasDispatchConfiguration(latestConfiguration)) {
+            const latestConfiguration = {
+              workspacePath: task.developmentContext?.type === "worktree"
+                ? task.developmentContext.path
+                : latestPlan?.workspacePath ?? latestPolicy.workspacePath,
+              profile: latestPlan?.profile ?? latestPolicy.profile,
+            };
+            const hasLatestConfiguration = hasTaskDispatchConfiguration(task, latestConfiguration);
+            if (!binding && !hasLatestConfiguration) {
               lastError = `任务 ${task.identifier} 的 Agent 配置已变化，已跳过。`;
               return;
             }

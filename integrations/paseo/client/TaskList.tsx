@@ -1,10 +1,10 @@
 import type { PluginTheme } from "@getpaseo/plugin";
-import { usePaseo, useRpc } from "@getpaseo/plugin/client";
+import { useRpc } from "@getpaseo/plugin/client";
 import { useEffect, useMemo, useState } from "react";
-import { Alert, Platform, Pressable, ScrollView, Text, TextInput, View } from "react-native";
+import { Alert, Platform, Pressable, ScrollView, Text, View } from "react-native";
 
 import * as contracts from "../shared/contracts";
-import type { AgentProfileConfig, ProjectAutomationSettings, Task, TaskStatus } from "../shared/contracts";
+import type { PaseoAutomationState, Task, TaskStatus } from "../shared/contracts";
 import { BOARD_COLUMN_LABELS, BOARD_COLUMNS, boardColumnForStatus, calculateDropSortOrder, isMainBoardStatus, orderBoardTasks } from "./board";
 import { PRIORITY_LABELS } from "./format";
 import { useRpcQuery } from "./hooks";
@@ -37,26 +37,24 @@ export function TaskList(props: {
   onCreateTask: (status?: TaskStatus) => void;
 }) {
   const { theme, layout, navigation, projectId, projectName, onBack, onSelectTask, onCreateTask } = props;
-  const paseo = usePaseo();
   const listTasks = useRpc(contracts.listTasks);
   const moveBoard = useRpc(contracts.moveTaskBoard);
   const retryDispatch = useRpc(contracts.retryTaskDispatch);
   const archiveTask = useRpc(contracts.archiveTask);
   const restoreTask = useRpc(contracts.restoreTask);
   const deleteTask = useRpc(contracts.deleteTask);
-  const getSettings = useRpc(contracts.getProjectSettings);
-  const saveSettings = useRpc(contracts.saveProjectSettings);
+  const getAutomation = useRpc(contracts.getPaseoAutomation);
+  const saveAutomation = useRpc(contracts.savePaseoAutomation);
   const [view, setView] = useState<TaskView>("board");
   const query = useRpcQuery(listTasks, {
     projectId: projectId ?? undefined,
     archived: view === "archived",
     status: view === "done" || view === "canceled" ? view : undefined,
   });
-  const settingsQuery = useRpcQuery(getSettings, { projectId: projectId ?? "" }, { enabled: projectId !== null });
+  const automationQuery = useRpcQuery(getAutomation, { projectId: projectId ?? "" }, { enabled: projectId !== null });
   const [movingId, setMovingId] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [pendingDrop, setPendingDrop] = useState<{ task: Task; column: (typeof BOARD_COLUMNS)[number]; targetIndex: number } | null>(null);
 
   useEffect(() => {
     if (movingId || settingsOpen) return;
@@ -91,7 +89,6 @@ export function TaskList(props: {
     const loaded = query.data?.tasks ?? [];
     return view === "board" ? orderBoardTasks(loaded.filter((task) => isMainBoardStatus(task.status))) : loaded;
   }, [query.data?.tasks, view]);
-  const settings = settingsQuery.data?.settings ?? null;
 
   function destinationStatus(task: Task, column: (typeof BOARD_COLUMNS)[number]): TaskStatus {
     return boardColumnForStatus(task.status) === column ? task.status : COLUMN_STATUS[column];
@@ -106,18 +103,13 @@ export function TaskList(props: {
     try {
       const result = await moveBoard({ id: task.id, version: task.version, status, sortOrder: calculateDropSortOrder(destination, targetIndex) });
       if (result.dispatch === "needs_configuration") {
-        setPendingDrop({ task, column, targetIndex });
-        setSettingsOpen(true);
+        setNotice(result.dispatchMessage ?? "请打开任务详情配置 Agent 和代码目录，再重试开始执行。");
       }
       if (result.dispatchMessage) setNotice(result.dispatchMessage);
       query.refetch();
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       setNotice(message);
-      if (/配置|工作区|profile/i.test(message)) {
-        setPendingDrop({ task, column, targetIndex });
-        setSettingsOpen(true);
-      }
       query.refetch();
     } finally {
       setMovingId(null);
@@ -185,7 +177,7 @@ export function TaskList(props: {
         <View style={styles.headerRow}>
           <View><Text style={styles.title}>{projectName}</Text><Text style={styles.subtitle}>拖动想法开始执行，完成后自动进入等你确认</Text></View>
           <View style={styles.row}>
-            {projectId !== null && <Pressable accessibilityRole="button" accessibilityLabel="项目自动执行设置" testID="project-settings-toggle" style={styles.secondary} onPress={() => setSettingsOpen((value) => !value)}><Text style={styles.secondaryText}>设置</Text></Pressable>}
+            {projectId !== null && <Pressable accessibilityRole="button" accessibilityLabel="项目自动认领设置" testID="project-settings-toggle" style={styles.secondary} onPress={() => setSettingsOpen((value) => !value)}><Text style={styles.secondaryText}>自动认领</Text></Pressable>}
             <Pressable accessibilityRole="button" accessibilityLabel="新建任务" testID="create-task" onPress={() => onCreateTask()} style={styles.button}><Text style={styles.buttonText}>+ 新建</Text></Pressable>
           </View>
         </View>
@@ -198,7 +190,7 @@ export function TaskList(props: {
         </View>
       </View>
       {notice && <Text style={styles.error} accessibilityRole="alert" testID="board-notice">{notice}</Text>}
-      {settingsOpen && projectId !== null && <ProjectAutomationSettingsPanel theme={theme} layout={layout} paseo={paseo} initial={settings} projectId={projectId} save={saveSettings} onSaved={() => { settingsQuery.refetch(); setNotice("项目默认配置已保存。正在继续原来的拖放操作。 "); const next = pendingDrop; setPendingDrop(null); if (next) void handleDrop(next.task, next.column, next.targetIndex); }} />}
+      {settingsOpen && projectId !== null && <ProjectAutomationSettingsPanel theme={theme} layout={layout} initialAutomation={automationQuery.data?.automation ?? null} projectId={projectId} saveAutomation={saveAutomation} onSaved={() => { automationQuery.refetch(); setNotice("自动认领设置已保存。 "); }} />}
       {view === "board"
         ? (Platform.OS === "web" ? <OriginalTaskboardFrame theme={theme} layout={layout} navigation={navigation} /> : <NativeBoard theme={theme} layout={layout} tasks={tasks} movingId={movingId} onSelectTask={onSelectTask} onDrop={handleDrop} onRetry={handleRetry} onAction={handleAction} />)
         : <TaskStatusList theme={theme} layout={layout} tasks={tasks} view={view} movingId={movingId} onSelectTask={onSelectTask} onAction={handleAction} />}
@@ -206,33 +198,21 @@ export function TaskList(props: {
   );
 }
 
-function ProjectAutomationSettingsPanel(props: { theme: PluginTheme; layout: PluginLayout; paseo: ReturnType<typeof usePaseo>; initial: ProjectAutomationSettings | null; projectId: string; save: (input: { projectId: string; workspacePath: string; profile: AgentProfileConfig }) => Promise<unknown>; onSaved: () => void }) {
-  const { theme, layout, paseo, initial, projectId, save, onSaved } = props;
-  const [workspaces, setWorkspaces] = useState<Array<{ id: string; name: string | null; workspaceDirectory: string | null }>>([]);
-  const [profiles, setProfiles] = useState<AgentProfileConfig[]>([]);
-  const [workspacePath, setWorkspacePath] = useState(initial?.workspacePath ?? "");
-  const [profile, setProfile] = useState<AgentProfileConfig | null>(initial?.profile ?? null);
+function ProjectAutomationSettingsPanel(props: { theme: PluginTheme; layout: PluginLayout; initialAutomation: PaseoAutomationState | null; projectId: string; saveAutomation: (input: { projectId: string; enabledByUser: boolean; intervalMinutes: 5 | 10 | 15 | 30 | 60; quotaAware: boolean }) => Promise<unknown>; onSaved: () => void }) {
+  const { theme, layout, initialAutomation, projectId, saveAutomation, onSaved } = props;
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  useEffect(() => {
-    let cancelled = false;
-    void Promise.all([
-      paseo.workspaces.list().then((result) => result.entries).catch(() => []),
-      paseo.config.get().then((result) => (result.config.agentProfiles ?? []) as AgentProfileConfig[]).catch(() => []),
-    ]).then(([entries, configProfiles]) => {
-      if (cancelled) return;
-      setWorkspaces(entries.map((entry) => ({ id: entry.id, name: entry.name, workspaceDirectory: entry.workspaceDirectory })));
-      setProfiles(configProfiles);
-    });
-    return () => { cancelled = true; };
-  }, [paseo]);
-  const styles = useMemo(() => ({ box: { marginHorizontal: layout.compact ? 14 : 22, padding: 12, gap: 8, borderRadius: 8, borderWidth: 1, borderColor: theme.colors.border, backgroundColor: theme.colors.surface1 }, label: { color: theme.colors.foregroundMuted, fontSize: 12 }, input: { borderWidth: 1, borderColor: theme.colors.border, borderRadius: 7, padding: 8, color: theme.colors.foreground, backgroundColor: theme.colors.surface0 }, row: { flexDirection: "row" as const, flexWrap: "wrap" as const, gap: 6 }, chip: (active: boolean) => ({ paddingVertical: 6, paddingHorizontal: 9, borderRadius: 999, backgroundColor: active ? theme.colors.accent : theme.colors.surface2 }), chipText: (active: boolean) => ({ color: active ? theme.colors.accentForeground : theme.colors.foregroundMuted, fontSize: 11, fontWeight: "600" as const }), save: { alignSelf: "flex-start" as const, paddingVertical: 7, paddingHorizontal: 12, borderRadius: 7, backgroundColor: theme.colors.accent }, saveText: { color: theme.colors.accentForeground, fontWeight: "700" as const, fontSize: 12 }, error: { color: theme.colors.statusDanger, fontSize: 12 } }), [theme, layout.compact]);
+  const [enabledByUser, setEnabledByUser] = useState(initialAutomation?.enabledByUser ?? false);
+  const [intervalMinutes, setIntervalMinutes] = useState<5 | 10 | 15 | 30 | 60>(initialAutomation?.intervalMinutes ?? 5);
+  const styles = useMemo(() => ({ box: { marginHorizontal: layout.compact ? 14 : 22, padding: 12, gap: 8, borderRadius: 8, borderWidth: 1, borderColor: theme.colors.border, backgroundColor: theme.colors.surface1 }, label: { color: theme.colors.foregroundMuted, fontSize: 12 }, row: { flexDirection: "row" as const, flexWrap: "wrap" as const, gap: 6 }, chip: (active: boolean) => ({ paddingVertical: 6, paddingHorizontal: 9, borderRadius: 999, backgroundColor: active ? theme.colors.accent : theme.colors.surface2 }), chipText: (active: boolean) => ({ color: active ? theme.colors.accentForeground : theme.colors.foregroundMuted, fontSize: 11, fontWeight: "600" as const }), save: { alignSelf: "flex-start" as const, paddingVertical: 7, paddingHorizontal: 12, borderRadius: 7, backgroundColor: theme.colors.accent }, saveText: { color: theme.colors.accentForeground, fontWeight: "700" as const, fontSize: 12 }, error: { color: theme.colors.statusDanger, fontSize: 12 } }), [theme, layout.compact]);
   async function handleSave() {
-    if (!workspacePath.trim() || !profile) { setError("请选择工作区和 Agent Profile。"); return; }
     setSaving(true); setError(null);
-    try { await save({ projectId, workspacePath: workspacePath.trim(), profile }); onSaved(); } catch (value) { setError(value instanceof Error ? value.message : String(value)); } finally { setSaving(false); }
+    try {
+      await saveAutomation({ projectId, enabledByUser, intervalMinutes, quotaAware: false });
+      onSaved();
+    } catch (value) { setError(value instanceof Error ? value.message : String(value)); } finally { setSaving(false); }
   }
-  return <View style={styles.box} testID="project-automation-settings"><Text style={styles.label}>默认工作区</Text><TextInput accessibilityLabel="默认工作区路径" testID="default-workspace-path" style={styles.input} value={workspacePath} onChangeText={setWorkspacePath} placeholder="选择下方工作区或输入路径" placeholderTextColor={theme.colors.foregroundMuted} /><View style={styles.row}>{workspaces.map((workspace) => workspace.workspaceDirectory ? <Pressable key={workspace.id} accessibilityRole="button" accessibilityLabel={`选择工作区 ${workspace.name ?? workspace.workspaceDirectory}`} testID={`workspace-${workspace.id}`} style={styles.chip(workspacePath === workspace.workspaceDirectory)} onPress={() => setWorkspacePath(workspace.workspaceDirectory ?? "")}><Text style={styles.chipText(workspacePath === workspace.workspaceDirectory)}>{workspace.name ?? workspace.workspaceDirectory}</Text></Pressable> : null)}</View><Text style={styles.label}>默认 Agent Profile</Text><View style={styles.row}>{profiles.map((item) => <Pressable key={item.id} accessibilityRole="button" accessibilityLabel={`选择 Agent Profile ${item.name}`} testID={`profile-${item.id}`} style={styles.chip(profile?.id === item.id)} onPress={() => setProfile(item)}><Text style={styles.chipText(profile?.id === item.id)}>{item.name}</Text></Pressable>)}</View>{error && <Text style={styles.error} accessibilityRole="alert">{error}</Text>}<Pressable accessibilityRole="button" accessibilityLabel="保存项目自动执行设置" testID="save-project-settings" style={styles.save} onPress={() => void handleSave()} disabled={saving}><Text style={styles.saveText}>{saving ? "保存中…" : "保存默认配置"}</Text></Pressable></View>;
+  return <View style={styles.box} testID="project-automation-settings"><Text style={styles.label}>自动认领</Text><View style={styles.row}><Pressable accessibilityRole="button" style={styles.chip(enabledByUser)} onPress={() => setEnabledByUser((value) => !value)}><Text style={styles.chipText(enabledByUser)}>{enabledByUser ? "已启用" : "已关闭"}</Text></Pressable>{([5, 10, 15, 30, 60] as const).map((minutes) => <Pressable key={minutes} accessibilityRole="button" style={styles.chip(intervalMinutes === minutes)} onPress={() => setIntervalMinutes(minutes)}><Text style={styles.chipText(intervalMinutes === minutes)}>{minutes} 分钟</Text></Pressable>)}</View><Text style={styles.label}>额度感知</Text><Text style={styles.label}>当前 Paseo SDK 未提供额度目录，额度开关保持关闭。</Text>{error && <Text style={styles.error} accessibilityRole="alert">{error}</Text>}<Pressable accessibilityRole="button" accessibilityLabel="保存项目自动认领设置" testID="save-project-settings" style={styles.save} onPress={() => void handleSave()} disabled={saving}><Text style={styles.saveText}>{saving ? "保存中…" : "保存自动认领"}</Text></Pressable></View>;
 }
 
 function NativeBoard(props: { theme: PluginTheme; layout: PluginLayout; tasks: Task[]; movingId: string | null; onSelectTask: (id: string) => void; onDrop: (task: Task, column: (typeof BOARD_COLUMNS)[number], index: number) => void; onRetry: (task: Task) => void; onAction: (task: Task, action: BoardTaskAction) => void }) {

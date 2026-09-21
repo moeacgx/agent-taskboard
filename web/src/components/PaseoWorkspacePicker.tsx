@@ -15,9 +15,23 @@ interface PaseoWorkspacePickerProps {
   options: PaseoWorkspaceOption[];
   value: string;
   onChange: (id: string) => void;
+  disabled?: boolean;
+  ariaLabel?: string;
+  allowEmpty?: boolean;
+  emptyLabel?: string;
+  placeholder?: string;
 }
 
-export function PaseoWorkspacePicker({ options, value, onChange }: PaseoWorkspacePickerProps) {
+export function PaseoWorkspacePicker({
+  options,
+  value,
+  onChange,
+  disabled = false,
+  ariaLabel = "新 Agent 工作区",
+  allowEmpty = false,
+  emptyLabel = "不指定工作区",
+  placeholder = "选择工作区",
+}: PaseoWorkspacePickerProps) {
   const rootRef = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
@@ -141,7 +155,26 @@ export function PaseoWorkspacePicker({ options, value, onChange }: PaseoWorkspac
         />
       </label>
       <div className="task-property-options paseo-workspace-options">
-        {visibleCount === 0 ? (
+        {allowEmpty && !normalizedQuery && (
+          <button
+            type="button"
+            role="option"
+            aria-selected={!value}
+            className="task-property-option paseo-workspace-option"
+            onClick={() => {
+              closePicker(true);
+              if (value) onChange("");
+            }}
+          >
+            <span className="task-property-option-icon"><LinearIcon name="folder" /></span>
+            <span className="paseo-workspace-option-copy">
+              <span className="paseo-workspace-option-title">{emptyLabel}</span>
+              <span className="paseo-workspace-option-path">执行时使用任务或所属项目目录</span>
+            </span>
+            {!value && <span className="task-property-option-check"><LinearIcon name="check" /></span>}
+          </button>
+        )}
+        {visibleCount === 0 && !(allowEmpty && !normalizedQuery) ? (
           <div className="task-filter-no-results">没有匹配的项目或工作区</div>
         ) : groups.map((group) => (
           <div role="group" aria-label={group.label} key={group.kind}>
@@ -186,10 +219,11 @@ export function PaseoWorkspacePicker({ options, value, onChange }: PaseoWorkspac
         ref={triggerRef}
         type="button"
         className="property-control property-development"
-        aria-label="新 Agent 工作区"
+        aria-label={ariaLabel}
         aria-haspopup="listbox"
         aria-expanded={open}
-        title={selected?.path ?? "选择工作区"}
+        disabled={disabled}
+        title={selected?.path ?? placeholder}
         onClick={() => setOpen((current) => !current)}
         onKeyDown={(event) => {
           if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
@@ -202,7 +236,7 @@ export function PaseoWorkspacePicker({ options, value, onChange }: PaseoWorkspac
             ? <TaskboardIcon name="projectFolder" />
             : <LinearIcon name="folder" />}
         </span>
-        <span className="task-property-trigger-label">{selected?.name ?? selected?.path ?? "选择工作区"}</span>
+        <span className="task-property-trigger-label">{selected?.name ?? selected?.path ?? placeholder}</span>
       </button>
       {menu}
     </div>

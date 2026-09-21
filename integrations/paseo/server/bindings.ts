@@ -86,6 +86,24 @@ export function createBindingsStore(options: { filePath?: string } = {}) {
       });
     },
 
+    /** 任务换项目时只同步归属，不改变 Agent、轮次或派发所有权。 */
+    setProjectId(taskId: string, projectId: string): Promise<Binding | null> {
+      return enqueue(async () => {
+        let updated: Binding | null = null;
+        await mutate((byTaskId) => {
+          const existing = byTaskId[taskId];
+          if (!existing) return byTaskId;
+          if (existing.projectId === projectId) {
+            updated = existing;
+            return byTaskId;
+          }
+          updated = { ...existing, projectId, updatedAt: new Date().toISOString() };
+          return { ...byTaskId, [taskId]: updated };
+        });
+        return updated;
+      });
+    },
+
     upsert(input: {
       taskId: string;
       taskIdentifier: string;

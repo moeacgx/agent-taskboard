@@ -1,4 +1,8 @@
 {
   "id": "dashi-taskboard",
-  "requirements": { "paseo": ">=0.8.0" }
+  "requirements": { "paseo": ">=0.8.0" },
+  "build": [
+    ["npm", "ci", "--ignore-scripts"],
+    ["node", "scripts/prepare-installation.mjs"]
+  ]
 }

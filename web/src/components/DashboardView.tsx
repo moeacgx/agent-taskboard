@@ -4,17 +4,19 @@ import "./DashboardView.css";
 import dueDoneIcon from "../assets/figma-taskboard/dashboard-due-done.svg";
 import dueEditIcon from "../assets/figma-taskboard/dashboard-due-edit.svg";
 import processingAnimation from "../assets/figma-taskboard/loading-16.svg";
-import { getProjectSummary } from "../api";
+import { getPluginUpdateStatus, getProjectSummary, isPaseoEmbeddedHost } from "../api";
+import { openPaseoExternalUrl } from "../paseo-bridge";
 import { taskPriorityLabel, taskStatusLabel, useTaskboardI18n } from "../i18n";
 import { labelPresentation } from "../labels";
 import type {
   TaskCardPresentation,
   TaskConversationItem,
 } from "../taskConversations";
-import type { ActorIdentity, ProjectSummary, Task } from "../types";
+import type { ActorIdentity, PluginUpdateStatus, ProjectSummary, Task } from "../types";
 import { ActorAvatar } from "./ActorAvatar";
 import { PriorityIcon } from "./SemanticIcons";
 import { TaskConversationMenu } from "./TaskConversationMenu";
+import { ProviderIcon } from "../providerIcons";
 
 interface DashboardViewProps {
   projectId: string;
@@ -161,6 +163,116 @@ function dayValue(value: string) {
 function shortDate(value: string, locale: string) {
   return new Intl.DateTimeFormat(locale, { month: "short", day: "numeric" })
     .format(new Date(`${value}T12:00:00`));
+}
+
+const PLUGIN_DISPLAY_VERSION = "0.1.0";
+
+const PLUGIN_UPDATE_FALLBACK: PluginUpdateStatus = {
+  status: "unavailable",
+  updateAvailable: false,
+  currentVersion: PLUGIN_DISPLAY_VERSION,
+  latestVersion: null,
+  publishedAt: null,
+  title: null,
+  notes: null,
+  htmlUrl: "https://github.com/moeacgx/agent-taskboard/releases",
+  guideUrl: "https://github.com/moeacgx/agent-taskboard/blob/HEAD/integrations/paseo/README.md",
+  checkedAt: "",
+  error: null,
+};
+
+function DashboardUpdatePanel() {
+  const { locale, text } = useTaskboardI18n();
+  const enabled = isPaseoEmbeddedHost();
+  const [loading, setLoading] = useState(enabled);
+  const [info, setInfo] = useState<PluginUpdateStatus | null>(null);
+
+  async function load(refresh = false, signal?: AbortSignal) {
+    if (!enabled) return;
+    setLoading(true);
+    try {
+      setInfo(await getPluginUpdateStatus({ refresh, signal }));
+    } catch (error) {
+      if (error instanceof Error && error.name === "AbortError") return;
+      setInfo({
+        ...PLUGIN_UPDATE_FALLBACK,
+        checkedAt: new Date().toISOString(),
+        error: error instanceof Error ? error.message : String(error),
+      });
+    } finally {
+      if (!signal?.aborted) setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    if (!enabled) return undefined;
+    const controller = new AbortController();
+    void load(false, controller.signal);
+    return () => controller.abort();
+  }, [enabled]);
+
+  if (!enabled) return null;
+
+  const status = info?.status ?? (loading ? "loading" : "unavailable");
+  const publishedLabel = info?.publishedAt
+    ? new Intl.DateTimeFormat(locale, { dateStyle: "medium", timeStyle: "short" }).format(new Date(info.publishedAt))
+    : null;
+  const heading = status === "update"
+    ? text("发现新版本", "Update available")
+    : status === "current"
+      ? info?.latestVersion
+        ? text("当前已是最新版", "You're on the latest version")
+        : text("尚未发布正式版本", "No stable release published yet")
+      : loading && !info
+        ? text("正在检查更新…", "Checking for updates…")
+        : text("暂时无法检查更新", "Update check unavailable");
+
+  return (
+    <section
+      className={`dashboard-update-panel${status === "update" ? " is-update" : ""}`}
+      aria-live="polite"
+      aria-label={text("插件版本更新", "Plugin version updates")}
+    >
+      <div className="dashboard-update-copy">
+        <strong>{heading}</strong>
+        <span>
+          {text("当前版本", "Current")} {info?.currentVersion || "—"}
+          {info?.latestVersion ? ` · ${text("最新版本", "Latest")} ${info.latestVersion}` : ""}
+          {publishedLabel ? ` · ${text("发布于", "Published")} ${publishedLabel}` : ""}
+        </span>
+        {status === "unavailable" && (
+          <span className="dashboard-update-error">
+            {text("检查失败不影响看板使用。", "The board still works if the check fails.")}
+            {info?.error ? ` ${info.error}` : ""}
+          </span>
+        )}
+        {status === "update" && info?.title ? <em>{info.title}</em> : null}
+        {status === "update" && info?.notes ? (
+          <pre className="dashboard-update-notes">{info.notes}</pre>
+        ) : null}
+      </div>
+      <div className="dashboard-update-actions">
+        {info?.htmlUrl ? (
+          <button type="button" className="button secondary" onClick={() => openPaseoExternalUrl(info.htmlUrl!)}>
+            {text("查看完整说明", "View release notes")}
+          </button>
+        ) : null}
+        {info?.guideUrl ? (
+          <button type="button" className="button secondary" onClick={() => openPaseoExternalUrl(info.guideUrl)}>
+            {text("更新指南", "Update guide")}
+          </button>
+        ) : null}
+        <button
+          type="button"
+          className="button primary"
+          disabled={loading}
+          onClick={() => void load(true)}
+        >
+          {loading ? text("正在检查…", "Checking…") : text("检查更新", "Check now")}
+        </button>
+      </div>
+    </section>
+  );
 }
 
 function DashboardSummary({
@@ -670,15 +782,23 @@ export function DashboardView({
   }, [isAllProjects, projectCreatedAt, tasks, todayValue]);
 
   const runningTasks = useMemo(() => tasks.filter(
-    (task) => presentations[task.id]?.processing.running,
+    (task) => presentations[task.id]?.processing.running
+      && !presentations[task.id]?.processing.awaitingPermission,
   ), [presentations, tasks]);
 
   const attentionItems = useMemo(() => activeTasks
-    .filter((task) => task.status === "blocked" || presentations[task.id]?.unread)
+    .filter((task) => (
+      presentations[task.id]?.processing.awaitingPermission
+      || task.status === "blocked"
+      || presentations[task.id]?.unread
+    ))
     .sort((left, right) => {
+      const leftAwaitingPermission = presentations[left.id]?.processing.awaitingPermission ? 1 : 0;
+      const rightAwaitingPermission = presentations[right.id]?.processing.awaitingPermission ? 1 : 0;
       const leftUnread = presentations[left.id]?.unread ? 1 : 0;
       const rightUnread = presentations[right.id]?.unread ? 1 : 0;
-      return rightUnread - leftUnread
+      return rightAwaitingPermission - leftAwaitingPermission
+        || rightUnread - leftUnread
         || right.activityUpdatedAt.localeCompare(left.activityUpdatedAt);
     })
     .slice(0, 5), [activeTasks, presentations]);
@@ -737,6 +857,8 @@ export function DashboardView({
           />
         </div>
 
+        <DashboardUpdatePanel />
+
         <div className="dashboard-metrics">
           {metrics.map((metric) => {
             const percent = activeTasks.length ? Math.round((metric.value / activeTasks.length) * 100) : 0;
@@ -779,22 +901,43 @@ export function DashboardView({
           </section>
 
           <section className="dashboard-panel dashboard-primary-panel dashboard-attention-panel">
-            <header><span>{text("需要关注（未读、阻塞）", "Needs attention (unread, blocked)")}</span></header>
+            <header><span>{text("需要关注", "Needs attention")}</span></header>
             <div className="dashboard-task-list">
-              {attentionItems.length ? attentionItems.map((task) => (
-                <button
-                  type="button"
-                  className="dashboard-attention-row"
-                  onClick={() => onOpenTask(task)}
-                  key={task.id}
-                >
-                  <span className="dashboard-attention-mark" aria-hidden="true">
-                    {presentations[task.id]?.unread && <i />}
-                  </span>
-                  <strong>{task.title}</strong>
-                  <small>ID: {task.externalKey ?? task.identifier}</small>
-                </button>
-              )) : (
+              {attentionItems.length ? attentionItems.map((task) => {
+                const presentation = presentations[task.id];
+                const awaitingPermission = presentation?.processing.awaitingPermission === true;
+                return (
+                  <article
+                    className={`dashboard-attention-row${awaitingPermission ? " is-awaiting-permission" : ""}`}
+                    key={task.id}
+                  >
+                    <button
+                      type="button"
+                      className="dashboard-attention-open"
+                      onClick={() => onOpenTask(task)}
+                    >
+                      <span className="dashboard-attention-mark" aria-hidden="true">
+                        {awaitingPermission ? (
+                          <ProviderIcon iconDataUrl={task.assignee.avatarUrl} />
+                        ) : presentation?.unread ? <i /> : null}
+                      </span>
+                      <span className="dashboard-attention-copy">
+                        <strong>{task.title}</strong>
+                        {awaitingPermission && (
+                          <span className="dashboard-attention-status">{text("等待你的授权", "Waiting for your authorization")}</span>
+                        )}
+                      </span>
+                      <small>ID: {task.externalKey ?? task.identifier}</small>
+                    </button>
+                    {presentation?.conversations.length ? (
+                      <TaskConversationMenu
+                        conversations={presentation.conversations}
+                        onOpenConversation={onOpenConversation}
+                      />
+                    ) : null}
+                  </article>
+                );
+              }) : (
                 <div className="dashboard-empty">{text("当前没有需要关注的议题", "No issues need attention")}</div>
               )}
             </div>

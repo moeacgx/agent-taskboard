@@ -135,10 +135,11 @@ interface TaskEditorProps {
     onOpenAgent: (agentId: string) => void;
   };
   paseoWorkspaces?: PaseoWorkspaceOption[];
-  paseoDefaultWorkspacePath?: string | null;
   paseoWorktree?: {
     onCreated: (context: DevelopmentContext) => void;
   };
+  mergeSources?: Task[];
+  mergeStartAfterSave?: boolean;
   onCreateLabel: (label: string) => Promise<void>;
   onCancel: (draft: NewTaskEditorDraft | null) => void;
   onSave: (
@@ -200,13 +201,15 @@ export function TaskEditor({
   paseoAssignee,
   paseoConfiguration,
   paseoWorkspaces = [],
-  paseoDefaultWorkspacePath = null,
   paseoWorktree,
+  mergeSources = [],
+  mergeStartAfterSave = false,
   onCreateLabel,
   onCancel,
   onSave,
 }: TaskEditorProps) {
   const { language, locale, text } = useTaskboardI18n();
+  const mergingIdeas = mergeSources.length >= 2;
   const dialogRef = useRef<HTMLDialogElement>(null);
   const moreMenuRef = useRef<HTMLDivElement>(null);
   const backdropPointerRef = useRef({ down: false, up: false });
@@ -221,7 +224,8 @@ export function TaskEditor({
   const [status, setStatus] = useState<TaskStatus>(initialStatus);
   const [priority, setPriority] = useState<TaskPriority>(initialDraft?.priority ?? "none");
   const [assignee, setAssignee] = useState<ActorIdentity>(initialDraft?.assignee ?? currentUser);
-  const [paseoAssigneeId, setPaseoAssigneeId] = useState("paseo:self");
+  const [paseoAssigneeId, setPaseoAssigneeId] = useState("paseo:project-default");
+  const [paseoPlanTouched, setPaseoPlanTouched] = useState(false);
   const [paseoWorkspaceId, setPaseoWorkspaceId] = useState("");
   const [paseoConfigurationSelection, setPaseoConfigurationSelection] = useState<PaseoConfigurationSelection>({});
   const [paseoConfigurationReady, setPaseoConfigurationReady] = useState(false);
@@ -327,24 +331,18 @@ export function TaskEditor({
   const selectedPaseoWorkspace = availablePaseoWorkspaces.find((workspace) => workspace.id === paseoWorkspaceId) ?? null;
   const selectedPaseoAssignee = paseoAssignee?.options.find((option) => option.id === paseoAssigneeId) ?? null;
   const paseoConfigurationTarget = selectedPaseoAssignee?.provider && selectedPaseoAssignee.model
-    && (selectedPaseoAssignee.workspacePath || selectedPaseoWorkspace?.path)
     ? {
         provider: selectedPaseoAssignee.provider,
         model: selectedPaseoAssignee.model,
-        workspacePath: selectedPaseoAssignee.workspacePath ?? selectedPaseoWorkspace!.path,
+        workspacePath: selectedPaseoAssignee.workspacePath ?? selectedPaseoWorkspace?.path ?? null,
         ...(selectedPaseoAssignee.agentId ? { agentId: selectedPaseoAssignee.agentId } : {}),
         ...(selectedPaseoAssignee.modeId ? { modeId: selectedPaseoAssignee.modeId } : {}),
         ...(selectedPaseoAssignee.thinkingOptionId ? { thinkingOptionId: selectedPaseoAssignee.thinkingOptionId } : {}),
       }
     : null;
-  const worktreeRepositoryPath = selectedPaseoWorkspace?.path ?? developmentScan.workspacePath;
-
-  useEffect(() => {
-    if (!paseoNeedsWorkspace || availablePaseoWorkspaces.length === 0) return;
-    if (selectedPaseoWorkspace) return;
-    const preferred = availablePaseoWorkspaces.find((workspace) => workspace.path === paseoDefaultWorkspacePath);
-    if (preferred) setPaseoWorkspaceId(preferred.id);
-  }, [availablePaseoWorkspaces, paseoDefaultWorkspacePath, paseoNeedsWorkspace, selectedPaseoWorkspace]);
+  const worktreeRepositoryPath = developmentContext?.type === "worktree"
+    ? developmentContext.path
+    : selectedPaseoWorkspace?.path ?? null;
 
   useEffect(() => {
     dialogRef.current?.showModal();
@@ -447,10 +445,6 @@ export function TaskEditor({
       ]);
       return;
     }
-    if (paseoAssignee && paseoNeedsWorkspace && !selectedPaseoWorkspace) {
-      setError("请选择新 Agent 的工作区。");
-      return;
-    }
     if (paseoConfigurationTarget && !paseoConfigurationReady) {
       setError("正在读取 Paseo Thinking/Mode 选项，请稍后重试。");
       return;
@@ -477,10 +471,14 @@ export function TaskEditor({
       }, inlineMediaFiles(descriptionSegments), inlineMediaImages(descriptionSegments), {
         keepOpen: createMore,
         relations: { parentId, relatedIds, subIssueIds },
-        ...(paseoAssignee ? { paseoAssigneeId } : {}),
-        ...(paseoAssignee && selectedPaseoWorkspace ? { paseoWorkspacePath: selectedPaseoWorkspace.path } : {}),
-        ...(paseoConfigurationSelection.modeId ? { paseoModeId: paseoConfigurationSelection.modeId } : {}),
-        ...(paseoConfigurationSelection.thinkingOptionId
+        ...(paseoAssignee && paseoPlanTouched ? { paseoAssigneeId } : {}),
+        ...(paseoAssignee && paseoPlanTouched && selectedPaseoWorkspace
+          ? { paseoWorkspacePath: selectedPaseoWorkspace.path }
+          : {}),
+        ...(paseoPlanTouched && paseoConfigurationSelection.modeId
+          ? { paseoModeId: paseoConfigurationSelection.modeId }
+          : {}),
+        ...(paseoPlanTouched && paseoConfigurationSelection.thinkingOptionId
           ? { paseoThinkingOptionId: paseoConfigurationSelection.thinkingOptionId }
           : {}),
       });
@@ -569,7 +567,11 @@ export function TaskEditor({
       <form className="task-form is-creating" onSubmit={handleSubmit} onKeyDown={handleKeyDown}>
         <header className="dialog-header">
           <div className="dialog-context">
-            <strong id="task-dialog-title">{text("新建议题", "New issue")}</strong>
+            <strong id="task-dialog-title">{mergingIdeas
+              ? mergeStartAfterSave
+                ? text("合并并开始任务", "Merge and start task")
+                : text("合并想法为任务", "Merge ideas into task")
+              : text("新建议题", "New issue")}</strong>
           </div>
           <div className="dialog-header-actions">
             <button
@@ -597,7 +599,7 @@ export function TaskEditor({
         <div className="form-body">
           <label className="composer-title">
             <span className="sr-only">{text("标题", "Title")}</span>
-            <textarea ref={titleRef} rows={1} value={title} onChange={(event) => setTitle(event.target.value.replace(/\n/g, ""))} placeholder={text("议题标题", "Issue title")} maxLength={240} autoComplete="off" />
+            <textarea ref={titleRef} rows={1} value={title} onChange={(event) => setTitle(event.target.value.replace(/\n/g, ""))} placeholder={mergingIdeas ? text("合并后的任务标题", "Merged task title") : text("议题标题", "Issue title")} maxLength={240} autoComplete="off" />
           </label>
           <InlineMediaComposer
             ref={descriptionComposerRef}
@@ -606,13 +608,40 @@ export function TaskEditor({
             mentionTasks={tasks}
             referenceTasks={referenceTasks}
             completionContext={projectId ? { projectId, surface: "issue-description" } : undefined}
-            placeholder={text("添加描述…", "Add description…")}
-            ariaLabel={text("描述", "Description")}
+            placeholder={mergingIdeas
+              ? text("补充要求（来源想法内容由系统追加）", "Additional requirements (source idea content is appended automatically)")
+              : text("添加描述…", "Add description…")}
+            ariaLabel={mergingIdeas ? text("补充要求", "Additional requirements") : text("描述", "Description")}
             disabled={saving}
-            allowAttachments
+            allowAttachments={!mergingIdeas}
             onChange={setDescriptionSegments}
             onError={setAttachmentError}
           />
+
+          {mergingIdeas && (
+            <section className="merge-ideas-sources" aria-labelledby="merge-ideas-sources-title">
+              <header>
+                <strong id="merge-ideas-sources-title">{text("来源想法", "Source ideas")}</strong>
+                <span>{mergeSources.length}</span>
+              </header>
+              <p>{text(
+                mergeStartAfterSave
+                  ? "确认后只创建一个新任务和一个 Agent；来源想法会保留记录、关联到新任务并归档。"
+                  : "合并成功后，来源想法会保留完整记录、关联到新任务并归档，不会被删除。",
+                mergeStartAfterSave
+                  ? "Confirmation creates one new task and one Agent; source ideas keep their history, link to the new task, and are archived."
+                  : "After merging, source ideas keep their full history, are linked to the new task, and are archived rather than deleted.",
+              )}</p>
+              <ul>
+                {mergeSources.map((source) => (
+                  <li key={source.id}>
+                    <span>{source.externalKey ?? source.identifier}</span>
+                    <strong>{source.title}</strong>
+                  </li>
+                ))}
+              </ul>
+            </section>
+          )}
 
         </div>
 
@@ -634,6 +663,7 @@ export function TaskEditor({
                   })),
                 ]}
                 open={menu === "project"}
+                disabled={mergingIdeas}
                 triggerClassName="property-control property-project"
                 ariaLabel={text("项目", "Project")}
                 onOpenChange={(open) => setMenu(open ? "project" : null)}
@@ -652,12 +682,23 @@ export function TaskEditor({
                 icon: <StatusIcon status={value} color="currentColor" size={14} />,
               }))}
               open={menu === "status"}
+              disabled={mergingIdeas}
               triggerClassName="property-control property-status"
+              triggerContent={mergeStartAfterSave ? (
+                <>
+                  <span className="task-property-trigger-icon">
+                    <StatusIcon status="in_progress" color="currentColor" size={14} />
+                  </span>
+                  <span className="task-property-trigger-label">
+                    {taskStatusLabel(language, "in_progress")}
+                  </span>
+                </>
+              ) : undefined}
               ariaLabel={text("状态", "Status")}
               onOpenChange={(open) => setMenu(open ? "status" : null)}
               onChange={setStatus}
             />
-            <TaskPropertyPicker
+            {!mergingIdeas && (!paseoAssignee || paseoNeedsWorkspace) && <TaskPropertyPicker
               value={priority}
               options={TASK_PRIORITIES.map((value) => ({
                 value,
@@ -670,7 +711,7 @@ export function TaskEditor({
               ariaLabel={text("优先级", "Priority")}
               onOpenChange={(open) => setMenu(open ? "priority" : null)}
               onChange={setPriority}
-            />
+            />}
             {paseoAssignee ? (
               <div className="paseo-agent-configuration-group">
                 <PaseoAssigneePicker
@@ -679,7 +720,14 @@ export function TaskEditor({
                   loading={paseoAssignee.loading}
                   error={paseoAssignee.error}
                   onRefresh={paseoAssignee.onRefresh}
-                  onChange={setPaseoAssigneeId}
+                  onChange={(id) => {
+                    if (id === paseoAssigneeId) return;
+                    setPaseoAssigneeId(id);
+                    setPaseoPlanTouched(true);
+                    setPaseoWorkspaceId("");
+                    setPaseoConfigurationSelection({});
+                    setPaseoConfigurationReady(false);
+                  }}
                 />
                 {paseoConfiguration && paseoConfigurationTarget && (
                   <PaseoConfigurationFields
@@ -716,10 +764,16 @@ export function TaskEditor({
               <PaseoWorkspacePicker
                 value={paseoWorkspaceId}
                 options={availablePaseoWorkspaces}
-                onChange={setPaseoWorkspaceId}
+                allowEmpty
+                emptyLabel={text("使用项目默认目录", "Use project default directory")}
+                placeholder={text("使用项目默认目录", "Use project default directory")}
+                onChange={(id) => {
+                  setPaseoPlanTouched(true);
+                  setPaseoWorkspaceId(id);
+                }}
               />
             )}
-            <LabelPicker
+            {!mergingIdeas && <LabelPicker
               availableLabels={availableLabels}
               selectedLabels={selectedLabels}
               open={menu === "labels"}
@@ -728,9 +782,9 @@ export function TaskEditor({
               onOpenChange={(open) => setMenu(open ? "labels" : null)}
               onChange={setSelectedLabels}
               onCreateLabel={onCreateLabel}
-            />
+            />}
 
-            <TaskPropertyPicker
+            {!mergingIdeas && <TaskPropertyPicker
               value={contextValue(developmentContext)}
               options={[
                 {
@@ -747,12 +801,18 @@ export function TaskEditor({
                     ? <BranchIcon color="currentColor" size={14} />
                     : <LinearIcon name="folder" />,
                 })),
-                ...(paseoWorktree ? [{
+                ...(paseoWorktree && paseoNeedsWorkspace ? [{
                   value: "__paseo-create-worktree__",
-                  label: text("创建 Worktree", "Create worktree"),
+                  label: text(
+                    "新建独立代码目录（Worktree）",
+                    "Create isolated code directory (worktree)",
+                  ),
                   icon: <PlusIcon color="currentColor" size={14} />,
                   className: "development-context-create-option",
-                  onSelect: () => setWorktreeDialogOpen(true),
+                  onSelect: () => {
+                    paseoAssignee?.onRefresh();
+                    setWorktreeDialogOpen(true);
+                  },
                 }] : []),
               ]}
               open={menu === "development"}
@@ -763,11 +823,12 @@ export function TaskEditor({
               title={developmentScan.workspacePath ?? undefined}
               onOpenChange={(open) => setMenu(open ? "development" : null)}
               onChange={(value) => setDevelopmentContext(value ? JSON.parse(value) as DevelopmentContext : null)}
-            />
-            {paseoWorktree && (
+            />}
+            {!mergingIdeas && paseoWorktree && paseoNeedsWorkspace && (
               <PaseoWorktreeDialog
                 open={worktreeDialogOpen}
-                workspacePath={worktreeRepositoryPath}
+                workspaces={availablePaseoWorkspaces}
+                initialWorkspacePath={worktreeRepositoryPath}
                 onClose={() => setWorktreeDialogOpen(false)}
                 onCreated={(result) => {
                   setDevelopmentContext(result.context);
@@ -779,21 +840,22 @@ export function TaskEditor({
                     kind: "workspace",
                   });
                   setPaseoWorkspaceId(result.workspace.id);
+                  setPaseoPlanTouched(true);
                   paseoWorktree.onCreated(result.context);
                 }}
               />
             )}
 
-            {dueDate && (
-              <button className="property-control" type="button" onClick={() => setMenu("due")}>
+            {!mergingIdeas && dueDate && (
+              <button className="property-control" type="button" title={text("用于计划安排，不会定时启动 Agent。", "Used for planning; it does not start an Agent on a schedule.")} onClick={() => setMenu("due")}>
                 <span>{text(
                   `截止 ${displayDate(dueDate, locale)}`,
                   `Due ${displayDate(dueDate, locale)}`,
                 )}</span>
               </button>
             )}
-            {recurrence && (
-              <button className="property-control" type="button" onClick={() => setMenu("recurrence")}>
+            {!mergingIdeas && recurrence && (
+              <button className="property-control" type="button" title={text("仅记录周期，尚不自动生成下一次任务。", "Records the cadence only; it does not create the next task automatically.")} onClick={() => setMenu("recurrence")}>
                 <span>{text(
                   `每 ${recurrence.interval} ${RECURRENCE_UNITS.zh[recurrence.unit]}`,
                   `Every ${recurrence.interval} ${RECURRENCE_UNITS.en[recurrence.unit]}${recurrence.interval === 1 ? "" : "s"}`,
@@ -801,7 +863,7 @@ export function TaskEditor({
               </button>
             )}
 
-            {selectedRelationChips.map(({ type, issue }) => {
+            {!mergingIdeas && selectedRelationChips.map(({ type, issue }) => {
               const identifier = issue.externalKey ?? issue.identifier;
               const relationLabel = type === "subIssue"
                 ? text("子", "Sub")
@@ -832,7 +894,7 @@ export function TaskEditor({
               );
             })}
 
-            <div className="composer-menu-anchor" ref={moreMenuRef}>
+            {!mergingIdeas && <div className="composer-menu-anchor" ref={moreMenuRef}>
               <button className="property-control property-more" type="button" aria-label={text("更多属性", "More properties")} onClick={toggleMoreMenu}><MoreIcon color="currentColor" /></button>
               {menu === "more" && (
                 <div
@@ -846,8 +908,8 @@ export function TaskEditor({
                     left: "auto",
                   } : undefined}
                 >
-                  <button type="button" onClick={() => setMenu("due")}><span><DueDateIcon color="currentColor" /></span><strong>{text("设置截止日期", "Set due date")}</strong><kbd>⇧ D</kbd><b><LinearIcon name="chevronRight" /></b></button>
-                  <button type="button" onClick={() => setMenu("recurrence")}><span><RecurrenceIcon color="currentColor" /></span><strong>{text("设置重复…", "Set recurrence…")}</strong><b><LinearIcon name="chevronRight" /></b></button>
+                  <button type="button" title={text("用于计划安排，不会定时启动 Agent。", "Used for planning; it does not start an Agent on a schedule.")} onClick={() => setMenu("due")}><span><DueDateIcon color="currentColor" /></span><strong>{text("设置截止日期", "Set due date")}</strong><kbd>⇧ D</kbd><b><LinearIcon name="chevronRight" /></b></button>
+                  <button type="button" title={text("仅记录周期，尚不自动生成下一次任务。", "Records the cadence only; it does not create the next task automatically.")} onClick={() => setMenu("recurrence")}><span><RecurrenceIcon color="currentColor" /></span><strong>{text("设置重复…", "Set recurrence…")}</strong><b><LinearIcon name="chevronRight" /></b></button>
                   <div className="more-popover-divider" />
                   <button className={relationMenu === "subIssue" ? "is-open" : undefined} type="button" role="menuitem" aria-haspopup="menu" aria-expanded={relationMenu === "subIssue"} onClick={() => setRelationMenu("subIssue")}><span><PlusIcon color="currentColor" size={16} /></span><strong>{text("添加子议题", "Add sub-issue")}</strong>{selectedSubIssues.length > 0 && <small>{text(`${selectedSubIssues.length} 个已选`, `${selectedSubIssues.length} selected`)}</small>}<b><LinearIcon name="chevronRight" /></b></button>
                   <button className={relationMenu === "parent" ? "is-open" : undefined} type="button" role="menuitem" aria-haspopup="menu" aria-expanded={relationMenu === "parent"} onClick={() => setRelationMenu("parent")}><span><PlusIcon color="currentColor" size={16} /></span><strong>{text("添加父议题", "Add parent issue")}</strong>{selectedParent && <small>{selectedParent.externalKey ?? selectedParent.identifier}</small>}<b><LinearIcon name="chevronRight" /></b></button>
@@ -867,6 +929,7 @@ export function TaskEditor({
               )}
               {menu === "due" && (
                 <div className="composer-popover due-popover">
+                  <p className="composer-scheduling-note">{text("日期用于计划安排，不会定时启动 Agent。", "Dates are for planning and do not start an Agent on a schedule.")}</p>
                   <label className="custom-date-row"><span>{text("自定义…", "Custom…")}</span><input type="date" value={dueDate} onChange={(event) => chooseDueDate(event.target.value)} /></label>
                   <button type="button" onClick={() => chooseDueDate(dateFromNow(1))}><strong>{text("明天", "Tomorrow")}</strong><span>{displayDate(dateFromNow(1), locale)}</span></button>
                   <button type="button" onClick={() => chooseDueDate(endOfWeek())}><strong>{text("本周结束", "End of this week")}</strong><span>{displayDate(endOfWeek(), locale)}</span></button>
@@ -876,13 +939,14 @@ export function TaskEditor({
               )}
               {menu === "recurrence" && (
                 <div className="composer-popover recurrence-popover">
+                  <p className="composer-scheduling-note">{text("仅记录周期，尚不自动生成下一次任务。", "This records the cadence only and does not create the next task automatically.")}</p>
                   <label><span>{text("最早截止日期", "Initial due date")}</span><input type="date" value={dueDate || dateFromNow(7)} onChange={(event) => setDueDate(event.target.value)} /></label>
                   <label><span>{text("重复频率", "Repeat frequency")}</span><span className="recurrence-controls"><input type="number" min="1" max="365" value={recurrence?.interval ?? 1} onChange={(event) => setRecurrence({ interval: Number(event.target.value), unit: recurrence?.unit ?? "week" })} /><select value={recurrence?.unit ?? "week"} onChange={(event) => setRecurrence({ interval: recurrence?.interval ?? 1, unit: event.target.value as Recurrence["unit"] })}>{Object.entries(RECURRENCE_UNITS[language]).map(([unit, label]) => <option value={unit} key={unit}>{label}</option>)}</select></span></label>
                   <button className="recurrence-save" type="button" onClick={() => { if (!dueDate) setDueDate(dateFromNow(7)); if (!recurrence) setRecurrence({ interval: 1, unit: "week" }); setMenu(null); }}>{text("设置重复", "Set recurrence")}</button>
                   {recurrence && <button className="destructive-menu-row" type="button" onClick={() => { setRecurrence(null); setMenu(null); }}>{text("清除重复", "Clear recurrence")}</button>}
                 </div>
               )}
-            </div>
+            </div>}
           </div>
 
           {attachmentError && (
@@ -899,12 +963,16 @@ export function TaskEditor({
           )}
 
           <footer className="dialog-footer">
-            <button className="composer-attach-icon" type="button" disabled={saving} onClick={() => attachmentInputRef.current?.click()} aria-label={text("上传附件", "Upload attachments")}>
-              <AttachmentIcon color="currentColor" />
-            </button>
-            <input ref={attachmentInputRef} type="file" multiple hidden onChange={(event) => { if (event.currentTarget.files) descriptionComposerRef.current?.addFiles(event.currentTarget.files); event.currentTarget.value = ""; }} />
+            {!mergingIdeas && (
+              <>
+                <button className="composer-attach-icon" type="button" disabled={saving} onClick={() => attachmentInputRef.current?.click()} aria-label={text("上传附件", "Upload attachments")}>
+                  <AttachmentIcon color="currentColor" />
+                </button>
+                <input ref={attachmentInputRef} type="file" multiple hidden onChange={(event) => { if (event.currentTarget.files) descriptionComposerRef.current?.addFiles(event.currentTarget.files); event.currentTarget.value = ""; }} />
+              </>
+            )}
             <div className="dialog-actions">
-              <div className="create-more-control">
+              {!mergingIdeas && <div className="create-more-control">
                 <span>{text("创建更多", "Create more")}</span>
                 <button
                   type="button"
@@ -916,7 +984,7 @@ export function TaskEditor({
                 >
                   <span aria-hidden="true" />
                 </button>
-              </div>
+              </div>}
               <button
                 className="button primary"
                 type="submit"
@@ -927,7 +995,11 @@ export function TaskEditor({
               >
                 {saving
                   ? text("正在保存…", "Saving…")
-                  : text("创建议题", "Create issue")}
+                  : mergingIdeas
+                    ? mergeStartAfterSave
+                      ? text("合并并开始", "Merge and start")
+                      : text("合并为任务", "Merge into task")
+                    : text("创建议题", "Create issue")}
               </button>
             </div>
           </footer>

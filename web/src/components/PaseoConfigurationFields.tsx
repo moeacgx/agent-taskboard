@@ -188,9 +188,12 @@ export function PaseoConfigurationFields({
         </div>
       )}
       {options && !options.editable && (
-        <div className="paseo-configuration-message">
-          <span>已有会话需在 Paseo 中调整</span>
-          {onOpenAgent && <button type="button" onClick={onOpenAgent}>打开 Paseo</button>}
+        <div className="paseo-configuration-message is-readonly-note">
+          <span>
+            <strong>当前会话配置</strong>
+            <small>Thinking 与 Mode 需在 Paseo 会话中调整。</small>
+          </span>
+          {onOpenAgent && <button type="button" onClick={onOpenAgent}>打开会话调整</button>}
         </div>
       )}
     </div>

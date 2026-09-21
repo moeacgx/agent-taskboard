@@ -358,6 +358,22 @@ export interface ProjectSummary {
   error: string | null;
 }
 
+export type PluginUpdateStatusKind = "update" | "current" | "unavailable";
+
+export interface PluginUpdateStatus {
+  status: PluginUpdateStatusKind;
+  updateAvailable: boolean;
+  currentVersion: string;
+  latestVersion: string | null;
+  publishedAt: string | null;
+  title: string | null;
+  notes: string | null;
+  htmlUrl: string | null;
+  guideUrl: string;
+  checkedAt: string;
+  error: string | null;
+}
+
 export interface ProjectReadme {
   projectId: string;
   content: string;
@@ -509,6 +525,10 @@ export interface HostContext {
   threadId?: string;
   theme?: "light" | "dark";
   projectId?: string;
+  route?: {
+    projectId: string | null;
+    issueIdentifier: string | null;
+  };
   projects?: Array<{
     id: string;
     name: string;

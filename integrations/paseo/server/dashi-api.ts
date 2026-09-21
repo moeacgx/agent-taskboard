@@ -6,18 +6,29 @@ import { Buffer } from "node:buffer";
  * (`server/app.mjs` in the dashi-taskboard repository). This is the only
  * module that knows the API's URL scheme, headers, and error envelope.
  *
- * Service discovery is deliberately simple for this first version: an
- * explicit `DASHI_TASKBOARD_URL` override, or the documented default port.
- * There is no auto-launch; `checkConnection()` reports the exact command to
- * run when nothing answers.
+ * The plugin lifecycle configures a managed local Dashi service. An explicit
+ * `DASHI_TASKBOARD_URL` remains external and is never started or stopped here.
  */
 
 const DEFAULT_BASE_URL = "http://127.0.0.1:47823";
 const REQUEST_TIMEOUT_MS = 5_000;
 
-export const START_COMMAND_HINT =
-  "在 dashi-taskboard 仓库根目录运行 `npm run dev:server`（或 `node server/index.mjs`）启动本地服务，" +
-  "默认监听 http://127.0.0.1:47823。若使用其它端口/主机，请设置环境变量 DASHI_TASKBOARD_URL。";
+export const START_COMMAND_HINT = "插件会自动启动本地 Dashi 服务；请检查 Paseo 插件日志中的启动路径、Node.js 版本与数据目录错误。";
+
+interface DashiReadyGate {
+  baseUrl: string;
+  ensureReady(): Promise<void>;
+}
+
+let readyGate: DashiReadyGate | null = null;
+
+export function configureDashiReadyGate(gate: DashiReadyGate | null): void {
+  readyGate = gate;
+}
+
+async function ensureReady(baseUrl: string): Promise<void> {
+  if (readyGate && readyGate.baseUrl === baseUrl) await readyGate.ensureReady();
+}
 
 export class DashiApiError extends Error {
   code: string;
@@ -37,7 +48,8 @@ export class DashiConnectionError extends Error {
   baseUrl: string;
 
   constructor(baseUrl: string, cause: unknown) {
-    super(`无法连接到 dashi-taskboard 服务（${baseUrl}）。${START_COMMAND_HINT}`);
+    const detail = cause instanceof Error ? cause.message : String(cause);
+    super(`无法连接到 dashi-taskboard 服务（${baseUrl}）。${detail ? `原因：${detail}。` : ""}${START_COMMAND_HINT}`);
     this.name = "DashiConnectionError";
     this.baseUrl = baseUrl;
     this.cause = cause;
@@ -47,7 +59,8 @@ export class DashiConnectionError extends Error {
 export function resolveBaseUrl(env: NodeJS.ProcessEnv = process.env): string {
   const override = env.DASHI_TASKBOARD_URL;
   if (override && override.trim().length > 0) return override.trim().replace(/\/$/, "");
-  return DEFAULT_BASE_URL;
+  const port = env.CODEX_TASKBOARD_PORT?.trim();
+  return port ? `http://127.0.0.1:${port}` : DEFAULT_BASE_URL;
 }
 
 export interface ActorIdentity {
@@ -66,8 +79,6 @@ async function request<T>(
   path: string,
   options: { body?: unknown; actor?: ActorIdentity } = {},
 ): Promise<T> {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
   const headers: Record<string, string> = {};
   const actor = options.actor ?? PLUGIN_UI_ACTOR;
   headers["x-taskboard-user-id"] = actor.id;
@@ -78,6 +89,14 @@ async function request<T>(
     body = JSON.stringify(options.body);
   }
 
+  try {
+    await ensureReady(baseUrl);
+  } catch (error) {
+    throw new DashiConnectionError(baseUrl, error);
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
   let response: Response;
   try {
     response = await fetch(`${baseUrl}${path}`, { method, headers, body, signal: controller.signal });
@@ -166,6 +185,7 @@ const BRIDGE_ROUTES: Array<[string, RegExp]> = [
   ["GET", /^\/api\/tasks(?:\/[^/?]+(?:\/(comments|activities|attachments))?)?$/],
   ["GET", /^\/api\/attachments\/[^/?]+\/(content|download)$/],
   ["PUT", /^\/api\/projects\/[^/?]+\/readme$/],
+  ["PATCH", /^\/api\/projects\/[^/?]+$/],
   ["PATCH", /^\/api\/tasks\/[^/?]+$/],
   ["PATCH", /^\/api\/comments\/[^/?]+$/],
   ["DELETE", /^\/api\/projects\/[^/?]+$/],
@@ -193,6 +213,7 @@ export async function bridgeRequest(baseUrl: string, input: {
   headers: Record<string, string>;
   body: { kind: "json"; value: unknown } | { kind: "base64"; value: string };
 }> {
+  await ensureReady(baseUrl);
   const url = new URL(input.path, "https://paseo-taskboard.invalid");
   if (!BRIDGE_ROUTES.some(([method, pattern]) => method === input.method && pattern.test(url.pathname))) {
     return {
@@ -242,15 +263,30 @@ export function createTask(
   return request(baseUrl, "POST", "/api/tasks", { body: input });
 }
 
+export function mergeTasks(
+  baseUrl: string,
+  input: {
+    operationId: string;
+    projectId: string;
+    sourceTaskIds: string[];
+    title: string;
+    description?: string;
+  },
+): Promise<{ task: Task; sourceTasks: Task[]; replayed: boolean }> {
+  return request(baseUrl, "POST", "/api/tasks/merge", { body: input });
+}
+
 export function updateTask(
   baseUrl: string,
   id: string,
   input: {
     version: number;
+    projectId?: string;
     title?: string;
     description?: string;
     priority?: TaskPriority;
     labels?: string[];
+    developmentContext?: { type: "branch"; branch: string } | { type: "worktree"; path: string; branch: string | null } | null;
   },
 ): Promise<{ task: Task }> {
   return request(baseUrl, "PATCH", `/api/tasks/${encodeURIComponent(id)}`, { body: input });

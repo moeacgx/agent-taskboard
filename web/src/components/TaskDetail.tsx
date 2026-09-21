@@ -90,11 +90,12 @@ import {
   type RelationMutationResult,
 } from "./IssueRelations";
 import { TaskPropertyPicker } from "./TaskPropertyPicker";
-import { buildIssueUrl } from "../issueRoute";
 import { postEmbeddedHostMessage } from "../embeddedHost.mjs";
 import type {
   PaseoConfigurationOptions,
   PaseoConfigurationOptionsRequest,
+  PaseoCreatedWorktree,
+  PaseoAgentProfile,
   PaseoTaskAssignment,
 } from "../paseo-bridge";
 import type { PaseoAgentPresentation } from "../taskConversations";
@@ -107,9 +108,12 @@ import {
   type PaseoConfigurationSelection,
 } from "./PaseoConfigurationFields";
 import { PaseoWorktreeDialog } from "./PaseoWorktreeDialog";
+import type { PaseoWorkspaceOption } from "./PaseoWorkspacePicker";
 import copyIdIcon from "../assets/figma-taskboard/copy-id.svg";
 import copyLinkIcon from "../assets/figma-taskboard/copy-link.svg";
 import { DescriptionDocument } from "./DescriptionDocument";
+import { MergedTaskSources } from "./MergedTaskSources";
+import { parseMergedTaskDescription } from "../mergeTaskPresentation";
 
 type TaskDetailError = string | readonly [string, string];
 
@@ -143,6 +147,7 @@ interface TaskDetailProps {
   onOpenLegacyLocalThread: (threadId: string) => void;
   onOpenInThread: (task: Task) => void;
   onCopy: (text: string, announcement: string) => void;
+  onCopyIssueLink: (projectId: string, identifier: string, announcement: string) => void;
   openingThread: boolean;
   onError: (message: TaskDetailError | null) => void;
   paseoAssignment?: PaseoTaskAssignment | null;
@@ -156,12 +161,23 @@ interface TaskDetailProps {
     onRefresh: () => void;
     onChange: (id: string) => void;
   };
+  paseoExecutionConfig?: {
+    onOpen: () => void;
+  };
+  paseoProjectDefaults?: {
+    profile: PaseoAgentProfile | null;
+    workspacePath: string | null;
+  };
   paseoConfiguration?: {
     target: PaseoConfigurationOptionsRequest | null;
     loadOptions: (target: PaseoConfigurationOptionsRequest) => Promise<PaseoConfigurationOptions>;
     onSave?: (selection: PaseoConfigurationSelection) => Promise<void>;
   };
-  paseoWorktree?: boolean;
+  paseoWorktree?: {
+    workspaces: PaseoWorkspaceOption[];
+    onRefresh: () => void;
+    onCreated: (result: PaseoCreatedWorktree) => void | Promise<void>;
+  };
 }
 
 function messageFor(error: unknown): TaskDetailError {
@@ -254,7 +270,7 @@ const ACTIVITY_FIELD_LABELS: Record<string, readonly [string, string]> = {
   priority: ["优先级", "priority"],
   labels: ["标签", "labels"],
   assignee: ["负责人", "assignee"],
-  developmentContext: ["开发上下文", "development context"],
+  developmentContext: ["代码工作目录", "code working directory"],
   startDate: ["开始日期", "start date"],
   dueDate: ["截止日期", "due date"],
   recurrence: ["重复", "recurrence"],
@@ -262,12 +278,20 @@ const ACTIVITY_FIELD_LABELS: Record<string, readonly [string, string]> = {
   relation: ["关系", "relation"],
 };
 
-const RELATION_LABELS: Record<IssueRelationType, readonly [string, string]> = {
-  parent: ["父议题", "Parent issue"],
-  blocks: ["阻塞", "Blocks"],
-  blocked_by: ["阻塞于", "Blocked by"],
-  related: ["相关议题", "Related issue"],
-};
+function relationActivityPrefix(
+  type: IssueRelationType,
+  action: "add" | "remove",
+  text: (chinese: string, english: string) => string,
+): string {
+  if (action === "add") {
+    if (type === "blocked_by") return text("设为当前任务需要先完成：", "set as a task to complete first: ");
+    if (type === "blocks") return text("设为后续依赖任务：", "set as a downstream dependent task: ");
+    return text("添加了相关任务：", "added a related task: ");
+  }
+  if (type === "blocked_by") return text("取消了“需要先完成”关系：", "removed the complete-first relationship: ");
+  if (type === "blocks") return text("取消了“后续依赖任务”关系：", "removed the downstream dependency: ");
+  return text("移除了相关任务：", "removed a related task: ");
+}
 
 function activityValue(
   field: string,
@@ -324,8 +348,7 @@ function activityValue(
       externalKey?: string | null;
       title: string;
     };
-    const [chineseLabel, englishLabel] = RELATION_LABELS[relation.type];
-    return `${text(chineseLabel, englishLabel)} ${relation.externalKey ?? relation.identifier} · ${relation.title}`;
+    return `${relation.externalKey ?? relation.identifier} · ${relation.title}`;
   }
   if (Array.isArray(value)) return value.join(language === "zh" ? "、" : ", ");
   if (typeof value === "object") return JSON.stringify(value);
@@ -419,20 +442,24 @@ export function TaskDetail({
   onOpenLegacyLocalThread,
   onOpenInThread,
   onCopy,
+  onCopyIssueLink,
   openingThread,
   onError,
   paseoAssignment = null,
   paseoPresentation = null,
   onOpenPaseoAgent,
   paseoAssignee,
+  paseoExecutionConfig,
+  paseoProjectDefaults,
   paseoConfiguration,
-  paseoWorktree = false,
+  paseoWorktree,
 }: TaskDetailProps) {
   const { language, locale, text } = useTaskboardI18n();
   const [currentTask, setCurrentTask] = useState(task);
   const [worktreeDialogOpen, setWorktreeDialogOpen] = useState(false);
   const [title, setTitle] = useState(task.title);
   const [description, setDescription] = useState(task.description);
+  const mergedDescription = parseMergedTaskDescription(description);
   const [descriptionSegments, setDescriptionSegments] = useState<InlineMediaSegment[]>(
     () => createInlineMediaSegments(task.description, referenceTasks),
   );
@@ -1028,6 +1055,18 @@ export function TaskDetail({
     ? currentUser
     : currentTask.assignee;
   const paseoEmbedded = new URL(document.baseURI).searchParams.get("host") === "paseo";
+  const taskWorktreePath = currentTask.developmentContext?.type === "worktree"
+    ? currentTask.developmentContext.path
+    : null;
+  const effectivePaseoDirectory = paseoAssignment?.kind === "existing"
+    ? paseoAssignment.workspacePath
+    : taskWorktreePath
+      ?? (paseoAssignment?.kind === "planned"
+        ? paseoAssignment.workspacePath ?? paseoProjectDefaults?.workspacePath ?? null
+        : paseoProjectDefaults?.workspacePath ?? null);
+  const paseoDirectoryName = effectivePaseoDirectory
+    ? effectivePaseoDirectory.split(/[\\/]/).filter(Boolean).at(-1) ?? effectivePaseoDirectory
+    : paseoAssignment?.kind === "existing" ? paseoAssignment.workspaceName : null;
   const assigneeOptions = (paseoEmbedded ? [displayAssignee] : [displayAssignee, currentUser, CODEX_AGENT_ACTOR])
     .filter((actor, index, actors) => (
       actors.findIndex((candidate) => actorKey(candidate) === actorKey(actor)) === index
@@ -1170,10 +1209,11 @@ export function TaskDetail({
                 ) : (
                   <div
                     className={`issue-description-read${description ? "" : " empty"}`}
-                    role="button"
-                    tabIndex={0}
+                    role={mergedDescription ? undefined : "button"}
+                    tabIndex={mergedDescription ? -1 : 0}
                     aria-label={text("编辑议题描述", "Edit issue description")}
                     onClick={(event) => {
+                      if (event.target instanceof Element && event.target.closest(".merged-task-sources")) return;
                       if (event.target instanceof Element && event.target.closest("video")) return;
                       if (window.getSelection()?.isCollapsed === false) return;
                       descriptionCaretRef.current = null;
@@ -1210,6 +1250,7 @@ export function TaskDetail({
                       setEditingDescription(true);
                     }}
                     onKeyDown={(event) => {
+                      if (mergedDescription) return;
                       if (event.key === "Enter" || event.key === " ") {
                         event.preventDefault();
                         descriptionCaretRef.current = null;
@@ -1227,14 +1268,34 @@ export function TaskDetail({
                     }}
                   >
                     {description
-                      ? <DescriptionDocument
-                          value={description}
-                          referenceTasks={referenceTasks}
-                          onOpenTask={onOpenTask}
-                          attachments={attachments}
-                          enableImagePreview
-                          onOpenAttachment={handleAttachmentDownload}
-                        />
+                      ? mergedDescription
+                        ? <>
+                            {mergedDescription.summary && (
+                              <DescriptionDocument
+                                value={mergedDescription.summary}
+                                referenceTasks={referenceTasks}
+                                onOpenTask={onOpenTask}
+                                attachments={attachments}
+                                enableImagePreview
+                                onOpenAttachment={handleAttachmentDownload}
+                              />
+                            )}
+                            <MergedTaskSources
+                              presentation={mergedDescription}
+                              referenceTasks={referenceTasks}
+                              attachments={attachments}
+                              onOpenTask={onOpenTask}
+                              onOpenAttachment={handleAttachmentDownload}
+                            />
+                          </>
+                        : <DescriptionDocument
+                            value={description}
+                            referenceTasks={referenceTasks}
+                            onOpenTask={onOpenTask}
+                            attachments={attachments}
+                            enableImagePreview
+                            onOpenAttachment={handleAttachmentDownload}
+                          />
                       : text("添加描述…", "Add description…")}
                   </div>
                 )}
@@ -1341,9 +1402,9 @@ export function TaskDetail({
                           {change.field === "description" ? (
                             <>{text("更新了描述", "updated the description")}</>
                           ) : change.field === "relation" && change.before === null ? (
-                            <>{text("添加了 ", "added ")}<span className="activity-change-value">{afterValue}</span></>
+                            <>{relationActivityPrefix((change.after as { type: IssueRelationType }).type, "add", text)}<span className="activity-change-value">{afterValue}</span></>
                           ) : change.field === "relation" && change.after === null ? (
-                            <>{text("移除了 ", "removed ")}<span className="activity-change-value">{beforeValue}</span></>
+                            <>{relationActivityPrefix((change.before as { type: IssueRelationType }).type, "remove", text)}<span className="activity-change-value">{beforeValue}</span></>
                           ) : language === "zh" ? (
                             <>
                               将{fieldLabel}从
@@ -1697,12 +1758,9 @@ export function TaskDetail({
               <button
                 className="detail-copy-action"
                 type="button"
-                onClick={() => onCopy(
-                  buildIssueUrl(
-                    document.baseURI,
-                    currentTask.projectId,
-                    currentTask.identifier,
-                  ).href,
+                onClick={() => onCopyIssueLink(
+                  currentTask.projectId,
+                  currentTask.identifier,
                   text("议题链接已复制。", "Issue link copied."),
                 )}
               >
@@ -1773,7 +1831,7 @@ export function TaskDetail({
                 <div className="detail-property-trigger" title={paseoAssignment?.kind === "existing"
                   ? `${paseoAssignment.provider}${paseoAssignment.model ? `/${paseoAssignment.model}` : ""} · ${paseoAssignment.status}`
                   : paseoAssignment?.kind === "planned"
-                    ? `计划新建 · ${paseoAssignment.profile.name} · ${paseoAssignment.workspacePath}`
+                    ? `计划执行 · ${paseoAssignment.profile?.name ?? text("项目默认 Agent", "Project default Agent")} · ${paseoAssignment.workspacePath ?? text("项目默认目录", "Project default directory")}`
                     : undefined}
                 >
                   <ActorAvatar actor={displayAssignee} className="task-property-assignee-avatar" />
@@ -1803,6 +1861,41 @@ export function TaskDetail({
                 }}
               />}
             </div>
+            {paseoExecutionConfig && (
+              <div className="detail-property-row execution-config-property">
+                <span className="detail-property-label">{text("执行配置", "Execution")}</span>
+                <div className="detail-execution-config-copy">
+                  <button
+                    type="button"
+                    className="detail-execution-config-button"
+                    onClick={paseoExecutionConfig.onOpen}
+                  >
+                    <LinearIcon name="displayOptions" />
+                    <span>{paseoAssignment?.kind === "planned"
+                      ? text("编辑执行配置", "Edit execution configuration")
+                      : text("配置执行", "Configure execution")}</span>
+                  </button>
+                  <small>{paseoAssignment?.kind === "planned"
+                    ? paseoAssignment.profile
+                      ? text(
+                          `任务指定 Agent：${paseoAssignment.profile.name}`,
+                          `Task Agent: ${paseoAssignment.profile.name}`,
+                        )
+                      : paseoProjectDefaults?.profile
+                        ? text(
+                            `使用项目默认 Agent：${paseoProjectDefaults.profile.name}`,
+                            `Uses project default Agent: ${paseoProjectDefaults.profile.name}`,
+                          )
+                        : text("项目尚未配置默认 Agent", "The project has no default Agent")
+                    : paseoProjectDefaults?.profile
+                      ? text(
+                          `使用项目默认 Agent：${paseoProjectDefaults.profile.name}`,
+                          `Uses project default Agent: ${paseoProjectDefaults.profile.name}`,
+                        )
+                      : text("项目尚未配置默认 Agent", "The project has no default Agent")}</small>
+                </div>
+              </div>
+            )}
             {paseoConfiguration?.target && (
               <PaseoConfigurationFields
                 target={paseoConfiguration.target}
@@ -1835,59 +1928,156 @@ export function TaskDetail({
               />
             </div>
             <div className="detail-property-row development-property">
-              <span className="detail-property-label">{text("开发上下文", "Development context")}</span>
-              <TaskPropertyPicker
-                value={contextValue(currentTask.developmentContext)}
-                options={[
-                  {
-                    value: "",
-                    label: developmentScanLoading
-                      ? text("正在扫描 Git…", "Scanning Git…")
-                      : text("未绑定", "Not linked"),
-                    icon: <BranchIcon color="currentColor" size={14} />,
-                  },
-                  ...developmentOptions.map((context) => ({
-                    value: contextValue(context),
-                    label: contextLabel(context, text),
-                    icon: context.type === "branch"
-                      ? <BranchIcon color="currentColor" size={14} />
-                      : <LinearIcon name="folder" />,
-                  })),
-                  ...(paseoWorktree ? [{
-                    value: "__paseo-create-worktree__",
-                    label: text("创建 Worktree", "Create worktree"),
-                    icon: <NewConversationIcon color="currentColor" size={14} />,
-                    className: "development-context-create-option",
-                    onSelect: () => setWorktreeDialogOpen(true),
-                  }] : []),
-                ]}
-                open={propertyMenu === "development"}
-                disabled={developmentScanLoading || savingProperty === "developmentContext"}
-                className="detail-property-picker"
-                popoverClassName="development-context-popover"
-                triggerClassName="detail-property-trigger"
-                ariaLabel={text("开发上下文", "Development context")}
-                title={currentTask.developmentContext?.type === "worktree" ? currentTask.developmentContext.path : undefined}
-                onOpenChange={(open) => setPropertyMenu(open ? "development" : null)}
-                onChange={(value) => void saveTask({
-                  developmentContext: value ? JSON.parse(value) as DevelopmentContext : null,
-                }, "developmentContext")}
-              />
-              {paseoWorktree && (
+              <span className="detail-property-label">{text(
+                paseoWorktree ? "代码工作目录" : "开发上下文",
+                paseoWorktree ? "Code working directory" : "Development context",
+              )}</span>
+              {paseoWorktree ? (
+                <div className="detail-code-directory-wrap">
+                  <div className={`detail-code-directory${paseoAssignment?.kind === "existing" ? " is-agent-bound" : paseoAssignment?.kind === "planned" || taskWorktreePath ? " is-planned" : " is-unplanned"}`}>
+                    <div className="detail-code-directory-heading">
+                      <LinearIcon name="folder" />
+                      <span title={effectivePaseoDirectory ?? paseoDirectoryName ?? undefined}>
+                        {paseoDirectoryName ?? (paseoAssignment?.kind === "existing"
+                          ? text("暂时无法读取 Agent 目录", "Agent directory temporarily unavailable")
+                          : paseoAssignment?.kind === "planned"
+                            ? text("使用项目默认目录", "Use project default directory")
+                            : text("项目尚未配置默认目录", "The project has no default directory"))}
+                      </span>
+                      {(paseoAssignment?.kind === "existing"
+                        || paseoAssignment?.kind === "planned"
+                        || taskWorktreePath
+                        || paseoProjectDefaults?.workspacePath) && (
+                        <b>{paseoAssignment?.kind === "existing"
+                          ? text("跟随 Agent", "Follows Agent")
+                          : !taskWorktreePath && (
+                            paseoAssignment?.kind !== "planned" || !paseoAssignment.workspacePath
+                          )
+                            ? text("继承项目默认", "Inherits project default")
+                          : text("启动后使用", "Used after start")}</b>
+                      )}
+                    </div>
+                    {effectivePaseoDirectory && (
+                      <span className="detail-code-directory-path" title={effectivePaseoDirectory}>{effectivePaseoDirectory}</span>
+                    )}
+                    <small>{paseoAssignment?.kind === "existing"
+                      ? effectivePaseoDirectory
+                        ? text(
+                            "Agent 在这里修改代码，沿用当前会话的目录。",
+                            "The Agent changes code here and keeps using the current session directory.",
+                          )
+                        : paseoAssignment.workspaceName
+                          ? text(
+                              "暂时无法读取完整 Agent 目录；上方仅显示真实工作区名称。",
+                              "The full Agent directory is unavailable; only the real workspace name is shown above.",
+                            )
+                          : text(
+                              "当前会话暂未返回目录，无法确认实际代码位置。",
+                              "The current session has not returned a directory, so the actual code location cannot be confirmed.",
+                            )
+                      : taskWorktreePath
+                        ? text("任务已指定独立代码目录（Worktree）。", "The task uses an isolated code directory (worktree).")
+                        : paseoAssignment?.kind === "planned"
+                          ? paseoAssignment.workspacePath
+                            ? text("Agent 启动后会在这个目录处理任务。", "The Agent will work in this directory after it starts.")
+                            : text(
+                                "启动时读取项目当前默认目录；任务不会固化一份旧路径。",
+                                "The current project default directory is read at start; the task does not freeze an old path.",
+                              )
+                          : paseoProjectDefaults?.workspacePath
+                            ? text(
+                                "任务未保存目录覆盖，启动时使用项目当前默认目录。",
+                                "The task has no directory override and uses the current project default at start.",
+                              )
+                            : text(
+                                "项目尚未配置默认目录；可在项目设置中配置，或为任务单独选择。",
+                                "The project has no default directory; configure one in project settings or choose one for this task.",
+                              )}</small>
+                  </div>
+                  {currentTask.developmentContext?.type === "branch" && (
+                    <div className="detail-code-branch-note">
+                      <BranchIcon color="currentColor" size={13} />
+                      <span>{text(
+                        `分支记录：${currentTask.developmentContext.branch}（不会切换 Agent 目录）`,
+                        `Branch note: ${currentTask.developmentContext.branch} (does not switch the Agent directory)`,
+                      )}</span>
+                    </div>
+                  )}
+                  {paseoExecutionConfig && (
+                    <div className="detail-code-directory-actions">
+                      <button
+                        type="button"
+                        className="detail-code-directory-action"
+                        onClick={paseoExecutionConfig.onOpen}
+                      >
+                        <LinearIcon name="folder" />
+                        <span>{text("选择已有代码目录", "Choose existing code directory")}</span>
+                      </button>
+                      <button
+                        type="button"
+                        className="detail-code-directory-action"
+                        onClick={() => {
+                          paseoWorktree?.onRefresh();
+                          setWorktreeDialogOpen(true);
+                        }}
+                      >
+                        <NewConversationIcon color="currentColor" size={14} />
+                        <span>{text("新建独立代码目录（Worktree）", "Create isolated code directory (worktree)")}</span>
+                      </button>
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <TaskPropertyPicker
+                  value={contextValue(currentTask.developmentContext)}
+                  options={[
+                    {
+                      value: "",
+                      label: developmentScanLoading
+                        ? text("正在扫描 Git…", "Scanning Git…")
+                        : text("未绑定", "Not linked"),
+                      icon: <BranchIcon color="currentColor" size={14} />,
+                    },
+                    ...developmentOptions.map((context) => ({
+                      value: contextValue(context),
+                      label: contextLabel(context, text),
+                      icon: context.type === "branch"
+                        ? <BranchIcon color="currentColor" size={14} />
+                        : <LinearIcon name="folder" />,
+                    })),
+                  ]}
+                  open={propertyMenu === "development"}
+                  disabled={developmentScanLoading || savingProperty === "developmentContext"}
+                  className="detail-property-picker"
+                  popoverClassName="development-context-popover"
+                  triggerClassName="detail-property-trigger"
+                  ariaLabel={text("开发上下文", "Development context")}
+                  title={currentTask.developmentContext?.type === "worktree" ? currentTask.developmentContext.path : undefined}
+                  onOpenChange={(open) => setPropertyMenu(open ? "development" : null)}
+                  onChange={(value) => void saveTask({
+                    developmentContext: value ? JSON.parse(value) as DevelopmentContext : null,
+                  }, "developmentContext")}
+                />
+              )}
+              {paseoWorktree && paseoExecutionConfig && (
                 <PaseoWorktreeDialog
                   open={worktreeDialogOpen}
-                  workspacePath={developmentScan.workspacePath}
+                  workspaces={paseoWorktree.workspaces}
+                  initialWorkspacePath={taskWorktreePath
+                    ?? (paseoAssignment?.kind === "planned" ? paseoAssignment.workspacePath : null)}
                   taskId={currentTask.id}
                   onClose={() => setWorktreeDialogOpen(false)}
                   onCreated={async (result) => {
                     const saved = await saveTask({ developmentContext: result.context }, "developmentContext");
-                    if (!saved) throw new Error(text("Worktree 已创建，但任务未切换。请重试保存。", "The worktree was created, but the task was not switched. Try saving again."));
+                    if (!saved) throw new Error(text("独立代码目录已创建，但任务未切换。请重试保存。", "The isolated code directory was created, but the task was not switched. Try saving again."));
+                    await paseoWorktree.onCreated(result);
                   }}
                 />
               )}
             </div>
             <label
               className="detail-property-row detail-date-property-row"
+              title={text("用于计划安排，不会定时启动 Agent。", "Used for planning; it does not start an Agent on a schedule.")}
               onClick={(event) => openDatePicker("startDate", event)}
             >
               <span className="detail-property-icon" aria-hidden="true"><DueDateIcon color="currentColor" size={14} /></span>
@@ -1903,6 +2093,7 @@ export function TaskDetail({
             </label>
             <label
               className="detail-property-row detail-date-property-row"
+              title={text("用于标记计划截止时间，不会定时启动或停止 Agent。", "Marks the planned due date; it does not start or stop an Agent on a schedule.")}
               onClick={(event) => openDatePicker("dueDate", event)}
             >
               <span className="detail-property-icon" aria-hidden="true"><DueDateIcon color="currentColor" size={14} /></span>
@@ -1933,6 +2124,7 @@ export function TaskDetail({
                 className="detail-property-picker"
                 triggerClassName="detail-property-trigger"
                 ariaLabel={text("重复", "Recurrence")}
+                title={text("仅记录周期，尚不自动生成下一次任务。", "Records the cadence only; it does not create the next task automatically.")}
                 onOpenChange={(open) => setPropertyMenu(open ? "recurrence" : null)}
                 onChange={(value) => {
                   const unit = value as Recurrence["unit"] | "";
@@ -1952,6 +2144,7 @@ export function TaskDetail({
             <IssueRelationSidebar
               task={currentTask}
               tasks={tasks}
+              paseoMode={Boolean(paseoWorktree)}
               onOpenTask={onOpenTask}
               onAddRelation={(anchor, type, relatedTaskId) => applyRelationMutation(
                 () => onAddRelation(anchor, type, relatedTaskId),
