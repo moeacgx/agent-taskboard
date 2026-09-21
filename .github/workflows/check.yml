@@ -230,6 +230,8 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      - name: Prepare Paseo plugin dependencies and types
+        run: npm ci --ignore-scripts --prefix integrations/paseo && npm run typecheck --prefix integrations/paseo
       - run: npm run check
       - name: Record tested PR merge tree
         if: github.event_name == 'pull_request'
@@ -327,7 +329,7 @@ jobs:
           cache-bin: false
       - run: npm ci
       - name: Run the Windows Node.js test suite
-        run: npm test
+        run: npm ci --ignore-scripts --prefix integrations/paseo && npm test
       - name: Build the unsigned NSIS installer
         run: npm run app:build:windows
       - name: Preserve the unsigned NSIS installer

@@ -36,7 +36,7 @@ import {
   requestPaseoWorktree,
   type PaseoCreatedWorktree,
   type PaseoWorktreeScan,
-} from "./paseo-bridge";
+} from "./paseo-bridge.ts";
 
 const DEFAULT_USER_ACTOR: ActorIdentity = {
   type: "user",
