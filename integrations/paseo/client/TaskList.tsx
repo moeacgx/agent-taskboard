@@ -24,7 +24,7 @@ export type BoardTaskAction =
   | { kind: "delete" }
   | { kind: "move"; status: TaskStatus };
 
-type TaskView = "board" | "done" | "canceled" | "archived";
+type TaskView = "board" | "list" | "done" | "canceled" | "archived";
 
 export function TaskList(props: {
   theme: PluginTheme;
@@ -35,8 +35,9 @@ export function TaskList(props: {
   onBack: () => void;
   onSelectTask: (taskId: string) => void;
   onCreateTask: (status?: TaskStatus) => void;
+  embedded?: boolean;
 }) {
-  const { theme, layout, navigation, projectId, projectName, onBack, onSelectTask, onCreateTask } = props;
+  const { theme, layout, navigation, projectId, projectName, onBack, onSelectTask, onCreateTask, embedded = false } = props;
   const listTasks = useRpc(contracts.listTasks);
   const moveBoard = useRpc(contracts.moveTaskBoard);
   const retryDispatch = useRpc(contracts.retryTaskDispatch);
@@ -55,6 +56,7 @@ export function TaskList(props: {
   const [movingId, setMovingId] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [moreOpen, setMoreOpen] = useState(false);
 
   useEffect(() => {
     if (movingId || settingsOpen) return;
@@ -172,22 +174,37 @@ export function TaskList(props: {
 
   return (
     <View style={styles.screen} testID="paseo-taskboard">
-      <View style={styles.header}>
-        <Pressable accessibilityRole="button" accessibilityLabel="返回项目列表" testID="board-back" onPress={onBack}><Text style={styles.backText}>‹ 全部项目</Text></Pressable>
-        <View style={styles.headerRow}>
+      <View style={[styles.header, embedded ? { paddingTop: 8 } : null]}>
+        {!embedded && <Pressable accessibilityRole="button" accessibilityLabel="返回项目列表" testID="board-back" onPress={onBack}><Text style={styles.backText}>‹ 全部项目</Text></Pressable>}
+        {!embedded && <View style={styles.headerRow}>
           <View><Text style={styles.title}>{projectName}</Text><Text style={styles.subtitle}>拖动想法开始执行，完成后自动进入等你确认</Text></View>
+        </View>}
+        <View style={styles.headerRow}>
+          <Text style={styles.subtitle}>{view === "board" ? "议题看板" : view === "list" ? "任务列表" : view === "done" ? "已完成" : view === "canceled" ? "已取消" : "已归档"}</Text>
           <View style={styles.row}>
+            {embedded && view !== "board" && <Pressable accessibilityRole="button" testID="native-issues-back-board" style={styles.secondary} onPress={() => { setView("board"); setMoreOpen(false); }}><Text style={styles.secondaryText}>返回看板</Text></Pressable>}
+            {embedded && <Pressable accessibilityRole="button" testID="native-issues-more" style={styles.secondary} onPress={() => setMoreOpen((value) => !value)}><Text style={styles.secondaryText}>更多</Text></Pressable>}
             {projectId !== null && <Pressable accessibilityRole="button" accessibilityLabel="项目自动认领设置" testID="project-settings-toggle" style={styles.secondary} onPress={() => setSettingsOpen((value) => !value)}><Text style={styles.secondaryText}>自动认领</Text></Pressable>}
-            <Pressable accessibilityRole="button" accessibilityLabel="新建任务" testID="create-task" onPress={() => onCreateTask()} style={styles.button}><Text style={styles.buttonText}>+ 新建</Text></Pressable>
+            <Pressable accessibilityRole="button" accessibilityLabel="新建任务" testID="create-task" onPress={() => onCreateTask()} style={styles.button}><Text style={styles.buttonText}>新建</Text></Pressable>
           </View>
         </View>
-        <View style={styles.row}>
+        {!embedded && <View style={styles.row}>
           {(["board", "done", "canceled", "archived"] as TaskView[]).map((candidate) => (
             <Pressable key={candidate} accessibilityRole="button" accessibilityLabel={candidate === "board" ? "议题看板" : candidate === "done" ? "已完成任务" : candidate === "canceled" ? "已取消任务" : "归档任务"} testID={`task-view-${candidate}`} style={styles.chip(view === candidate)} onPress={() => setView(candidate)}>
               <Text style={styles.chipText(view === candidate)}>{candidate === "board" ? "议题看板" : candidate === "done" ? "已完成" : candidate === "canceled" ? "已取消" : "归档"}</Text>
             </Pressable>
           ))}
-        </View>
+        </View>}
+        {embedded && moreOpen && <View style={styles.settings} testID="native-issues-more-menu">
+          <Text style={styles.label}>其他视图</Text>
+          <View style={styles.row}>
+            {(["list", "done", "canceled", "archived"] as TaskView[]).map((candidate) => (
+              <Pressable key={candidate} accessibilityRole="button" testID={`task-view-${candidate}`} style={styles.chip(view === candidate)} onPress={() => { setView(candidate); setMoreOpen(false); }}>
+                <Text style={styles.chipText(view === candidate)}>{candidate === "list" ? "普通列表" : candidate === "done" ? "已完成" : candidate === "canceled" ? "已取消" : "已归档"}</Text>
+              </Pressable>
+            ))}
+          </View>
+        </View>}
       </View>
       {notice && <Text style={styles.error} accessibilityRole="alert" testID="board-notice">{notice}</Text>}
       {settingsOpen && projectId !== null && <ProjectAutomationSettingsPanel theme={theme} layout={layout} initialAutomation={automationQuery.data?.automation ?? null} projectId={projectId} saveAutomation={saveAutomation} onSaved={() => { automationQuery.refetch(); setNotice("自动认领设置已保存。 "); }} />}

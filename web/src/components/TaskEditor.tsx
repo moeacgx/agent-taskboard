@@ -724,7 +724,7 @@ export function TaskEditor({
                     if (id === paseoAssigneeId) return;
                     setPaseoAssigneeId(id);
                     setPaseoPlanTouched(true);
-                    setPaseoWorkspaceId("");
+                    // 保留用户已经手动选择的目录；项目默认目录只作为空选择的显示兜底。
                     setPaseoConfigurationSelection({});
                     setPaseoConfigurationReady(false);
                   }}

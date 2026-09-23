@@ -73,6 +73,18 @@ export const TaskSchema = z.object({
 });
 export type Task = z.infer<typeof TaskSchema>;
 
+export const AttachmentSchema = z.object({
+  id: z.string(),
+  taskId: z.string(),
+  commentId: z.string().nullable(),
+  kind: z.enum(["inline", "attachment"]),
+  filename: z.string(),
+  contentType: z.string(),
+  size: z.number(),
+  createdAt: z.string(),
+});
+export type Attachment = z.infer<typeof AttachmentSchema>;
+
 export const CommentSchema = z.object({
   id: z.string(),
   taskId: z.string(),
@@ -80,6 +92,7 @@ export const CommentSchema = z.object({
   authorType: z.string(),
   authorId: z.string(),
   authorName: z.string(),
+  attachments: z.array(AttachmentSchema).default([]),
   version: z.number(),
   createdAt: z.string(),
   updatedAt: z.string(),

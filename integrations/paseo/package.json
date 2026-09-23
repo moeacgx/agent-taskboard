@@ -1,6 +1,6 @@
 {
   "name": "dashi-taskboard-paseo-plugin",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "license": "Apache-2.0",
   "type": "module",
@@ -16,7 +16,7 @@
   ],
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "node --test --test-timeout=60000 test/dashi-api.test.ts test/board.test.ts test/dispatch.test.ts test/board-api.test.ts test/lifecycle.test.ts test/turn-ownership.test.ts test/plugin-update.test.ts",
+    "test": "node --test --test-timeout=60000 test/dashi-api.test.ts test/board.test.ts test/dispatch.test.ts test/board-api.test.ts test/lifecycle.test.ts test/turn-ownership.test.ts test/plugin-update.test.ts test/task-message-images.test.ts",
     "prepare:runtime": "node scripts/prepare-runtime.mjs",
     "build:original-srcdoc": "npx vite build --config ../../web/vite.paseo.config.ts && node ../../scripts/build-paseo-srcdoc.mjs"
   },

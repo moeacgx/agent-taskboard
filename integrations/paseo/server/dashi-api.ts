@@ -1,4 +1,4 @@
-import type { Comment, Project, Task, TaskPriority, TaskStatus } from "../shared/contracts";
+import type { Attachment, Comment, Project, Task, TaskPriority, TaskStatus } from "../shared/contracts";
 import { Buffer } from "node:buffer";
 
 /**
@@ -309,6 +309,44 @@ export function moveTask(
 
 export function listComments(baseUrl: string, taskId: string): Promise<{ comments: Comment[] }> {
   return request(baseUrl, "GET", `/api/tasks/${encodeURIComponent(taskId)}/comments`);
+}
+
+export function listTaskAttachments(baseUrl: string, taskId: string): Promise<{ attachments: Attachment[] }> {
+  return request(baseUrl, "GET", `/api/tasks/${encodeURIComponent(taskId)}/attachments`);
+}
+
+export async function getAttachmentContent(baseUrl: string, attachmentId: string): Promise<Buffer> {
+  try {
+    await ensureReady(baseUrl);
+  } catch (error) {
+    throw new DashiConnectionError(baseUrl, error);
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  try {
+    const response = await fetch(
+      `${baseUrl}/api/attachments/${encodeURIComponent(attachmentId)}/content`,
+      { signal: controller.signal },
+    );
+    if (!response.ok) {
+      const text = await response.text();
+      let payload: { error?: { code?: string; message?: string; details?: unknown } } | undefined;
+      try { payload = text ? JSON.parse(text) : undefined; } catch { payload = undefined; }
+      throw new DashiApiError(
+        response.status,
+        payload?.error?.code ?? "UNKNOWN_ERROR",
+        payload?.error?.message ?? `dashi-taskboard 请求失败（HTTP ${response.status}）`,
+        payload?.error?.details,
+      );
+    }
+    return Buffer.from(await response.arrayBuffer());
+  } catch (error) {
+    if (error instanceof DashiApiError) throw error;
+    throw new DashiConnectionError(baseUrl, error);
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 export function addComment(

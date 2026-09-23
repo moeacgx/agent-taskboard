@@ -781,16 +781,19 @@ export function DashboardView({
     );
   }, [isAllProjects, projectCreatedAt, tasks, todayValue]);
 
-  const runningTasks = useMemo(() => tasks.filter(
-    (task) => presentations[task.id]?.processing.running
+  const runningTasks = useMemo(() => activeTasks.filter(
+    (task) => !task.archivedAt && presentations[task.id]?.processing.running
       && !presentations[task.id]?.processing.awaitingPermission,
-  ), [presentations, tasks]);
+  ), [presentations, activeTasks]);
 
   const attentionItems = useMemo(() => activeTasks
     .filter((task) => (
-      presentations[task.id]?.processing.awaitingPermission
-      || task.status === "blocked"
-      || presentations[task.id]?.unread
+      !task.archivedAt && (
+        presentations[task.id]?.processing.awaitingPermission
+        || (!presentations[task.id]?.processing.running && (
+          task.status === "blocked" || presentations[task.id]?.unread
+        ))
+      )
     ))
     .sort((left, right) => {
       const leftAwaitingPermission = presentations[left.id]?.processing.awaitingPermission ? 1 : 0;

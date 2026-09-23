@@ -9,7 +9,7 @@ import * as contracts from "../shared/contracts.ts";
 import type { BindingsStore } from "./bindings.ts";
 import * as dashi from "./dashi-api.ts";
 import { performWriteback } from "./writeback.ts";
-import { assertAgentCanLeaveProcessing, buildTaskContinuationPrompt, buildTaskPrompt, canStartTaskDispatch, createTaskDispatchCoordinator, dispatchBoundTask, hasTaskDispatchConfiguration, recordDispatchFailure, type TaskDispatchCoordinator, type TaskMutationLock } from "./dispatch.ts";
+import { assertAgentCanLeaveProcessing, buildTaskContinuationMessage, buildTaskMessage, buildTaskPrompt, canStartTaskDispatch, createTaskDispatchCoordinator, dispatchBoundTask, hasTaskDispatchConfiguration, recordDispatchFailure, sendTaskMessage, type TaskDispatchCoordinator, type TaskMutationLock } from "./dispatch.ts";
 import type { SettingsStore } from "./settings.ts";
 import type { TaskPlansStore } from "./task-plans.ts";
 import type { PaseoAutomationRuntime } from "./automation.ts";
@@ -516,7 +516,9 @@ export function registerHandlers(
         return { task: current.task, dispatch: "skipped" as const, dispatchMessage: readiness.message };
       }
     }
-    const prompt = wantsStart ? await buildTaskPrompt(baseUrl, current.task) : undefined;
+    const message = wantsStart
+      ? await buildTaskMessage(baseUrl, current.task, { continuation: binding !== null })
+      : undefined;
     if (input.status === "todo" || input.status === "backlog" || input.status === "canceled") {
       await assertAgentCanLeaveProcessing(paseo, bindings, input.id);
     }
@@ -527,7 +529,7 @@ export function registerHandlers(
     })).task;
     if (!wantsStart) return { task: movedTask, dispatch: "none" as const, dispatchMessage: null };
 
-    const result = await dispatchCoordinator.run(input.id, () => dispatchBoundTask(paseo, bindings, movedTask, projectSettings, baseUrl, prompt));
+    const result = await dispatchCoordinator.run(input.id, () => dispatchBoundTask(paseo, bindings, movedTask, projectSettings, baseUrl, message));
     if (result.kind === "failed") movedTask = await recordDispatchFailure(baseUrl, movedTask, result.message ?? "未知错误");
     return { task: movedTask, dispatch: result.kind, dispatchMessage: result.message };
   }
@@ -886,11 +888,11 @@ export function registerHandlers(
     if (!readiness.ok) {
       return { task: current.task, dispatch: "skipped" as const, dispatchMessage: readiness.message };
     }
-    const prompt = await buildTaskPrompt(baseUrl, current.task);
+    const message = await buildTaskMessage(baseUrl, current.task, { continuation: binding !== null });
     const moved = current.task.status === "in_progress"
       ? current.task
       : (await dashi.moveTask(baseUrl, id, { version, status: "in_progress" })).task;
-    const result = await dispatchCoordinator.run(id, () => dispatchBoundTask(paseo, bindings, moved, projectSettings, baseUrl, prompt));
+    const result = await dispatchCoordinator.run(id, () => dispatchBoundTask(paseo, bindings, moved, projectSettings, baseUrl, message));
     const task = result.kind === "failed" ? await recordDispatchFailure(baseUrl, moved, result.message ?? "未知错误") : moved;
     return { task, dispatch: result.kind, dispatchMessage: result.message };
     });
@@ -913,9 +915,9 @@ export function registerHandlers(
     const binding = await bindings.get(taskId);
     if (!binding) throw new Error("任务尚未绑定 Paseo Agent。 ");
     let { task } = await dashi.getTask(baseUrl, taskId);
-    const prompt = message
-      ? await buildTaskContinuationPrompt(baseUrl, task, message)
-      : await buildTaskPrompt(baseUrl, task);
+    const taskMessage = message
+      ? await buildTaskContinuationMessage(baseUrl, task, message)
+      : await buildTaskMessage(baseUrl, task, { continuation: true });
     const readiness = await canStartTaskDispatch(paseo, bindings, taskId);
     if (!readiness.ok) throw new Error(readiness.message);
     if (task.status !== "in_progress") {
@@ -924,7 +926,7 @@ export function registerHandlers(
     const armed = await bindings.armDispatch(taskId, binding.agentId);
     if (!armed) throw new Error("无法记录本轮 Agent 派发资格。 ");
     try {
-      await paseo.agents.ref(binding.agentId).send(prompt);
+      await sendTaskMessage(paseo.agents.ref(binding.agentId), taskMessage);
       return { task, binding: armed };
     } catch (error) {
       await bindings.cancelDispatchArm(taskId, binding.agentId);

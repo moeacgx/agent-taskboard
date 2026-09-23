@@ -20,6 +20,7 @@ import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
 import { resolvePersistedAttachmentUrl } from "../api";
 import { useTaskboardI18n } from "../i18n";
+import { TaskboardImage } from "./TaskboardImage";
 
 interface MarkdownAstNode {
   type: string;
@@ -561,7 +562,7 @@ function MarkdownImage({ node, ...props }: ComponentPropsWithoutRef<"img"> & Ext
     ? markdown
     : undefined;
   return (
-    <img
+    <TaskboardImage
       {...props}
       className={[props.className, onImageClick ? "is-previewable" : ""].filter(Boolean).join(" ") || undefined}
       data-taskboard-inline-media-markdown={selfContainedMarkdown}

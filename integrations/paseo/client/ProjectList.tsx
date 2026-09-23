@@ -12,8 +12,9 @@ export function ProjectList(props: {
   theme: PluginTheme;
   layout: PluginLayout;
   onSelectProject: (projectId: string | null, projectName: string) => void;
+  onCancel?: () => void;
 }) {
-  const { theme, layout, onSelectProject } = props;
+  const { theme, layout, onSelectProject, onCancel } = props;
   const listProjects = useRpc(contracts.listProjects);
   const bridgeRequest = useRpc(contracts.bridgeRequest);
   const saveDefaults = useRpc(contracts.savePaseoProjectDefaults);
@@ -44,6 +45,7 @@ export function ProjectList(props: {
         paddingBottom: 12,
         gap: 4,
       },
+      headerRow: { flexDirection: "row" as const, alignItems: "center" as const, justifyContent: "space-between" as const, gap: 10 },
       title: { color: theme.colors.foreground, fontSize: layout.compact ? 20 : 24, fontWeight: "700" as const },
       subtitle: { color: theme.colors.foregroundMuted, fontSize: 13 },
       list: { paddingHorizontal: layout.compact ? 16 : 24, paddingBottom: 24, gap: 10 },
@@ -75,8 +77,11 @@ export function ProjectList(props: {
   return (
     <ScrollView style={styles.screen} contentContainerStyle={{ flexGrow: 1 }}>
       <View style={styles.header}>
-        <Text style={styles.title}>任务看板</Text>
-        <Text style={styles.subtitle}>选择项目查看任务，或直接查看全部任务</Text>
+        <View style={styles.headerRow}>
+          <Text style={styles.title}>{onCancel ? "选择项目" : "任务看板"}</Text>
+          {onCancel && <Pressable accessibilityRole="button" testID="native-project-switch-cancel" onPress={onCancel}><Text style={{ color: theme.colors.accent, fontSize: 13 }}>取消</Text></Pressable>}
+        </View>
+        <Text style={styles.subtitle}>选择项目后返回当前页面；也可以在这里管理项目</Text>
         <Pressable accessibilityRole="button" testID="create-project" style={styles.button} onPress={() => { setError(null); setCreating(true); setEditor({ id: `temp-${Date.now()}`, name: "", workspacePath: null, profile: null }); }}><Text style={styles.buttonText}>新建项目</Text></Pressable>
       </View>
 
@@ -96,7 +101,7 @@ export function ProjectList(props: {
           <View key={project.id} style={styles.card}>
             <Pressable accessibilityRole="button" onPress={() => onSelectProject(project.id, project.name)}>
               <Text style={styles.cardTitle}>{project.name}</Text>
-              <Text style={styles.cardMeta}>{project.issueCount} 个任务{project.workspacePath ? ` · ${project.workspacePath}` : ""}</Text>
+              <Text style={styles.cardMeta}>{project.issueCount} 个任务</Text>
             </Pressable>
             {project.source === "local" && <View style={styles.row}><Pressable accessibilityRole="button" testID={`project-settings-${project.id}`} style={styles.secondaryButton} onPress={() => void openProjectSettings(project)}><Text style={styles.secondaryButtonText}>项目设置</Text></Pressable>{project.id !== "local" && <Pressable accessibilityRole="button" testID={`project-delete-${project.id}`} style={styles.secondaryButton} onPress={() => Alert.alert("删除项目", `确认删除“${project.name}”？空项目才可删除。`, [{ text: "取消", style: "cancel" }, { text: "删除", style: "destructive", onPress: () => void handleDelete(project.id) }])}><Text style={[styles.secondaryButtonText, { color: theme.colors.statusDanger }]}>删除</Text></Pressable>}</View>}
           </View>

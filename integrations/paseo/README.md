@@ -49,7 +49,7 @@ Paseo 安装构建会自动执行 `scripts/prepare-installation.mjs`，将实际
 
 ## 使用正式版安装包
 
-1. 从 [GitHub Releases](https://github.com/moeacgx/agent-taskboard/releases/latest) 下载 `agent-taskboard-paseo-v0.2.0.zip` 和 `SHA256SUMS.txt`。
+1. 从 [GitHub Releases](https://github.com/moeacgx/agent-taskboard/releases/latest) 下载 `agent-taskboard-paseo-v0.3.0.zip` 和 `SHA256SUMS.txt`。
 2. 核对 ZIP 的 SHA-256 后，解压到长期保留的目录。包内已包含后台 runtime、自包含页面、依赖锁文件和安装准备脚本。
 3. 在解压后的插件目录运行：
 
@@ -107,7 +107,7 @@ paseo plugin reload dashi-taskboard
 检测和安装是分开的：插件不会自动下载或替换正在运行的代码，避免打断正在执行的任务。发版时：
 
 1. 更新 `integrations/paseo/package.json` 的 `version`，该值会作为当前安装版本写入插件。
-2. 在 GitHub 创建 Release（tag 如 `v0.2.0`），并填写更新说明。
+2. 在 GitHub 创建 Release（tag 如 `v0.3.0`），并填写更新说明。
 3. 用户在仪表盘看到提示后，按本页“安装插件”步骤拉取新版本并执行 `paseo plugin install ./integrations/paseo`，再用 `paseo plugin reload dashi-taskboard` 加载。
 
 ## 数据与配置
@@ -209,6 +209,12 @@ Provider/Model、Mode、Thinking 和工作区，但合并本身只保存 planned
 空项目文档会省略；项目文档或评论读取失败时，本轮不会在缺失公共规范的情况下继续执行。详情页首次启动发送完整
 任务提示；后续继续只加入最新项目背景和本次人工要求，不重复发送旧的完整提示。
 
+新会话只发送任务描述和最新人工要求中引用的图片；已有会话的自动继续只发送最新人工要求中引用的图片，详情页显式继续只发送本次 message 中引用的图片。
+
+同一附件在一轮中只发送一次；图片不存在或读取失败时，在移动任务、准备派发和发送之前报错。历史人工补充中的图片不会再次附发。会话展示将较早要求中的图片替换为历史图片说明，本轮图片可通过缩略图打开大图；已经发送给模型的历史图片不会撤回。未被上述正文引用的独立附件、项目说明中的图片尚不在发送范围内。
+
+桌面任务详情的评论输入框位于活动区顶部。历史记录按最新优先展示，初次显示 20 条，下滑或点击“加载更早记录”再显示下一批；切换任务后恢复首批，尚未展开的图片不会挂载加载。当前评论和活动的文字数据仍由原接口读取，分批展示不改变任务历史。
+
 项目文档增强只覆盖从 Taskboard 发起的派发。用户直接在 Paseo 原生会话中输入的消息不会被插件改写。插件也不会
 同步仓库中的 `README`、扫描附件、执行 OCR 或自动生成背景摘要。
 
@@ -269,7 +275,8 @@ npm test
 
 ## 已知边界
 
-- 手机原生界面支持项目创建、编辑、删除确认，项目默认 Agent、Thinking、Mode 和可选目录，任务执行配置、状态移动、自动认领开关与间隔，以及 Agent 权限等待提示和打开会话。
+- 当前源码的手机原生界面默认进入仪表盘，顶部切换项目，主导航提供仪表盘、议题和项目说明。仪表盘展示真实任务统计、完成度、需要关注和运行中的 Agent；项目说明支持显式编辑、保存与取消。
+- 手机原生界面支持项目创建、编辑、删除确认，项目默认 Agent、Thinking、Mode 和可选目录，任务执行配置、状态移动、自动认领开关与间隔，以及 Agent 权限等待提示和打开会话。列表及已完成、已取消、归档视图放在议题页“更多”。
 - 手机配置目录使用与桌面相同的完整 Project/Workspace 目录；任务未指定的执行配置按字段继承项目默认值。
 - 桌面 Web 使用自包含原版 DOM/CSS；手机使用 React Native。桌面的多选拖拽合并、仪表盘更新面板等不代表已在原生手机端提供。当前未完成 iOS/Android 真机验收。
 - 外部 Jira 账号配置与同步需要在目标环境单独验证。

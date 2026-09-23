@@ -427,7 +427,7 @@ test("保存计划不会被 Grok 慢 feature 读取阻塞；已知无效模型�
 test("提示词过滤 authorType=agent 的真实 Agent 评论，而不误过滤 Paseo 人工评论", async () => {
   const { humanComments } = await import("../server/dispatch.ts");
   const base = {
-    taskId: "task", version: 1, createdAt: "2026-09-16T00:00:00.000Z", updatedAt: "2026-09-16T00:00:00.000Z",
+    taskId: "task", attachments: [], version: 1, createdAt: "2026-09-16T00:00:00.000Z", updatedAt: "2026-09-16T00:00:00.000Z",
   };
   const comments: Comment[] = [
     { ...base, id: "human", body: "说你好", authorType: "user", authorId: "paseo-plugin", authorName: "Paseo" },

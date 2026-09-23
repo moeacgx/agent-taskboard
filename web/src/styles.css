@@ -3501,6 +3501,11 @@ kbd {
   position: relative;
 }
 
+.activity-load-older {
+  display: block;
+  margin: 12px auto;
+}
+
 .activity-entry::before {
   position: absolute;
   top: 0;
@@ -3937,7 +3942,7 @@ kbd {
 }
 
 .comment-composer {
-  margin: 18px 0 0;
+  margin: 0 0 18px;
   overflow: hidden;
   border: var(--border-hairline) solid var(--border);
   border-radius: 12px;

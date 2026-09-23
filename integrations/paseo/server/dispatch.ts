@@ -1,6 +1,6 @@
-import type { PaseoApi } from "@getpaseo/client";
+import type { PaseoAgentHandle, PaseoApi } from "@getpaseo/client";
 
-import type { Binding, Comment, ProjectAutomationSettings, Task, TaskExecutionPlan } from "../shared/contracts";
+import type { Attachment, Binding, Comment, ProjectAutomationSettings, Task, TaskExecutionPlan } from "../shared/contracts";
 import type { BindingsStore } from "./bindings";
 import * as dashi from "./dashi-api.ts";
 
@@ -11,6 +11,16 @@ export interface TaskDispatchResult {
 }
 
 export type TaskDispatchConfiguration = Pick<ProjectAutomationSettings, "workspacePath" | "profile">;
+
+export interface TaskMessage {
+  prompt: string;
+  images: Array<{ data: string; mimeType: string }>;
+}
+
+export interface TaskMessageBuildOptions {
+  /** 已有 Agent 会话只发送本轮最新人工要求，不重复任务正文和历史评论。 */
+  continuation?: boolean;
+}
 
 export function hasDispatchConfiguration(settings: TaskDispatchConfiguration | null): boolean {
   return Boolean(settings?.workspacePath && settings.profile?.provider);
@@ -70,11 +80,21 @@ export function humanComments(comments: Comment[]): Comment[] {
     .sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id));
 }
 
-export async function buildTaskPrompt(baseUrl: string, task: Task): Promise<string> {
-  const [{ comments }, { readme }] = await Promise.all([
-    dashi.listComments(baseUrl, task.id),
-    dashi.getProjectReadme(baseUrl, task.projectId),
-  ]);
+function latestHumanComment(comments: Comment[]): Comment | null {
+  return humanComments(comments).at(-1) ?? null;
+}
+
+const ATTACHMENT_REFERENCE = /(?<![A-Za-z0-9:/.])(?:(https?:\/\/[^\s)\]}>"']+?)\/)?\/?api\/attachments\/([A-Za-z0-9._~-]+)\/content(?=$|[\s)\]}>"'?#])/giu;
+const ATTACHMENT_MARKDOWN = /!\[[^\]]*\]\((?:(?:https?:\/\/[^\s)\]}>"']+?)\/)?\/?api\/attachments\/([A-Za-z0-9._~-]+)\/content(?:[?#][^)]*)?\)/giu;
+
+/** 历史评论仍保留语义，但不再把历史图片 URL 暴露给消息图片解析器。 */
+function historicalCommentBody(body: string): string {
+  return body
+    .replace(ATTACHMENT_MARKDOWN, (_match, id: string) => `[历史图片附件：${id}]`)
+    .replace(ATTACHMENT_REFERENCE, (_match, _origin: string | undefined, id: string) => `[历史图片附件：${id}]`);
+}
+
+function taskPrompt(task: Task, comments: Comment[], readme: dashi.ProjectReadme): string {
   const supplements = humanComments(comments);
   const latest = supplements.at(-1) ?? null;
   const history = latest ? supplements.slice(0, -1) : [];
@@ -94,7 +114,7 @@ export async function buildTaskPrompt(baseUrl: string, task: Task): Promise<stri
       ? `最新人工要求（本轮最高优先级）：\n${latest.body}`
       : "最新人工要求：\n（暂无人工补充，按任务原始描述执行）",
     ...(history.length > 0
-      ? ["", "较早人工补充（背景，按时间排序）：", ...history.map((comment) => `${comment.createdAt} · ${comment.authorName}\n${comment.body}`)]
+      ? ["", "较早人工补充（背景，按时间排序）：", ...history.map((comment) => `${comment.createdAt} · ${comment.authorName}\n${historicalCommentBody(comment.body)}`)]
       : []),
     "",
     "这是 Paseo 插件托管的任务。不要查找或调用 taskctl，不要读取或伪造 CODEX_THREAD_ID；任务状态与结果由平台生命周期自动写回。",
@@ -103,9 +123,81 @@ export async function buildTaskPrompt(baseUrl: string, task: Task): Promise<stri
   ].join("\n");
 }
 
+export function inlineAttachmentIds(baseUrl: string, texts: string[]): string[] {
+  const baseOrigin = new URL(baseUrl).origin;
+  const ids = new Set<string>();
+  for (const text of texts) {
+    for (const match of text.matchAll(ATTACHMENT_REFERENCE)) {
+      if (match[1]) {
+        const url = new URL(match[0]);
+        const localHost = url.hostname === "localhost" || url.hostname === "127.0.0.1" || url.hostname === "[::1]";
+        if (!localHost && url.origin !== baseOrigin) continue;
+      }
+      ids.add(match[2]);
+    }
+  }
+  return [...ids];
+}
+
+async function referencedImages(
+  baseUrl: string,
+  task: Task,
+  comments: Comment[],
+  sourceTexts: string[],
+): Promise<TaskMessage["images"]> {
+  const ids = inlineAttachmentIds(baseUrl, sourceTexts);
+  if (ids.length === 0) return [];
+
+  const { attachments: taskAttachments } = await dashi.listTaskAttachments(baseUrl, task.id);
+  const metadata = new Map<string, Attachment>();
+  for (const attachment of taskAttachments) metadata.set(attachment.id, attachment);
+  for (const comment of comments) {
+    for (const attachment of comment.attachments) metadata.set(attachment.id, attachment);
+  }
+
+  return Promise.all(ids.map(async (id) => {
+    const attachment = metadata.get(id);
+    if (!attachment) throw new Error(`任务引用的附件不存在或不属于当前任务：${id}`);
+    if (!attachment.contentType.startsWith("image/")) {
+      throw new Error(`任务引用的附件不是图片：${attachment.filename}（${attachment.contentType}）`);
+    }
+    const content = await dashi.getAttachmentContent(baseUrl, id);
+    return { data: content.toString("base64"), mimeType: attachment.contentType };
+  }));
+}
+
+export async function buildTaskPrompt(baseUrl: string, task: Task): Promise<string> {
+  const [{ comments }, { readme }] = await Promise.all([
+    dashi.listComments(baseUrl, task.id),
+    dashi.getProjectReadme(baseUrl, task.projectId),
+  ]);
+  return taskPrompt(task, comments, readme);
+}
+
+export async function buildTaskMessage(
+  baseUrl: string,
+  task: Task,
+  options: TaskMessageBuildOptions = {},
+): Promise<TaskMessage> {
+  const [{ comments }, { readme }] = await Promise.all([
+    dashi.listComments(baseUrl, task.id),
+    dashi.getProjectReadme(baseUrl, task.projectId),
+  ]);
+  const latest = latestHumanComment(comments);
+  const continuation = options.continuation === true;
+  const sourceTexts = continuation
+    ? (latest ? [latest.body] : [])
+    : [task.description, ...(latest ? [latest.body] : [])];
+  return {
+    prompt: continuation
+      ? taskContinuationPrompt(task, latest?.body ?? "（暂无新的人工要求；继续当前工作。）", readme)
+      : taskPrompt(task, comments, readme),
+    images: await referencedImages(baseUrl, task, comments, sourceTexts),
+  };
+}
+
 /** 已有会话只补入最新项目背景与本次人工要求，不重复发送整份任务历史。 */
-export async function buildTaskContinuationPrompt(baseUrl: string, task: Task, message: string): Promise<string> {
-  const { readme } = await dashi.getProjectReadme(baseUrl, task.projectId);
+function taskContinuationPrompt(task: Task, message: string, readme: dashi.ProjectReadme): string {
   const projectBackground = readme.content.trim();
   return [
     `继续处理 Dashi Taskboard 任务 ${task.identifier}：${task.title}`,
@@ -120,6 +212,30 @@ export async function buildTaskContinuationPrompt(baseUrl: string, task: Task, m
     "",
     "这是 Paseo 插件托管的任务。不要查找或调用 taskctl，不要读取或伪造 CODEX_THREAD_ID；任务状态与结果由平台生命周期自动写回。",
   ].join("\n");
+}
+
+export async function buildTaskContinuationPrompt(baseUrl: string, task: Task, message: string): Promise<string> {
+  const { readme } = await dashi.getProjectReadme(baseUrl, task.projectId);
+  return taskContinuationPrompt(task, message, readme);
+}
+
+export async function buildTaskContinuationMessage(baseUrl: string, task: Task, message: string): Promise<TaskMessage> {
+  const [{ comments }, { readme }] = await Promise.all([
+    dashi.listComments(baseUrl, task.id),
+    dashi.getProjectReadme(baseUrl, task.projectId),
+  ]);
+  return {
+    prompt: taskContinuationPrompt(task, message, readme),
+    images: await referencedImages(baseUrl, task, comments, [message]),
+  };
+}
+
+export async function sendTaskMessage(agent: PaseoAgentHandle, message: TaskMessage): Promise<void> {
+  if (message.images.length === 0) {
+    await agent.send(message.prompt);
+    return;
+  }
+  await agent.send(message.prompt, { images: message.images });
 }
 
 export async function recordDispatchFailure(baseUrl: string, task: Task, message: string): Promise<Task> {
@@ -186,7 +302,7 @@ export async function dispatchBoundTask(
   task: Task,
   settings: TaskDispatchConfiguration | TaskExecutionPlan | null,
   baseUrl: string,
-  preparedPrompt?: string,
+  preparedMessage?: TaskMessage,
 ): Promise<TaskDispatchResult> {
   const existing = await bindings.get(task.id);
   if (existing) {
@@ -200,11 +316,11 @@ export async function dispatchBoundTask(
       return { kind: "skipped", message: "该任务的 Agent 正在运行或等待权限，本次拖动不会重复派发。", agentId: existing.agentId };
     }
     try {
-      const prompt = preparedPrompt ?? await buildTaskPrompt(baseUrl, task);
+      const message = preparedMessage ?? await buildTaskMessage(baseUrl, task, { continuation: true });
       if (!await bindings.armDispatch(task.id, existing.agentId)) {
         return { kind: "skipped", message: "该任务已有待确认的 Agent 轮次，本次不会重复派发。", agentId: existing.agentId };
       }
-      await agent.send(prompt);
+      await sendTaskMessage(agent, message);
       return { kind: "continued", message: null, agentId: existing.agentId };
     } catch (error) {
       await bindings.cancelDispatchArm(task.id, existing.agentId);
@@ -229,7 +345,7 @@ export async function dispatchBoundTask(
   let createdAgentId: string | null = null;
   try {
     // 先读取人工评论；失败时不创建/绑定/发送 Agent，避免用旧描述静默执行。
-    const prompt = preparedPrompt ?? await buildTaskPrompt(baseUrl, task);
+    const message = preparedMessage ?? await buildTaskMessage(baseUrl, task);
     const workspace = await paseo.workspaces.open(workspacePath);
     const provider = profile.model
       ? `${profile.provider}/${profile.model}`
@@ -260,7 +376,7 @@ export async function dispatchBoundTask(
       await bindings.cancelDispatchArm(task.id, agent.id);
       return { kind: "failed", message: "无法为新 Agent 记录本轮派发资格。", agentId: agent.id };
     }
-    await agent.send(prompt);
+    await sendTaskMessage(agent, message);
     return { kind: "started", message: null, agentId: agent.id };
   } catch (error) {
     if (createdAgentId) await bindings.cancelDispatchArm(task.id, createdAgentId).catch(() => undefined);
