@@ -3,7 +3,7 @@ import type { PaseoApi } from "@getpaseo/client";
 import type { BindingsStore } from "./bindings.ts";
 import * as dashi from "./dashi-api.ts";
 import {
-  buildTaskPrompt,
+  buildTaskMessage,
   canStartTaskDispatch,
   dispatchBoundTask,
   hasTaskDispatchConfiguration,
@@ -109,7 +109,7 @@ export function createPaseoAutomationRuntime(
               lastError = `任务 ${task.identifier} 的 Agent 配置已变化，已跳过。`;
               return;
             }
-            const prompt = await buildTaskPrompt(baseUrl, task);
+            const message = await buildTaskMessage(baseUrl, task, { continuation: binding !== null });
 
             // 从移动开始视为一个领取事务。关闭会在项目锁后落盘，因此该事务完成；
             // 不再领取下一项，也不取消已经启动的 Agent。
@@ -118,7 +118,7 @@ export function createPaseoAutomationRuntime(
               status: "in_progress",
             })).task;
             claimed += 1;
-            const dispatch = await coordinator.run(task.id, () => dispatchBoundTask(api, bindings, moved, latestConfiguration, baseUrl, prompt));
+            const dispatch = await coordinator.run(task.id, () => dispatchBoundTask(api, bindings, moved, latestConfiguration, baseUrl, message));
             if (dispatch.kind === "failed") {
               lastError = dispatch.message ?? "自动认领失败";
               await recordDispatchFailure(baseUrl, moved, lastError);

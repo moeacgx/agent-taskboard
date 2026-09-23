@@ -472,6 +472,7 @@ export function TaskDetail({
   const [attachmentsError, setAttachmentsError] = useState<TaskDetailError | null>(null);
   const [comments, setComments] = useState<Comment[]>([]);
   const [taskActivities, setTaskActivities] = useState<TaskChangeActivity[]>([]);
+  const [activityWindow, setActivityWindow] = useState({ taskId: task.id, count: 20 });
   const [commentsLoading, setCommentsLoading] = useState(true);
   const [commentsError, setCommentsError] = useState<TaskDetailError | null>(null);
   const [commentSegments, setCommentSegments] = useState<InlineMediaSegment[]>(
@@ -500,6 +501,8 @@ export function TaskDetail({
   const attachmentInputRef = useRef<HTMLInputElement>(null);
   const descriptionAttachmentPickerOpenRef = useRef(false);
   const commentAttachmentInputRef = useRef<HTMLInputElement>(null);
+  const detailScrollRef = useRef<HTMLDivElement>(null);
+  const activityLoadMoreRef = useRef<HTMLButtonElement>(null);
   const editCommentAttachmentInputRef = useRef<HTMLInputElement>(null);
   const pendingCommentRef = useRef<{
     comment: Comment;
@@ -517,6 +520,7 @@ export function TaskDetail({
   useEffect(() => {
     const taskChanged = currentTask.id !== task.id;
     setCurrentTask(task);
+    if (taskChanged) setActivityWindow({ taskId: task.id, count: 20 });
     if (document.activeElement !== titleRef.current) setTitle(task.title);
     if (taskChanged || !editingDescription) {
       setDescription(task.description);
@@ -1086,15 +1090,36 @@ export function TaskDetail({
       comment,
     })),
   ].sort((left, right) => (
-    left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id)
+    right.createdAt.localeCompare(left.createdAt) || right.id.localeCompare(left.id)
   ));
+  const activityWindowCount = activityWindow.taskId === task.id ? activityWindow.count : 20;
+  const visibleActivityTimeline = activityTimeline.slice(0, activityWindowCount);
+  const hasEarlierActivity = visibleActivityTimeline.length < activityTimeline.length;
+
+  const loadEarlierActivity = useCallback(() => {
+    setActivityWindow((current) => ({
+      taskId: task.id,
+      count: (current.taskId === task.id ? current.count : 20) + 20,
+    }));
+  }, [task.id]);
+
+  useEffect(() => {
+    const target = activityLoadMoreRef.current;
+    const root = detailScrollRef.current;
+    if (!target || !root || !hasEarlierActivity || typeof IntersectionObserver === "undefined") return;
+    const observer = new IntersectionObserver((entries) => {
+      if (entries.some((entry) => entry.isIntersecting)) loadEarlierActivity();
+    }, { root, rootMargin: "0px 0px 240px 0px" });
+    observer.observe(target);
+    return () => observer.disconnect();
+  }, [commentsLoading, hasEarlierActivity, loadEarlierActivity, visibleActivityTimeline.length]);
 
   return (
     <section
       className="issue-detail"
       aria-label={text(`${displayIdentifier} 议题详情`, `${displayIdentifier} issue details`)}
     >
-      <div className="issue-detail-scroll">
+      <div className="issue-detail-scroll" ref={detailScrollRef}>
         <div className="issue-detail-layout">
           <div className="issue-detail-main">
             <article className="issue-editor" aria-label={text("议题内容", "Issue content")}>
@@ -1341,29 +1366,98 @@ export function TaskDetail({
                 <span>{activityTimeline.length}</span>
               </header>
 
-              <div className="activity-stream">
-                <div className={`activity-entry activity-created is-${currentTask.creatorType}`}>
-                  <span className="activity-rail-icon activity-creator-icon" aria-hidden="true">
-                    <ActorAvatar
-                      className="comment-avatar"
-                      actor={{
-                        type: currentTask.creatorType,
-                        id: currentTask.creatorId,
-                        name: currentTask.creatorName,
-                        avatarUrl: currentTask.creatorAvatarUrl,
+              {commentsError && (
+                <div className="comments-error" role="alert">
+                  {typeof commentsError === "string"
+                    ? commentsError
+                    : text(commentsError[0], commentsError[1])}
+                </div>
+              )}
+
+              <form className="comment-composer" onSubmit={(event) => { event.preventDefault(); void submitComment(); }}>
+                <div className="composer-author">
+                  <ActorAvatar
+                    className="comment-avatar"
+                    actor={currentUser}
+                  />
+                  <strong>{currentUser.name}</strong>
+                </div>
+                <InlineMediaComposer
+                  ref={composerRef}
+                  className="comment-inline-media"
+                  disabled={submitting}
+                  segments={commentSegments}
+                  mentionTasks={tasks}
+                  referenceTasks={referenceTasks}
+                  completionContext={{
+                    projectId: currentTask.projectId,
+                    surface: "comment",
+                  }}
+                  placeholder={text("留下评论…", "Leave a comment…")}
+                  ariaLabel={text("留下评论", "Leave a comment")}
+                  allowAttachments
+                  onChange={setCommentSegments}
+                  onError={setCommentsError}
+                  onKeyDown={handleSubmitShortcut}
+                />
+                <footer className="composer-footer">
+                  <div className="composer-footer-leading">
+                    <button
+                      className="comment-attach-button"
+                      type="button"
+                      disabled={submitting}
+                      aria-label={text("添加评论附件", "Add comment attachments")}
+                      title={text("添加附件", "Add attachments")}
+                      onClick={() => commentAttachmentInputRef.current?.click()}
+                    >
+                      <AttachmentIcon color="currentColor" />
+                    </button>
+                    <input
+                      ref={commentAttachmentInputRef}
+                      type="file"
+                      multiple
+                      hidden
+                      onChange={(event) => {
+                        if (event.currentTarget.files) {
+                          composerRef.current?.addFiles(event.currentTarget.files);
+                        }
+                        event.currentTarget.value = "";
                       }}
                     />
-                  </span>
-                  <p>
-                    <strong>{currentTask.creatorName}</strong>
-                    {text(" 创建了此议题", " created this issue")}
-                    <time title={exactTime(currentTask.createdAt, locale)}>{relativeTime(currentTask.createdAt, locale)}</time>
-                  </p>
-                </div>
+                  </div>
+                  <div>
+                    <div className="comment-status-action">
+                      <span>{text("改变状态为-等待认领", "Change status to Todo")}</span>
+                      <button
+                        type="button"
+                        className={`board-setting-switch${changeStatusToTodo ? " is-on" : ""}`}
+                        role="switch"
+                        aria-checked={changeStatusToTodo}
+                        disabled={submitting}
+                        onClick={() => setChangeStatusToTodo((current) => !current)}
+                      >
+                        <span aria-hidden="true" />
+                      </button>
+                    </div>
+                    <button
+                      className="button primary"
+                      type="submit"
+                      disabled={(
+                        !draft.trim()
+                        && commentInlineImages.length === 0
+                        && commentInlineFiles.length === 0
+                      ) || submitting}
+                    >
+                      {submitting ? text("发布中…", "Posting…") : text("评论", "Comment")}
+                    </button>
+                  </div>
+                </footer>
+              </form>
 
+              <div className="activity-stream">
                 {commentsLoading ? (
                   <div className="comments-loading" aria-label={text("正在加载活动", "Loading activity")} aria-busy="true"><i /><i /></div>
-                ) : activityTimeline.map((item) => {
+                ) : visibleActivityTimeline.map((item) => {
                   if (item.kind === "change") {
                     const { activity, change } = item;
                     const fieldLabels = ACTIVITY_FIELD_LABELS[change.field];
@@ -1605,95 +1699,40 @@ export function TaskDetail({
                   </article>
                   );
                 })}
+
+                {hasEarlierActivity && (
+                  <button
+                    ref={activityLoadMoreRef}
+                    className="activity-load-older button secondary"
+                    type="button"
+                    onClick={loadEarlierActivity}
+                  >
+                    {text("加载更早记录", "Load earlier activity")}
+                  </button>
+                )}
+
+                {!commentsLoading && !hasEarlierActivity && (
+                  <div className={`activity-entry activity-created is-${currentTask.creatorType}`}>
+                    <span className="activity-rail-icon activity-creator-icon" aria-hidden="true">
+                      <ActorAvatar
+                        className="comment-avatar"
+                        actor={{
+                          type: currentTask.creatorType,
+                          id: currentTask.creatorId,
+                          name: currentTask.creatorName,
+                          avatarUrl: currentTask.creatorAvatarUrl,
+                        }}
+                      />
+                    </span>
+                    <p>
+                      <strong>{currentTask.creatorName}</strong>
+                      {text(" 创建了此议题", " created this issue")}
+                      <time title={exactTime(currentTask.createdAt, locale)}>{relativeTime(currentTask.createdAt, locale)}</time>
+                    </p>
+                  </div>
+                )}
               </div>
 
-              {commentsError && (
-                <div className="comments-error" role="alert">
-                  {typeof commentsError === "string"
-                    ? commentsError
-                    : text(commentsError[0], commentsError[1])}
-                </div>
-              )}
-
-              <form className="comment-composer" onSubmit={(event) => { event.preventDefault(); void submitComment(); }}>
-                <div className="composer-author">
-                  <ActorAvatar
-                    className="comment-avatar"
-                    actor={currentUser}
-                  />
-                  <strong>{currentUser.name}</strong>
-                </div>
-                <InlineMediaComposer
-                  ref={composerRef}
-                  className="comment-inline-media"
-                  disabled={submitting}
-                  segments={commentSegments}
-                  mentionTasks={tasks}
-                  referenceTasks={referenceTasks}
-                  completionContext={{
-                    projectId: currentTask.projectId,
-                    surface: "comment",
-                  }}
-                  placeholder={text("留下评论…", "Leave a comment…")}
-                  ariaLabel={text("留下评论", "Leave a comment")}
-                  allowAttachments
-                  onChange={setCommentSegments}
-                  onError={setCommentsError}
-                  onKeyDown={handleSubmitShortcut}
-                />
-                <footer className="composer-footer">
-                  <div className="composer-footer-leading">
-                    <button
-                      className="comment-attach-button"
-                      type="button"
-                      disabled={submitting}
-                      aria-label={text("添加评论附件", "Add comment attachments")}
-                      title={text("添加附件", "Add attachments")}
-                      onClick={() => commentAttachmentInputRef.current?.click()}
-                    >
-                      <AttachmentIcon color="currentColor" />
-                    </button>
-                    <input
-                      ref={commentAttachmentInputRef}
-                      type="file"
-                      multiple
-                      hidden
-                      onChange={(event) => {
-                        if (event.currentTarget.files) {
-                          composerRef.current?.addFiles(event.currentTarget.files);
-                        }
-                        event.currentTarget.value = "";
-                      }}
-                    />
-                  </div>
-                  <div>
-                    <div className="comment-status-action">
-                      <span>{text("改变状态为-等待认领", "Change status to Todo")}</span>
-                      <button
-                        type="button"
-                        className={`board-setting-switch${changeStatusToTodo ? " is-on" : ""}`}
-                        role="switch"
-                        aria-checked={changeStatusToTodo}
-                        disabled={submitting}
-                        onClick={() => setChangeStatusToTodo((current) => !current)}
-                      >
-                        <span aria-hidden="true" />
-                      </button>
-                    </div>
-                    <button
-                      className="button primary"
-                      type="submit"
-                      disabled={(
-                        !draft.trim()
-                        && commentInlineImages.length === 0
-                        && commentInlineFiles.length === 0
-                      ) || submitting}
-                    >
-                      {submitting ? text("发布中…", "Posting…") : text("评论", "Comment")}
-                    </button>
-                  </div>
-                </footer>
-              </form>
             </section>
           </div>
 

@@ -26,6 +26,7 @@ import { RelationIcon } from "./SemanticIcons";
 import { LabelPicker } from "./LabelPicker";
 import { TaskPropertyPicker } from "./TaskPropertyPicker";
 import { TaskConversationMenu } from "./TaskConversationMenu";
+import { TaskboardImage } from "./TaskboardImage";
 import completeIcon from "../assets/figma-taskboard/card-complete.svg";
 import processingAnimation from "../assets/figma-taskboard/loading-16.svg";
 import { parseMergedTaskDescription, taskCardDescription } from "../mergeTaskPresentation";
@@ -157,7 +158,7 @@ function TaskCardMedia({ src }: { src: string }) {
       className={`task-card-media${clamped ? " is-clamped" : ""}`}
       style={presentation ? { width: presentation.width } : undefined}
     >
-      <img
+      <TaskboardImage
         src={src}
         alt=""
         loading="lazy"

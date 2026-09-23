@@ -72,6 +72,7 @@ import { useTaskboardI18n } from "../i18n";
 import { STATUS_DETAILS } from "./BoardColumn";
 import { LinearIcon } from "./LinearIcon";
 import { MermaidDiagram } from "./MarkdownDocument";
+import { TaskboardImage } from "./TaskboardImage";
 import {
   ConversationIcon,
   ProjectIcon,
@@ -192,7 +193,11 @@ function PersistedImageBlock({
       contentEditable={false}
       data-inline-media-segment={segment.id}
     >
-      <img src={resolvePersistedAttachmentUrl(segment.url)} alt={segment.alt} draggable={false} />
+      <TaskboardImage
+        src={resolvePersistedAttachmentUrl(segment.url)}
+        alt={segment.alt}
+        draggable={false}
+      />
       <button
         type="button"
         disabled={disabled}
