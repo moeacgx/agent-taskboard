@@ -3,7 +3,7 @@ import path from "node:path";
 import os from "node:os";
 import { createRequire } from "node:module";
 import { afterEach, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { cleanup, configure, fireEvent, render, waitFor } from "@testing-library/react";
 import { createBindingsStore } from "../integrations/paseo/server/bindings.ts";
 import { createSettingsStore } from "../integrations/paseo/server/settings.ts";
 import { createTaskPlansStore } from "../integrations/paseo/server/task-plans.ts";
@@ -17,6 +17,9 @@ import { taskboardStorage } from "../web/src/storage";
 
 // 服务端按 Node 原生文件路径载入，避免 jsdom 转换 import.meta.url。
 const { createTaskboardServer } = createRequire(path.join(process.cwd(), "package.json"))("./server/app.mjs");
+
+// 真实 HTTP、SQLite 和派发回写在 CI 上可能超过默认的一秒 UI 等待。
+configure({ asyncUtilTimeout: 10000 });
 
 // 仅替换编辑器 UI，保留真实 TaskDetail 提交、图片转换、HTTP、数据库及派发处理器。
 vi.mock("../web/src/components/InlineMediaComposer", async () => {

@@ -1,11 +1,14 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { createRequire } from "node:module";
 import { cleanup, render, waitFor } from "@testing-library/react";
 import { expect, it, vi } from "vitest";
-import { TaskboardDatabase } from "../server/database.mjs";
 import { TaskCard } from "../web/src/components/TaskCard";
 import { TaskboardLanguageProvider } from "../web/src/i18n";
+
+// 数据库按 Node 原生路径载入，避免 Vite 打包 node:sqlite。
+const { TaskboardDatabase } = createRequire(path.join(process.cwd(), "package.json"))("./server/database.mjs");
 
 it("临时数据库的最新评论贯通 Paseo 卡片默认预览", async () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "taskboard-latest-card-preview-"));
