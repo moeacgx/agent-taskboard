@@ -12,8 +12,8 @@ Paseo 支持任务与真实 Agent 绑定、提供方和模型选择、Thinking /
 
 ## 在 Paseo 中安装和使用
 
-**正式版：[v0.3.0 下载与更新说明](https://github.com/moeacgx/agent-taskboard/releases/tag/v0.3.0)。**
-下载 `agent-taskboard-paseo-v0.3.0.zip`，解压到稳定目录后，在解压目录运行
+**正式版：[v0.3.1 下载与更新说明](https://github.com/moeacgx/agent-taskboard/releases/tag/v0.3.1)。**
+下载 `agent-taskboard-paseo-v0.3.1.zip`，解压到稳定目录后，在解压目录运行
 `paseo plugin install .`。安装会自动准备依赖及后台服务；无需克隆完整仓库。
 升级现有安装时保留原数据目录，详见[插件安装说明](integrations/paseo/README.md#使用正式版安装包)。
 

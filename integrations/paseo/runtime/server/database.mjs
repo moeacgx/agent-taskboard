@@ -1715,12 +1715,16 @@ export class TaskboardDatabase {
     const commentsByTask = this.#commentsForTaskActivity(rows.map((row) => row.id));
     const activitiesByTask = this.#activitiesForTasks(rows.map((row) => row.id));
     const previewImagesByTask = this.#taskPreviewImages(rows.map((row) => row.id));
-    return rows.map((row) => attachTaskActivity(
-      this.#taskWithRelations(row, relationsByTask.get(row.id)),
-      commentsByTask.get(row.id) ?? [],
-      activitiesByTask.get(row.id) ?? [],
-      previewImagesByTask.get(row.id) ?? null,
-    ));
+    const latestCommentsByTask = this.#latestCommentsForTasks(rows.map((row) => row.id));
+    return rows.map((row) => ({
+      ...attachTaskActivity(
+        this.#taskWithRelations(row, relationsByTask.get(row.id)),
+        commentsByTask.get(row.id) ?? [],
+        activitiesByTask.get(row.id) ?? [],
+        previewImagesByTask.get(row.id) ?? null,
+      ),
+      latestComment: latestCommentsByTask.get(row.id) ?? null,
+    }));
   }
 
   getTaskSource(id) {
@@ -1737,7 +1741,10 @@ export class TaskboardDatabase {
     const comments = this.#commentsForTaskActivity([task.id]).get(task.id) ?? [];
     const activities = this.#activitiesForTasks([task.id]).get(task.id) ?? [];
     const previewImage = this.#taskPreviewImages([task.id]).get(task.id) ?? null;
-    return attachTaskActivity(task, comments, activities, previewImage);
+    return {
+      ...attachTaskActivity(task, comments, activities, previewImage),
+      latestComment: this.#latestCommentsForTasks([task.id]).get(task.id) ?? null,
+    };
   }
 
   getTaskTree(id, direction, depth) {
@@ -2782,6 +2789,36 @@ export class TaskboardDatabase {
       for (const row of rows) commentsByTask.get(row.task_id)?.push(row);
     }
     return commentsByTask;
+  }
+
+  #latestCommentsForTasks(taskIds) {
+    const latestCommentsByTask = new Map();
+    for (let offset = 0; offset < taskIds.length; offset += 400) {
+      const chunk = taskIds.slice(offset, offset + 400);
+      const placeholders = chunk.map(() => "?").join(", ");
+      // 通过已有索引只取最新评论，避免把全部历史正文载入任务列表。
+      const rows = this.database.prepare(`
+        SELECT comments.task_id, comments.body,
+          (
+            SELECT id FROM attachments
+            WHERE comment_id = comments.id AND content_type LIKE 'image/%'
+            ORDER BY created_at, id
+            LIMIT 1
+          ) AS image_id
+        FROM tasks
+        JOIN comments ON comments.id = (
+          SELECT id FROM comments
+          WHERE task_id = tasks.id
+          ORDER BY created_at DESC, id DESC
+          LIMIT 1
+        )
+        WHERE tasks.id IN (${placeholders})
+      `).all(...chunk);
+      for (const row of rows) {
+        latestCommentsByTask.set(row.task_id, { body: row.body, imageId: row.image_id });
+      }
+    }
+    return latestCommentsByTask;
   }
 
   #activitiesForTasks(taskIds) {
