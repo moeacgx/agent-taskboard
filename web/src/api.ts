@@ -669,6 +669,20 @@ export async function moveTask(
   return data.task;
 }
 
+export interface PaseoCommentDispatchResult {
+  task: Task;
+  dispatch: "started" | "continued" | "skipped" | "needs_configuration" | "failed" | "none";
+  dispatchMessage: string | null;
+}
+
+/** 评论快捷操作需要派发结果；普通任务移动仍只返回 task。 */
+export function continuePaseoTaskAfterComment(task: Task): Promise<PaseoCommentDispatchResult> {
+  return request<PaseoCommentDispatchResult>(`/api/tasks/${encodeURIComponent(task.id)}/move`, {
+    method: "POST",
+    body: JSON.stringify({ version: task.version, status: "in_progress" }),
+  });
+}
+
 export async function archiveTask(task: Task, threadId?: string): Promise<Task> {
   const data = await request<{ task: Task }>(
     `/api/tasks/${encodeURIComponent(task.id)}/archive`,

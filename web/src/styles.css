@@ -4007,6 +4007,18 @@ kbd {
   min-width: 0;
 }
 
+.comment-continue-notice {
+  margin: 0;
+  padding: 8px 16px;
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+
+.comment-continue-actions {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
 .comment-status-action {
   display: flex;
   align-items: center;

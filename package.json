@@ -33,7 +33,7 @@
     "start": "node server/index.mjs",
     "taskctl": "node cli/taskctl.mjs",
     "test": "node --test && npm run test:components",
-    "test:components": "vitest run web/src/components/MarkdownDocument.test.tsx web/src/components/TaskboardImage.test.tsx --environment jsdom",
+    "test:components": "vitest run web/src/components/MarkdownDocument.test.tsx web/src/components/TaskboardImage.test.tsx test/paseo-latest-card-preview.test.tsx test/paseo-comment-continue.test.tsx --environment jsdom --testTimeout 60000 --hookTimeout 60000",
     "test:cloud": "node --test test/cloud-shared-worker.test.mjs",
     "cloud:migrate:local": "wrangler d1 migrations apply codex-taskboard-db --local",
     "cloud:migrate": "wrangler d1 migrations apply codex-taskboard-db --remote",

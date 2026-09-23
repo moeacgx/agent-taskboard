@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import remarkGfm from "remark-gfm";
 import remarkParse from "remark-parse";
 import { unified } from "unified";
-import { resolvePersistedAttachmentUrl } from "../api";
+import { attachmentContentUrl, resolvePersistedAttachmentUrl } from "../api";
 import {
   TASK_PRIORITIES,
   type ActorIdentity,
@@ -114,8 +114,8 @@ function elapsedTime(startedAt: string | null, now: number) {
   return `${hours}h${minutes % 60 ? `${minutes % 60}m` : ""}`;
 }
 
-function firstTaskImage(task: Task) {
-  const markdownImage = task.description.match(
+function firstTaskImage(value: string) {
+  const markdownImage = value.match(
     /!\[[^\]]*\]\((?:<([^>]+)>|([^\s)]+))(?:\s+["'][^)]*["'])?\)/,
   );
   const source = markdownImage?.[1]
@@ -480,14 +480,22 @@ export function TaskCard({
   const showsConversation = supportsConversation && presentation.conversations.length > 0;
   const showsInlineParticipants = variant === "main"
     && task.participants.length > 0;
-  const image = showCover ? firstTaskImage(task) : null;
+  const latestComment = paseoEmbedded ? task.latestComment : null;
+  const previewText = latestComment ? latestComment.body : task.description;
+  const image = showCover
+    ? firstTaskImage(previewText) ?? (latestComment?.imageId
+      ? resolvePersistedAttachmentUrl(attachmentContentUrl({ id: latestComment.imageId }))
+      : null)
+    : null;
   const mergedPresentation = useMemo(
     () => parseMergedTaskDescription(task.description),
     [task.description],
   );
   const body = useMemo(
-    () => showBody ? taskBodyText(taskCardDescription(task.description)) : "",
-    [showBody, task.description],
+    () => latestComment
+      ? taskBodyText(latestComment.body)
+      : showBody ? taskBodyText(taskCardDescription(task.description)) : "",
+    [latestComment, showBody, task.description],
   );
   const hasProperties = task.priority !== "none" || task.labels.length > 0 || task.dueDate;
   const showsProperties = Boolean(projectName)
@@ -615,7 +623,7 @@ export function TaskCard({
 
       <h3 id={`task-${task.id}-title`}>{task.title}</h3>
 
-      {body && <p className="task-card-description">{body}</p>}
+      {body && <p className="task-card-description">{latestComment && text("最新回复：", "Latest reply: ")}{body}</p>}
 
       {mergedPresentation && (
         <span className="task-card-merge-summary">

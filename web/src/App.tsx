@@ -21,6 +21,7 @@ import {
   createProject as createProjectRequest,
   createTask as createTaskRequest,
   configureJiraConnection,
+  continuePaseoTaskAfterComment,
   deleteArchivedTask as deleteArchivedTaskRequest,
   deleteProjectLabel as deleteProjectLabelRequest,
   deleteProject as deleteProjectRequest,
@@ -5625,6 +5626,18 @@ export function App() {
             onCreateLabel={persistProjectLabel}
             onDeleteLabel={removeProjectLabel}
             onUpdate={(current, changes) => updateTaskProperties(current, changes)}
+            onContinuePaseoTask={host === "paseo" ? async (current) => {
+              try {
+                const result = await continuePaseoTaskAfterComment(current);
+                const updated = decoratePaseoTask(
+                  result.task, paseoAssignmentsRef.current[current.id], paseoProviderIconsRef.current,
+                );
+                setTasks((items) => sortTasks(items.map((item) => item.id === updated.id ? updated : item)));
+                return { ...result, task: updated };
+              } finally {
+                if (taskScopeProjectId) void refreshTasks(taskScopeProjectId, { quiet: true });
+              }
+            } : undefined}
             onOpenTask={openTaskDetail}
             onAddRelation={(current, type, relatedTaskId, origin) => (
               mutateTaskRelation("add", current, type, relatedTaskId, origin)

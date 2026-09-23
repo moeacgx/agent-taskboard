@@ -280,6 +280,14 @@ export function OriginalTaskboardFrame(props: { theme: PluginTheme; layout: Plug
           headers: {},
           body: null,
         });
+        if (refreshed.body.kind === "json" && refreshed.body.value
+          && typeof refreshed.body.value === "object" && !Array.isArray(refreshed.body.value)) {
+          refreshed.body.value = {
+            ...refreshed.body.value,
+            dispatch: result.dispatch,
+            dispatchMessage: result.dispatchMessage,
+          };
+        }
         post({ type: "paseo-taskboard:response", channel, nonce, requestId, ...refreshed });
       } catch (error) {
         post({

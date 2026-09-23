@@ -22,6 +22,7 @@ import {
   uploadAttachment,
   uploadCommentAttachment,
   updateComment,
+  type PaseoCommentDispatchResult,
 } from "../api";
 import {
   taskPriorityLabel,
@@ -130,6 +131,7 @@ interface TaskDetailProps {
   onCreateLabel: (label: string) => Promise<void>;
   onDeleteLabel: (label: string) => Promise<void>;
   onUpdate: (task: Task, changes: Partial<TaskDraft>) => Promise<Task>;
+  onContinuePaseoTask?: (task: Task) => Promise<PaseoCommentDispatchResult>;
   onOpenTask: (task: TaskRelationSummary) => void;
   onAddRelation: (
     task: Task,
@@ -435,6 +437,7 @@ export function TaskDetail({
   onCreateLabel,
   onDeleteLabel,
   onUpdate,
+  onContinuePaseoTask,
   onOpenTask,
   onAddRelation,
   onRemoveRelation,
@@ -483,6 +486,12 @@ export function TaskDetail({
   );
   const [changeStatusToTodo, setChangeStatusToTodo] = useState(false);
   const [submitting, setSubmitting] = useState(false);
+  const submittingRef = useRef(false);
+  const [savedContinuation, setSavedContinuation] = useState<{
+    comment: Comment;
+    segments: InlineMediaSegment[];
+  } | null>(null);
+  const [continuationNotice, setContinuationNotice] = useState<string | null>(null);
   const [activeMenuId, setActiveMenuId] = useState<string | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editingSegments, setEditingSegments] = useState<InlineMediaSegment[]>(
@@ -887,11 +896,72 @@ export function TaskDetail({
     }
   }
 
-  async function submitComment() {
+  async function continueSavedComment(saved: NonNullable<typeof savedContinuation>) {
+    let dispatchRequested = false;
+    try {
+      const anchor = await getTask(task.id);
+      await addMentionRelations(anchor, saved.segments);
+      // /move 使用最新人工评论；重试前确认仍是本次已保存的评论。
+      const latest = (await listComments(task.id))
+        .filter((comment) => comment.authorType !== "agent" && comment.authorId !== "paseo-agent")
+        .sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id))
+        .at(-1);
+      if (latest?.id !== saved.comment.id) {
+        throw new Error(text("已有更新的人工评论或原评论已删除，未再次派发。请查看最新评论。", "A newer comment exists or the saved comment was deleted. Nothing was sent; check the latest comment."));
+      }
+      const fresh = await getTask(task.id);
+      setCurrentTask(fresh);
+      if (fresh.status !== "in_review" && fresh.status !== "blocked") {
+        throw new Error(text("任务已不在等你确认或遇到阻碍，未再次派发。请先查看 Agent 会话。", "The task is no longer in review or blocked. Nothing was sent; check the Agent session first."));
+      }
+      dispatchRequested = true;
+      const result = await onContinuePaseoTask!(fresh);
+      setCurrentTask(result.task);
+      if (result.dispatch === "continued") {
+        setSavedContinuation(null);
+        setContinuationNotice(text("评论已保存，已继续处理。", "Comment saved. The Agent has resumed."));
+      } else if (result.dispatch === "failed" || result.dispatch === "skipped" || result.dispatch === "needs_configuration") {
+        setContinuationNotice(text(
+          `评论已保存，但未成功继续处理：${result.dispatchMessage ?? result.dispatch}。重试只派发已保存评论，不会重复发布。`,
+          `Comment saved, but the Agent did not resume: ${result.dispatchMessage ?? result.dispatch}. Retrying sends the saved comment without posting it again.`,
+        ));
+      } else {
+        setContinuationNotice(text("评论已保存，派发结果未确认。请先查看 Agent 会话；未自动重发。", "Comment saved; dispatch is unconfirmed. Check the Agent session first. Nothing was automatically resent."));
+      }
+    } catch (error) {
+      const uncertain = dispatchRequested && (!(error instanceof ApiError) || error.status === 0 || error.status >= 500);
+      setContinuationNotice(text(
+        uncertain
+          ? `评论已保存，派发结果未确认（可能已开始）。请先查看 Agent 会话；未自动重发。${messageFor(error)}`
+          : `评论已保存，但尚未继续处理：${messageFor(error)} 重试不会重复发布评论。`,
+        uncertain
+          ? `Comment saved; dispatch is unconfirmed and may have started. Check the Agent session first; nothing was automatically resent. ${messageFor(error)}`
+          : `Comment saved, but the Agent has not resumed: ${messageFor(error)} Retrying will not post the comment again.`,
+      ));
+    }
+  }
+
+  async function retrySavedContinuation() {
+    if (!savedContinuation || submittingRef.current || continuationDisabledReason || !onContinuePaseoTask) return;
+    submittingRef.current = true;
+    setSubmitting(true);
+    setContinuationNotice(null);
+    try {
+      await continueSavedComment(savedContinuation);
+    } finally {
+      submittingRef.current = false;
+      setSubmitting(false);
+    }
+  }
+
+  async function submitComment(continueProcessing = false) {
     const body = draft.trim();
-    if ((!body && commentInlineImages.length === 0 && commentInlineFiles.length === 0) || submitting) return;
+    if ((!body && commentInlineImages.length === 0 && commentInlineFiles.length === 0) || submittingRef.current) return;
+    if (continueProcessing && (!showCommentContinuation || continuationDisabledReason)) return;
+    submittingRef.current = true;
     setSubmitting(true);
     setCommentsError(null);
+    if (continueProcessing) setContinuationNotice(null);
     try {
       if (!pendingCommentRef.current) {
         pendingCommentRef.current = {
@@ -923,8 +993,16 @@ export function TaskDetail({
         : [...current, nextComment]);
       setCommentSegments(createInlineMediaSegments());
       if (commentAttachmentInputRef.current) commentAttachmentInputRef.current.value = "";
+      setSavedContinuation(null);
+      setContinuationNotice(null);
+      if (continueProcessing) {
+        const saved = { comment: nextComment, segments: commentSegments };
+        setSavedContinuation(saved);
+        await continueSavedComment(saved);
+        return;
+      }
       let relationAnchor = await getTask(currentTask.id);
-      if (changeStatusToTodo) {
+      if (changeStatusToTodo && !showCommentContinuation) {
         const saved = await onUpdate(relationAnchor, { status: "todo" });
         setCurrentTask(saved);
         relationAnchor = saved;
@@ -936,6 +1014,7 @@ export function TaskDetail({
     } catch (error) {
       setCommentsError(messageFor(error));
     } finally {
+      submittingRef.current = false;
       setSubmitting(false);
     }
   }
@@ -1059,6 +1138,16 @@ export function TaskDetail({
     ? currentUser
     : currentTask.assignee;
   const paseoEmbedded = new URL(document.baseURI).searchParams.get("host") === "paseo";
+  const showCommentContinuation = paseoEmbedded && paseoAssignment?.kind === "existing"
+    && Boolean(onContinuePaseoTask)
+    && (currentTask.status === "in_review" || currentTask.status === "blocked" || savedContinuation !== null);
+  const continuationDisabledReason = paseoPresentation?.requiresAttention && paseoPresentation.attentionReason === "permission"
+    ? text("Agent 正在等待权限，请先打开会话处理授权；仍可仅发布评论。", "The Agent is awaiting permission. Open its session to authorize it; you can still post a comment.")
+    : paseoPresentation?.status === "running" || (paseoAssignment?.kind === "existing" && paseoAssignment.status === "running")
+      ? text("Agent 正在运行，请等待本轮结束；仍可仅发布评论。", "The Agent is running. Wait for this turn to finish; you can still post a comment.")
+      : currentTask.status !== "in_review" && currentTask.status !== "blocked"
+        ? text("任务当前不在等你确认或遇到阻碍，请先查看 Agent 会话；仍可仅发布评论。", "The task is not in review or blocked. Check the Agent session; you can still post a comment.")
+        : null;
   const taskWorktreePath = currentTask.developmentContext?.type === "worktree"
     ? currentTask.developmentContext.path
     : null;
@@ -1400,6 +1489,12 @@ export function TaskDetail({
                   onError={setCommentsError}
                   onKeyDown={handleSubmitShortcut}
                 />
+                {(continuationNotice || (showCommentContinuation && continuationDisabledReason)) && (
+                  <p className="comment-continue-notice" role="status">
+                    {continuationNotice}
+                    {showCommentContinuation && continuationDisabledReason && <> {continuationDisabledReason}</>}
+                  </p>
+                )}
                 <footer className="composer-footer">
                   <div className="composer-footer-leading">
                     <button
@@ -1425,8 +1520,8 @@ export function TaskDetail({
                       }}
                     />
                   </div>
-                  <div>
-                    <div className="comment-status-action">
+                  <div className={showCommentContinuation ? "comment-continue-actions" : undefined}>
+                    {!showCommentContinuation && <div className="comment-status-action">
                       <span>{text("改变状态为-等待认领", "Change status to Todo")}</span>
                       <button
                         type="button"
@@ -1438,9 +1533,9 @@ export function TaskDetail({
                       >
                         <span aria-hidden="true" />
                       </button>
-                    </div>
+                    </div>}
                     <button
-                      className="button primary"
+                      className={`button ${showCommentContinuation ? "secondary" : "primary"}`}
                       type="submit"
                       disabled={(
                         !draft.trim()
@@ -1450,6 +1545,18 @@ export function TaskDetail({
                     >
                       {submitting ? text("发布中…", "Posting…") : text("评论", "Comment")}
                     </button>
+                    {showCommentContinuation && <button
+                      className="button primary"
+                      type="button"
+                      disabled={submitting || Boolean(continuationDisabledReason) || (!savedContinuation
+                        && !draft.trim() && commentInlineImages.length === 0 && commentInlineFiles.length === 0)}
+                      title={continuationDisabledReason ?? undefined}
+                      onClick={() => void (savedContinuation ? retrySavedContinuation() : submitComment(true))}
+                    >
+                      {submitting ? text("处理中…", "Working…") : savedContinuation
+                        ? text("重试已保存评论", "Retry saved comment")
+                        : text("评论并继续处理", "Comment and resume")}
+                    </button>}
                   </div>
                 </footer>
               </form>

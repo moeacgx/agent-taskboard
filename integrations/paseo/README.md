@@ -49,7 +49,7 @@ Paseo 安装构建会自动执行 `scripts/prepare-installation.mjs`，将实际
 
 ## 使用正式版安装包
 
-1. 从 [GitHub Releases](https://github.com/moeacgx/agent-taskboard/releases/latest) 下载 `agent-taskboard-paseo-v0.3.0.zip` 和 `SHA256SUMS.txt`。
+1. 从 [GitHub Releases](https://github.com/moeacgx/agent-taskboard/releases/latest) 下载 `agent-taskboard-paseo-v0.3.1.zip` 和 `SHA256SUMS.txt`。
 2. 核对 ZIP 的 SHA-256 后，解压到长期保留的目录。包内已包含后台 runtime、自包含页面、依赖锁文件和安装准备脚本。
 3. 在解压后的插件目录运行：
 
@@ -107,7 +107,7 @@ paseo plugin reload dashi-taskboard
 检测和安装是分开的：插件不会自动下载或替换正在运行的代码，避免打断正在执行的任务。发版时：
 
 1. 更新 `integrations/paseo/package.json` 的 `version`，该值会作为当前安装版本写入插件。
-2. 在 GitHub 创建 Release（tag 如 `v0.3.0`），并填写更新说明。
+2. 在 GitHub 创建 Release（tag 如 `v0.3.1`），并填写更新说明。
 3. 用户在仪表盘看到提示后，按本页“安装插件”步骤拉取新版本并执行 `paseo plugin install ./integrations/paseo`，再用 `paseo plugin reload dashi-taskboard` 加载。
 
 ## 数据与配置
@@ -214,6 +214,10 @@ Provider/Model、Mode、Thinking 和工作区，但合并本身只保存 planned
 同一附件在一轮中只发送一次；图片不存在或读取失败时，在移动任务、准备派发和发送之前报错。历史人工补充中的图片不会再次附发。会话展示将较早要求中的图片替换为历史图片说明，本轮图片可通过缩略图打开大图；已经发送给模型的历史图片不会撤回。未被上述正文引用的独立附件、项目说明中的图片尚不在发送范围内。
 
 桌面任务详情的评论输入框位于活动区顶部。历史记录按最新优先展示，初次显示 20 条，下滑或点击“加载更早记录”再显示下一批；切换任务后恢复首批，尚未展开的图片不会挂载加载。当前评论和活动的文字数据仍由原接口读取，分批展示不改变任务历史。
+
+Paseo 卡片保留任务标题，在下方显示最新一条评论或 Agent 回复的简短预览，封面也来自同一条评论；最新评论没有图片时不沿用旧图。没有评论时按原显示设置回退到任务描述。
+
+已绑定 Agent 的任务在“等你确认”或“遇到阻碍”时，可以点击“评论并继续处理”：先保存本次文字和图片，再让原 Agent 继续，任务直接进入“处理中”。普通“评论”和 Ctrl+Enter 只保存意见。Agent 正在运行或等待权限时禁用继续；派发失败可重试已保存评论，网络超时会提示结果未确认，不自动重发。
 
 项目文档增强只覆盖从 Taskboard 发起的派发。用户直接在 Paseo 原生会话中输入的消息不会被插件改写。插件也不会
 同步仓库中的 `README`、扫描附件、执行 OCR 或自动生成背景摘要。

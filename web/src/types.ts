@@ -440,6 +440,7 @@ export interface Task {
   conversationRefs: TaskConversationRef[];
   participants: ActorIdentity[];
   previewImage: Attachment | null;
+  latestComment?: { body: string; imageId: string | null } | null;
   activityKey: string;
   activityUpdatedAt: string;
   creatorType: ActorType;
