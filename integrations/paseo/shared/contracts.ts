@@ -44,7 +44,9 @@ export const PaseoWorktreeScanSchema = z.object({
   gitRoot: z.string().nullable(),
   isGitRoot: z.boolean(),
   head: z.string().nullable(),
+  defaultBranch: z.string().nullable().optional(),
   branches: z.array(z.string()),
+  remoteBranches: z.array(z.object({ name: z.string(), ref: z.string(), branch: z.string(), localMatches: z.boolean().optional() })).default([]),
   worktrees: z.array(z.object({ path: z.string(), branch: z.string().nullable() })),
   error: z.string().nullable(),
 });
@@ -139,6 +141,29 @@ export const PendingWritebackSchema = z.object({
 });
 export type PendingWriteback = z.infer<typeof PendingWritebackSchema>;
 
+export const CommentQueueItemSchema = z.object({
+  id: z.string(), taskId: z.string(), commentId: z.string(), agentId: z.string(),
+  body: z.string(), prompt: z.string(),
+  images: z.array(z.object({ attachmentId: z.string(), mimeType: z.string() })),
+  createdAt: z.string(),
+  status: z.enum(["queued", "sending", "sent", "completed", "canceled", "uncertain"]),
+  turnId: z.string().nullable(),
+});
+export type CommentQueueItem = z.infer<typeof CommentQueueItemSchema>;
+export const CommentQueueRequestSchema = z.discriminatedUnion("action", [
+  z.object({ action: z.literal("list"), taskId: z.string() }),
+  z.object({ action: z.literal("enqueue"), taskId: z.string(), commentId: z.string(), agentId: z.string() }),
+  z.object({ action: z.literal("cancel"), taskId: z.string(), itemId: z.string() }),
+  z.object({ action: z.literal("retry"), taskId: z.string() }),
+  z.object({ action: z.literal("acknowledge"), taskId: z.string(), itemId: z.string() }),
+]);
+export type CommentQueueRequest = z.infer<typeof CommentQueueRequestSchema>;
+export const CommentQueueStateSchema = z.object({
+  items: z.array(CommentQueueItemSchema.omit({ prompt: true, images: true }).extend({ imageCount: z.number() })),
+  pauseReason: z.string().nullable(),
+  waitingReason: z.string().nullable(),
+});
+
 export const BindingSchema = z.object({
   taskId: z.string(),
   taskIdentifier: z.string(),
@@ -162,6 +187,10 @@ export const BindingSchema = z.object({
   acceptedTurnId: z.string().nullable().default(null),
   /** 每次接受真实 turn 递增；reload 后仍能区分旧 pending 写回。 */
   turnGeneration: z.number().int().nonnegative().default(0),
+  commentQueue: z.array(CommentQueueItemSchema).default([]),
+  commentQueuePauseReason: z.string().nullable().default(null),
+  /** 入队时尚未被 lifecycle 接受的真实原生轮次，跨 reload 保留。 */
+  commentQueueWait: z.object({ turnId: z.string(), generation: z.number() }).nullable().default(null),
 });
 export type Binding = z.infer<typeof BindingSchema>;
 
@@ -378,8 +407,9 @@ export const createPaseoWorktree = defineRpc({
   name: "dashi.create-paseo-worktree",
   input: z.object({
     workspacePath: z.string().min(1).max(4_096),
-    branch: z.string().min(1).max(255),
+    branch: z.string().min(1).max(255).optional(),
     branchMode: z.enum(["existing", "new"]),
+    baseBranch: z.string().min(1).max(1_024).optional(),
     taskId: z.string().optional(),
   }),
   output: z.object({
@@ -461,6 +491,12 @@ export const continueTaskAgent = defineRpc({
   name: "dashi.continue-task-agent",
   input: z.object({ taskId: z.string(), message: z.string().min(1).max(100_000).optional() }),
   output: z.object({ task: TaskSchema, binding: BindingSchema }),
+});
+
+export const commentQueue = defineRpc({
+  name: "dashi.comment-queue",
+  input: CommentQueueRequestSchema,
+  output: z.object({ queue: CommentQueueStateSchema }),
 });
 
 /** 已绑定后由详情创建流程在客户端发送前武装下一轮。 */

@@ -14,6 +14,9 @@ import type { SettingsStore } from "./settings.ts";
 import type { TaskPlansStore } from "./task-plans.ts";
 import type { PaseoAutomationRuntime } from "./automation.ts";
 import { handlePluginUpdateBridge } from "./plugin-update.ts";
+import type { CommentQueueRuntime } from "./comment-queue.ts";
+import { handleCommentImageBridge } from "./comment-images.ts";
+import { createCommentPresentationReader } from "./comment-presentation.ts";
 
 const PROVIDER_ICON_MAX_CHARS = 16_000;
 const OPTIONAL_PROVIDER_READ_TIMEOUT_MS = 5_000;
@@ -133,9 +136,11 @@ export function registerHandlers(
   coordinator?: TaskDispatchCoordinator,
   automationRuntime?: PaseoAutomationRuntime,
   mutationLock?: TaskMutationLock,
+  commentQueue?: CommentQueueRuntime,
 ): void {
   const baseUrl = dashi.resolveBaseUrl();
   const dispatchCoordinator = coordinator ?? createTaskDispatchCoordinator();
+  const decorateComments = createCommentPresentationReader(bindings);
 
   function withTaskMutation<T>(taskId: string, operation: () => Promise<T>): Promise<T> {
     return mutationLock ? mutationLock.run(taskId, operation) : operation();
@@ -156,31 +161,58 @@ export function registerHandlers(
     try {
       const info = await stat(workspacePath);
       if (!info.isDirectory()) {
-        return { workspacePath, gitRoot: null, isGitRoot: false, head: null, branches: [], worktrees: [], error: "当前目录不是 Git 仓库。" };
+        return { workspacePath, gitRoot: null, isGitRoot: false, head: null, branches: [], remoteBranches: [], worktrees: [], error: "当前目录不是 Git 仓库。" };
       }
     } catch (error) {
       if (typeof error === "object" && error && "code" in error && (error as { code?: unknown }).code === "ENOENT") {
-        return { workspacePath, gitRoot: null, isGitRoot: false, head: null, branches: [], worktrees: [], error: "当前目录不存在，不能创建 Worktree。" };
+        return { workspacePath, gitRoot: null, isGitRoot: false, head: null, branches: [], remoteBranches: [], worktrees: [], error: "当前目录不存在，不能创建 Worktree。" };
       }
       throw error;
     }
     const root = await gitRootFor(workspacePath);
     if (!root) {
-      return { workspacePath, gitRoot: null, isGitRoot: false, head: null, branches: [], worktrees: [], error: "当前目录不是 Git 仓库。" };
+      return { workspacePath, gitRoot: null, isGitRoot: false, head: null, branches: [], remoteBranches: [], worktrees: [], error: "当前目录不是 Git 仓库。" };
     }
     const [resolvedPath, resolvedRoot] = await Promise.all([realpath(workspacePath), realpath(root)]);
     const isGitRoot = equalPath(resolvedPath, resolvedRoot);
-    const [branchesOutput, worktreesOutput, head] = await Promise.all([
-      git(resolvedRoot, ["for-each-ref", "--format=%(refname:short)", "refs/heads"]),
+    const [branchesOutput, remoteOutput, remotesOutput, worktreesOutput, head] = await Promise.all([
+      git(resolvedRoot, ["for-each-ref", "--sort=-committerdate", "--format=%(refname:strip=2)%09%(objectname)", "refs/heads"]),
+      git(resolvedRoot, ["for-each-ref", "--sort=-committerdate", "--format=%(refname)%09%(symref)%09%(objectname)", "refs/remotes"]),
+      git(resolvedRoot, ["remote"]),
       git(resolvedRoot, ["worktree", "list", "--porcelain"]),
       git(resolvedRoot, ["symbolic-ref", "--quiet", "--short", "HEAD"]).then((value) => value.trim() || null).catch(() => null),
     ]);
+    const remotes = remotesOutput.split(/\r?\n/).filter(Boolean).sort((left, right) => right.length - left.length);
+    const localCommits = new Map(branchesOutput.split(/\r?\n/).filter(Boolean).map((line) => {
+      const [name, commit] = line.split("\t");
+      return [name, commit];
+    }));
+    const remoteHeads = new Map<string, string>();
+    const remoteBranches = remoteOutput.split(/\r?\n/).flatMap((line) => {
+      const [ref, symbolicRef, commit] = line.split("\t");
+      if (!ref) return [];
+      if (symbolicRef) {
+        if (ref.endsWith("/HEAD")) remoteHeads.set(ref, symbolicRef);
+        return [];
+      }
+      const name = ref.slice("refs/remotes/".length);
+      const remote = remotes.find((candidate) => name.startsWith(`${candidate}/`));
+      const branch = remote ? name.slice(remote.length + 1) : "";
+      return remote ? [{ name, ref, branch, localMatches: localCommits.get(branch) === commit }] : [];
+    });
+    // 起点优先采用远端声明的默认分支，而不是用户当前正在开发的 HEAD。
+    const refs = new Set([...localCommits.keys()].map((name) => `refs/heads/${name}`).concat(remoteBranches.map((branch) => branch.ref)));
+    const defaultBranch = [remoteHeads.get("refs/remotes/origin/HEAD"), ...remoteHeads.values(),
+      "refs/remotes/origin/main", "refs/remotes/origin/master", "refs/heads/main", "refs/heads/master",
+      ...(head ? [`refs/heads/${head}`] : []), ...refs].find((ref) => ref && refs.has(ref)) ?? null;
     return {
       workspacePath: resolvedPath,
       gitRoot: resolvedRoot,
       isGitRoot,
       head,
-      branches: branchesOutput.split(/\r?\n/).map((branch) => branch.trim()).filter(Boolean),
+      defaultBranch,
+      branches: [...localCommits.keys()],
+      remoteBranches,
       worktrees: parseGitWorktrees(worktreesOutput),
       error: isGitRoot ? null : `只能在 Git 根目录创建 Worktree。Git 根目录：${resolvedRoot}`,
     };
@@ -536,6 +568,7 @@ export function registerHandlers(
 
   server.handle(contracts.checkConnection, async (_input, { paseo }) => {
     automationRuntime?.attach(paseo);
+    commentQueue?.attach(paseo);
     const result = await dashi.checkConnection(baseUrl);
     return { connected: result.connected, baseUrl, error: result.error };
   });
@@ -555,22 +588,36 @@ export function registerHandlers(
       // 新 worktree 的宿主目录尚未生成，已有绑定必然不能安全地视为同 cwd。
       throw new Error("当前任务已绑定 Paseo Agent。请先重新绑定 Agent，再创建并切换 Worktree。 ");
     }
-    try {
-      await git(gitRoot, ["check-ref-format", "--branch", input.branch]);
-    } catch {
-      throw new Error("分支名称不合法，请使用 Git 可接受的分支名。 ");
+    const remoteBranch = input.branchMode === "existing"
+      ? scan.remoteBranches.find((candidate) => candidate.ref === input.branch)
+      : undefined;
+    const targetBranch = remoteBranch?.branch ?? input.branch;
+    if (targetBranch) {
+      try {
+        await git(gitRoot, ["check-ref-format", "--branch", targetBranch]);
+      } catch {
+        throw new Error("分支名称不合法，请使用 Git 可接受的分支名。 ");
+      }
     }
-    if (input.branchMode === "existing" && !scan.branches.includes(input.branch)) {
+    if (input.branchMode === "existing" && !remoteBranch && (!input.branch || !scan.branches.includes(input.branch))) {
       throw new Error("所选已有分支不存在，请刷新后重试。 ");
     }
-    if (input.branchMode === "existing" && scan.worktrees.some((worktree) => worktree.branch === input.branch)) {
+    if (input.branchMode === "existing" && scan.worktrees.some((worktree) => worktree.branch === targetBranch)) {
       throw new Error("该分支已在现有 Worktree 中检出，请直接选择该 Worktree。 ");
     }
-    if (input.branchMode === "new" && scan.branches.includes(input.branch)) {
+    if (remoteBranch && scan.branches.includes(remoteBranch.branch)) {
+      throw new Error("本地已有同名分支，请选择本地分支；如需从远端另起任务，请选择“新分支”并指定远端起点。 ");
+    }
+    if (input.branchMode === "new" && input.branch && scan.branches.includes(input.branch)) {
       throw new Error("该分支已存在；请选择“已有分支”检出，或填写新的分支名。 ");
     }
-    if (input.branchMode === "new" && !scan.head) {
+    const baseBranch = input.baseBranch ?? (scan.head ? `refs/heads/${scan.head}` : null);
+    if (input.branchMode === "new" && !baseBranch) {
       throw new Error("当前 Git HEAD 处于分离状态，不能据此创建新分支。 ");
+    }
+    if (input.branchMode === "new" && !scan.branches.some((branch) => `refs/heads/${branch}` === baseBranch)
+      && !scan.remoteBranches.some((branch) => branch.ref === baseBranch)) {
+      throw new Error("所选起始分支不存在，请刷新后重试。 ");
     }
 
     const [projectResult, workspaceEntries] = await Promise.all([
@@ -589,40 +636,46 @@ export function registerHandlers(
     // 同一路径优先使用 Project 身份；Workspace 仅作为没有 Project 根匹配时的后备来源。
     const sourceProjectId = sourceProject?.projectId ?? sourceWorkspace?.projectId;
     // worktreeSlug 只是 daemon 管理路径的稳定名称，不接受也不解释为用户自定义绝对路径。
-    const worktreeSlug = input.branch.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "worktree";
+    const worktreeSlug = targetBranch?.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || undefined;
     const source = input.branchMode === "new"
       ? {
         kind: "worktree" as const,
         cwd: gitRoot,
         ...(sourceProjectId ? { projectId: sourceProjectId } : {}),
         action: "branch-off" as const,
-        baseBranch: scan.head!,
-        branchName: input.branch,
-        worktreeSlug,
+        baseBranch: baseBranch!,
+        ...(input.branch ? { branchName: input.branch } : {}),
+        ...(worktreeSlug ? { worktreeSlug } : {}),
       }
       : {
         kind: "worktree" as const,
         cwd: gitRoot,
         ...(sourceProjectId ? { projectId: sourceProjectId } : {}),
         action: "checkout" as const,
-        refName: input.branch,
-        worktreeSlug,
+        refName: targetBranch!,
+        ...(worktreeSlug ? { worktreeSlug } : {}),
       };
-    const handle = await paseo.workspaces.create({ title: `Worktree · ${input.branch}`, source });
+    // 宿主 checkout 接收本地分支名；先从精确远端引用建立跟踪分支，避免默认 origin 或同名引用歧义。
+    if (remoteBranch) await git(gitRoot, ["branch", "--track", remoteBranch.branch, remoteBranch.ref]);
+    const handle = await paseo.workspaces.create({ ...(targetBranch ? { title: `Worktree · ${targetBranch}` } : {}), source });
     const workspacePath = handle.directory ?? (await handle.refresh())?.workspaceDirectory ?? null;
     if (!workspacePath) {
       throw new Error("Paseo 已创建 Worktree，但未返回工作区目录；请在 Paseo 工作区列表确认后重试。 ");
     }
     const nextScan = await inspectWorktree(gitRoot);
+    const actualBranch = (await git(workspacePath, ["symbolic-ref", "--quiet", "--short", "HEAD"])).trim();
     return {
-      context: { type: "worktree" as const, path: workspacePath, branch: input.branch },
-      workspace: { id: handle.id, path: workspacePath, branch: input.branch },
+      context: { type: "worktree" as const, path: workspacePath, branch: actualBranch },
+      workspace: { id: handle.id, path: workspacePath, branch: actualBranch },
       scan: nextScan,
     };
   });
 
   server.handle(contracts.bridgeRequest, async (input, { paseo }) => {
     automationRuntime?.attach(paseo);
+    commentQueue?.attach(paseo);
+    const commentImage = await handleCommentImageBridge(baseUrl, input);
+    if (commentImage) return commentImage;
     const pluginUpdate = await handlePluginUpdateBridge(input);
     if (pluginUpdate) return pluginUpdate;
     const path = input.path.split("?", 1)[0];
@@ -820,7 +873,15 @@ export function registerHandlers(
       if (match && (input.method === "DELETE" || (input.method === "POST" && match[2] === "archive"))) {
         await assertTaskAgentIdle(paseo, taskId!);
       }
-      return dashi.bridgeRequest(baseUrl, input);
+      const response = await dashi.bridgeRequest(baseUrl, input);
+      const commentsRoute = input.method === "GET" ? /^\/api\/tasks\/([^/?]+)\/comments$/.exec(path) : null;
+      if (commentsRoute && response.status === 200 && response.body.kind === "json") {
+        const payload = response.body.value as { comments?: contracts.Comment[] } | null;
+        if (Array.isArray(payload?.comments)) {
+          response.body.value = { ...payload, comments: await decorateComments(paseo, decodeURIComponent(commentsRoute[1]), payload.comments) };
+        }
+      }
+      return response;
     };
     const taskMutation = taskId !== null && (
       input.method === "PATCH"
@@ -832,6 +893,7 @@ export function registerHandlers(
 
   server.handle(contracts.listTasks, (input, { paseo }) => {
     automationRuntime?.attach(paseo);
+    commentQueue?.attach(paseo);
     return dashi.listTasks(baseUrl, input);
   });
 
@@ -946,6 +1008,11 @@ export function registerHandlers(
   server.handle(contracts.addComment, ({ taskId, body }) => dashi.addComment(baseUrl, taskId, body));
 
   server.handle(contracts.getBinding, async ({ taskId }) => ({ binding: await bindings.get(taskId) }));
+
+  server.handle(contracts.commentQueue, async (input, { paseo }) => {
+    if (!commentQueue) throw new Error("评论队列不可用。");
+    return commentQueue.request(input, paseo);
+  });
 
   server.handle(contracts.getProjectSettings, async ({ projectId }) => ({ settings: await settings.get(projectId) }));
   server.handle(contracts.saveProjectSettings, async (input, { paseo }) => {

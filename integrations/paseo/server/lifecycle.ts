@@ -7,6 +7,7 @@ import type { BindingsStore } from "./bindings.ts";
 import * as dashi from "./dashi-api.ts";
 import type { TaskMutationLock } from "./dispatch.ts";
 import { performWriteback } from "./writeback.ts";
+import type { CommentQueueRuntime } from "./comment-queue.ts";
 
 /** 已完成、已取消或归档任务不得被迟到的 Agent 事件重新写回。 */
 async function taskAcceptsLifecycleWriteback(baseUrl: string, taskId: string): Promise<boolean> {
@@ -52,6 +53,7 @@ export function registerLifecycle(
   bindings: BindingsStore,
   onPaseo?: (paseo: import("@getpaseo/client").PaseoApi) => void,
   mutationLock?: TaskMutationLock,
+  commentQueue?: CommentQueueRuntime,
 ): void {
   const baseUrl = dashi.resolveBaseUrl();
   const withTaskMutation = <T>(taskId: string, operation: () => Promise<T>): Promise<T> => (
@@ -110,7 +112,7 @@ export function registerLifecycle(
         event.agent.id,
         event.turnId,
         agent.activeTurn?.turnId ?? null,
-        task.status === "in_progress" || task.status === "in_review",
+        task.status === "in_progress" || task.status === "in_review" || task.status === "blocked",
       );
       if (!accepted) return;
       await moveIfAllowed(baseUrl, currentBinding.taskId, "in_progress");
@@ -129,6 +131,7 @@ export function registerLifecycle(
       return;
     }
     await withTaskMutation(binding.taskId, async () => {
+    await commentQueue?.acceptWaitingEnd(binding.taskId, event.agent.id, event.turnId!);
     const generation = await bindings.matchesEndedTurn(binding.taskId, event.agent.id, event.turnId);
     if (generation === null) return;
 
@@ -156,6 +159,7 @@ export function registerLifecycle(
     try {
       if (!await taskAcceptsLifecycleWriteback(baseUrl, binding.taskId)) {
         await bindings.consumeEndedTurn(binding.taskId, event.agent.id, event.turnId);
+        await commentQueue?.ended(binding.taskId, event.agent.id, event.turnId!, event.outcome.kind);
         return;
       }
     } catch (error) {
@@ -169,7 +173,10 @@ export function registerLifecycle(
           turnId: event.turnId,
           generation,
         });
-      if (pending) await bindings.consumeEndedTurn(binding.taskId, event.agent.id, event.turnId);
+      if (pending) {
+        await bindings.consumeEndedTurn(binding.taskId, event.agent.id, event.turnId);
+        await commentQueue?.ended(binding.taskId, event.agent.id, event.turnId!, event.outcome.kind);
+      }
       console.error("[dashi-taskboard] failed to confirm task lifecycle eligibility; write-back kept pending", error);
       return;
     }
@@ -190,6 +197,9 @@ export function registerLifecycle(
       event.turnId,
     );
     await bindings.consumeEndedTurn(binding.taskId, event.agent.id, event.turnId);
+    await commentQueue?.ended(binding.taskId, event.agent.id, event.turnId!, event.outcome.kind);
     });
+    // ended 的写回锁已释放；下一次 send 不得递归占用该锁。
+    if (event.outcome.kind === "completed") void commentQueue?.kick(binding.taskId).catch(console.error);
   });
 }

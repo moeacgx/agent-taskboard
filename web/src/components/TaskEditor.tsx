@@ -35,7 +35,7 @@ import type {
   PaseoConfigurationOptions,
   PaseoConfigurationOptionsRequest,
 } from "../paseo-bridge";
-import { PaseoWorktreeDialog } from "./PaseoWorktreeDialog";
+import { PaseoWorktreePicker, type PaseoWorktreePickerHandle } from "./PaseoWorktreePicker";
 import { PaseoWorkspacePicker, type PaseoWorkspaceOption } from "./PaseoWorkspacePicker";
 import { ActorAvatar } from "./ActorAvatar";
 import { LabelPicker } from "./LabelPicker";
@@ -135,6 +135,7 @@ interface TaskEditorProps {
     onOpenAgent: (agentId: string) => void;
   };
   paseoWorkspaces?: PaseoWorkspaceOption[];
+  paseoDefaultWorkspacePath?: string | null;
   paseoWorktree?: {
     onCreated: (context: DevelopmentContext) => void;
   };
@@ -201,6 +202,7 @@ export function TaskEditor({
   paseoAssignee,
   paseoConfiguration,
   paseoWorkspaces = [],
+  paseoDefaultWorkspacePath = null,
   paseoWorktree,
   mergeSources = [],
   mergeStartAfterSave = false,
@@ -216,6 +218,7 @@ export function TaskEditor({
   const titleRef = useRef<HTMLTextAreaElement>(null);
   const descriptionComposerRef = useRef<InlineMediaComposerHandle>(null);
   const createSubmitIntentRef = useRef(false);
+  const worktreePickerRef = useRef<PaseoWorktreePickerHandle>(null);
   const attachmentInputRef = useRef<HTMLInputElement>(null);
   const [title, setTitle] = useState(initialDraft?.title ?? "");
   const [descriptionSegments, setDescriptionSegments] = useState<InlineMediaSegment[]>(
@@ -245,14 +248,6 @@ export function TaskEditor({
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<TaskEditorError | null>(null);
   const [attachmentError, setAttachmentError] = useState<TaskEditorError | null>(null);
-  const [worktreeDialogOpen, setWorktreeDialogOpen] = useState(false);
-  const [createdPaseoWorkspace, setCreatedPaseoWorkspace] = useState<{
-    id: string;
-    name: string | null;
-    path: string;
-    projectWorkspace: boolean;
-    kind: "workspace";
-  } | null>(null);
 
   const developmentOptions = useMemo(() => {
     const options = [...developmentScan.contexts];
@@ -324,10 +319,7 @@ export function TaskEditor({
   const paseoNeedsWorkspace = Boolean(
     paseoAssignee?.options.find((option) => option.id === paseoAssigneeId)?.requiresWorkspace,
   );
-  const availablePaseoWorkspaces = useMemo(() => [
-    ...(createdPaseoWorkspace ? [createdPaseoWorkspace] : []),
-    ...paseoWorkspaces.filter((workspace) => workspace.id !== createdPaseoWorkspace?.id),
-  ], [createdPaseoWorkspace, paseoWorkspaces]);
+  const availablePaseoWorkspaces = paseoWorkspaces;
   const selectedPaseoWorkspace = availablePaseoWorkspaces.find((workspace) => workspace.id === paseoWorkspaceId) ?? null;
   const selectedPaseoAssignee = paseoAssignee?.options.find((option) => option.id === paseoAssigneeId) ?? null;
   const paseoConfigurationTarget = selectedPaseoAssignee?.provider && selectedPaseoAssignee.model
@@ -423,7 +415,7 @@ export function TaskEditor({
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!createSubmitIntentRef.current) return;
+    if (!createSubmitIntentRef.current || saving) return;
     createSubmitIntentRef.current = false;
     if (projectOptions && !projectId) {
       setError(["请选择项目。", "Select a project."]);
@@ -453,6 +445,9 @@ export function TaskEditor({
     setSaving(true);
     setError(null);
     try {
+      const createdWorktree = await worktreePickerRef.current?.prepare();
+      const executionPath = createdWorktree?.workspace.path ?? worktreeRepositoryPath;
+      const savePlan = paseoPlanTouched || Boolean(createdWorktree);
       const assigneeTarget = paseoAssignee
         ? paseoAssigneeId === "paseo:self" ? "current-user" : undefined
         : assigneeTargetForActor(assignee, currentUser);
@@ -464,16 +459,16 @@ export function TaskEditor({
         priority,
         labels: selectedLabels,
         ...(assigneeTarget ? { assigneeTarget } : {}),
-        developmentContext,
+        developmentContext: createdWorktree?.context ?? developmentContext,
         startDate: startDate || null,
         dueDate: dueDate || null,
         recurrence,
       }, inlineMediaFiles(descriptionSegments), inlineMediaImages(descriptionSegments), {
         keepOpen: createMore,
         relations: { parentId, relatedIds, subIssueIds },
-        ...(paseoAssignee && paseoPlanTouched ? { paseoAssigneeId } : {}),
-        ...(paseoAssignee && paseoPlanTouched && selectedPaseoWorkspace
-          ? { paseoWorkspacePath: selectedPaseoWorkspace.path }
+        ...(paseoAssignee && savePlan ? { paseoAssigneeId } : {}),
+        ...(paseoAssignee && savePlan && executionPath
+          ? { paseoWorkspacePath: executionPath }
           : {}),
         ...(paseoPlanTouched && paseoConfigurationSelection.modeId
           ? { paseoModeId: paseoConfigurationSelection.modeId }
@@ -483,6 +478,7 @@ export function TaskEditor({
           : {}),
       });
       if (createMore) {
+        worktreePickerRef.current?.reset();
         setTitle("");
         setDescriptionSegments(createInlineMediaSegments());
         setSubIssueIds([]);
@@ -595,6 +591,24 @@ export function TaskEditor({
             </button>
           </div>
         </header>
+
+        {!mergingIdeas && paseoWorktree && paseoNeedsWorkspace && (
+          <div className="task-editor-source-row">
+            <PaseoWorktreePicker
+              ref={worktreePickerRef}
+              key={projectId}
+              workspaces={availablePaseoWorkspaces}
+              workspacePath={worktreeRepositoryPath}
+              defaultWorkspacePath={paseoDefaultWorkspacePath}
+              disabled={saving}
+              onWorkspaceChange={(path) => {
+                setPaseoPlanTouched(true);
+                setPaseoWorkspaceId(availablePaseoWorkspaces.find((workspace) => workspace.path === path)?.id ?? "");
+                setDevelopmentContext(null);
+              }}
+            />
+          </div>
+        )}
 
         <div className="form-body">
           <label className="composer-title">
@@ -760,7 +774,7 @@ export function TaskEditor({
                 if (selected) setAssignee(selected);
               }}
             />}
-            {paseoAssignee && paseoNeedsWorkspace && (
+            {paseoAssignee && paseoNeedsWorkspace && (mergingIdeas || !paseoWorktree) && (
               <PaseoWorkspacePicker
                 value={paseoWorkspaceId}
                 options={availablePaseoWorkspaces}
@@ -784,7 +798,7 @@ export function TaskEditor({
               onCreateLabel={onCreateLabel}
             />}
 
-            {!mergingIdeas && <TaskPropertyPicker
+            {!mergingIdeas && !paseoWorktree && <TaskPropertyPicker
               value={contextValue(developmentContext)}
               options={[
                 {
@@ -801,19 +815,6 @@ export function TaskEditor({
                     ? <BranchIcon color="currentColor" size={14} />
                     : <LinearIcon name="folder" />,
                 })),
-                ...(paseoWorktree && paseoNeedsWorkspace ? [{
-                  value: "__paseo-create-worktree__",
-                  label: text(
-                    "新建独立代码目录（Worktree）",
-                    "Create isolated code directory (worktree)",
-                  ),
-                  icon: <PlusIcon color="currentColor" size={14} />,
-                  className: "development-context-create-option",
-                  onSelect: () => {
-                    paseoAssignee?.onRefresh();
-                    setWorktreeDialogOpen(true);
-                  },
-                }] : []),
               ]}
               open={menu === "development"}
               disabled={developmentScanLoading}
@@ -824,27 +825,6 @@ export function TaskEditor({
               onOpenChange={(open) => setMenu(open ? "development" : null)}
               onChange={(value) => setDevelopmentContext(value ? JSON.parse(value) as DevelopmentContext : null)}
             />}
-            {!mergingIdeas && paseoWorktree && paseoNeedsWorkspace && (
-              <PaseoWorktreeDialog
-                open={worktreeDialogOpen}
-                workspaces={availablePaseoWorkspaces}
-                initialWorkspacePath={worktreeRepositoryPath}
-                onClose={() => setWorktreeDialogOpen(false)}
-                onCreated={(result) => {
-                  setDevelopmentContext(result.context);
-                  setCreatedPaseoWorkspace({
-                    id: result.workspace.id,
-                    name: `Worktree · ${result.workspace.branch}`,
-                    path: result.workspace.path,
-                    projectWorkspace: false,
-                    kind: "workspace",
-                  });
-                  setPaseoWorkspaceId(result.workspace.id);
-                  setPaseoPlanTouched(true);
-                  paseoWorktree.onCreated(result.context);
-                }}
-              />
-            )}
 
             {!mergingIdeas && dueDate && (
               <button className="property-control" type="button" title={text("用于计划安排，不会定时启动 Agent。", "Used for planning; it does not start an Agent on a schedule.")} onClick={() => setMenu("due")}>

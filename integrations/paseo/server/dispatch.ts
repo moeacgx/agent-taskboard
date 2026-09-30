@@ -230,12 +230,12 @@ export async function buildTaskContinuationMessage(baseUrl: string, task: Task, 
   };
 }
 
-export async function sendTaskMessage(agent: PaseoAgentHandle, message: TaskMessage): Promise<void> {
-  if (message.images.length === 0) {
+export async function sendTaskMessage(agent: PaseoAgentHandle, message: TaskMessage, messageId?: string): Promise<void> {
+  if (message.images.length === 0 && !messageId) {
     await agent.send(message.prompt);
     return;
   }
-  await agent.send(message.prompt, { images: message.images });
+  await agent.send(message.prompt, { ...(message.images.length ? { images: message.images } : {}), ...(messageId ? { messageId } : {}) });
 }
 
 export async function recordDispatchFailure(baseUrl: string, task: Task, message: string): Promise<Task> {
@@ -268,6 +268,9 @@ export async function canStartTaskDispatch(
 ): Promise<{ ok: true } | { ok: false; message: string }> {
   const binding = await bindings.get(taskId);
   if (!binding) return { ok: true };
+  if (binding.commentQueue.some((item) => !["completed", "canceled"].includes(item.status))) {
+    return { ok: false, message: "该任务有评论队列，请在评论区查看、取消或恢复队列。" };
+  }
   const agent = paseo.agents.ref(binding.agentId);
   try {
     await agent.refresh();
@@ -395,6 +398,9 @@ export async function assertAgentCanLeaveProcessing(
 ): Promise<void> {
   const binding = await bindings.get(taskId);
   if (!binding) return;
+  if (binding.commentQueue.some((item) => item.status === "sending" || item.status === "uncertain")) {
+    throw new Error("评论队列有待确认的发送，请先在评论区核对 Agent 会话。");
+  }
   const agent = paseo.agents.ref(binding.agentId);
   try {
     await agent.refresh();

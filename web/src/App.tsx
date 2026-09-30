@@ -119,6 +119,7 @@ import type {
   PaseoMergeIdeasResult,
   PaseoTaskAssignment,
 } from "./paseo-bridge";
+import { requestPaseoCommentQueue } from "./paseo-bridge";
 import { profileIconSource, providerIconSource } from "./providerIcons";
 import { buildIssueUrl, readIssueIdentifier } from "./issueRoute";
 import {
@@ -5626,6 +5627,7 @@ export function App() {
             onCreateLabel={persistProjectLabel}
             onDeleteLabel={removeProjectLabel}
             onUpdate={(current, changes) => updateTaskProperties(current, changes)}
+            onPaseoCommentQueue={host === "paseo" ? requestPaseoCommentQueue : undefined}
             onContinuePaseoTask={host === "paseo" ? async (current) => {
               try {
                 const result = await continuePaseoTaskAfterComment(current);
@@ -5716,6 +5718,13 @@ export function App() {
                 workspace.path ? [{ ...workspace, path: workspace.path }] : []
               )),
               onRefresh: () => refreshPaseoAssignmentOptions(detailTask.projectId),
+              onSaveDirectory: async (path) => {
+                const assignment = paseoAssignments[detailTask.id];
+                if (assignment?.kind === "existing") throw new Error("当前任务已绑定 Agent，不能切换会话目录。");
+                await changePaseoTaskAssignment(detailTask, paseoAssignmentValue(detailTask), path, undefined, true, true, {
+                  kind: "planned", profile: assignment?.kind === "planned" ? assignment.profile : null,
+                });
+              },
               onCreated: async (result) => {
                 const assignment = paseoAssignments[detailTask.id];
                 if (assignment?.kind !== "planned") return;
@@ -6496,6 +6505,7 @@ export function App() {
             ? (paseoAssignmentOptions?.workspaces ?? []).flatMap((workspace) => workspace.path ? [{ ...workspace, path: workspace.path }] : [])
             : undefined}
           paseoWorktree={host === "paseo" ? { onCreated: () => {} } : undefined}
+          paseoDefaultWorkspacePath={host === "paseo" && editorProjectId ? paseoAutomations[editorProjectId]?.workspacePath ?? null : null}
           mergeSources={editorMergeSources}
           mergeStartAfterSave={editor.mergeStartAfterSave === true}
           onCreateLabel={(label) => persistProjectLabel(label, editorProjectId ?? selectedProjectId)}
@@ -6534,9 +6544,6 @@ export function App() {
               || option.group === "provider"
             )),
           ]}
-          workspaces={(paseoAssignmentOptions?.workspaces ?? []).flatMap((workspace) => (
-            workspace.path ? [{ ...workspace, path: workspace.path }] : []
-          ))}
           loading={paseoAssignmentOptionsLoading}
           error={paseoAssignmentOptionsError}
           initialChoiceId={paseoExecutionDialog.initialChoiceId}

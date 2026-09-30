@@ -142,3 +142,36 @@ test("processing 中无已接管 turn 的原生续聊按真实 active turn 接�
   assert.equal((await dashi.listComments(baseUrl, created.id)).comments.at(-1)?.body, "本轮真实回复");
   assert.equal((await h.bindings.get(created.id))?.lastOutcome?.kind, "completed");
 });
+
+test("blocked 原生续聊只接管匹配的 active turn，completed 无需入队即可写回 in_review", { timeout: 60_000 }, async () => {
+  const h = await lifecycleHarness();
+  const created = await createBoundTask(h);
+  const blocked = (await dashi.moveTask(baseUrl, created.id, { version: created.version, status: "blocked" })).task;
+  await h.bindings.recordOutcome(created.id, "agent-lifecycle", { kind: "failed", at: new Date().toISOString(), message: "此前断流" });
+
+  h.setAgent({ status: "idle", activeTurnId: null });
+  await h.hooks.get("agent.turn_started")!({ agent: agentEvent(), turnId: "stale-turn" }, { paseo: h.paseo });
+  assert.equal((await h.bindings.get(created.id))?.acceptedTurnId, null);
+  assert.equal((await dashi.getTask(baseUrl, created.id)).task.version, blocked.version);
+
+  h.setAgent({ status: "running", activeTurnId: "native-blocked" });
+  await h.hooks.get("agent.turn_started")!({ agent: agentEvent(), turnId: "stale-turn" }, { paseo: h.paseo });
+  assert.equal((await h.bindings.get(created.id))?.acceptedTurnId, null);
+  await h.hooks.get("agent.turn_started")!({ agent: agentEvent(), turnId: "native-blocked" }, { paseo: h.paseo });
+  const accepted = await h.bindings.get(created.id);
+  assert.equal(accepted?.acceptedTurnId, "native-blocked");
+  assert.equal(accepted?.turnGeneration, 1);
+  assert.equal((await dashi.getTask(baseUrl, created.id)).task.status, "in_progress");
+
+  await h.hooks.get("agent.turn_ended")!({ agent: agentEvent(), turnId: "stale-turn", outcome: { kind: "completed" }, timeline: completedTimeline }, { paseo: h.paseo });
+  assert.equal((await dashi.listComments(baseUrl, created.id)).comments.length, 0);
+  h.setAgent({ status: "idle", activeTurnId: null });
+  await h.hooks.get("agent.turn_ended")!({ agent: agentEvent(), turnId: "native-blocked", outcome: { kind: "completed" }, timeline: completedTimeline }, { paseo: h.paseo });
+  assert.equal((await dashi.getTask(baseUrl, created.id)).task.status, "in_review");
+  assert.equal((await dashi.listComments(baseUrl, created.id)).comments.at(-1)?.body, "本轮真实回复");
+  const completed = await h.bindings.get(created.id);
+  assert.equal(completed?.lastOutcome?.kind, "completed");
+  assert.equal(completed?.acceptedTurnId, null);
+  assert.equal(completed?.pendingWriteback, null);
+  assert.equal(completed?.commentQueue.length, 0);
+});
