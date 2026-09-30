@@ -20,7 +20,7 @@ function deferred() {
   return { promise, resolve };
 }
 
-async function fixture(status: "in_progress" | "blocked" = "in_progress") {
+async function fixture(status: "in_progress" | "blocked" = "in_progress", sendTimeoutMs = 5_000) {
   const directory = await mkdtemp(path.join(os.tmpdir(), "paseo-comment-queue-"));
   const { createTaskboardServer } = await import("../../../server/app.mjs") as any;
   const app = createTaskboardServer({ dataDirectory: directory, databasePath: path.join(directory, "db.sqlite"), attachmentsDirectory: path.join(directory, "attachments"), staticDirectory: directory });
@@ -65,7 +65,8 @@ async function fixture(status: "in_progress" | "blocked" = "in_progress") {
   };
   const paseo = { agents: { ref: (id: string) => { assert.equal(id, eventAgent.id); return agent; } },
     workspaces: { open() { throw new Error("队列不能创建新 Agent"); } } } as unknown as PaseoApi;
-  let queue = createCommentQueueRuntime(bindings, lock, { baseUrl, intervalMs: 60_000, sendTimeoutMs: 30 });
+  // 普通路径包含真实数据库写入；仅专门的超时用例使用极短发送期限。
+  let queue = createCommentQueueRuntime(bindings, lock, { baseUrl, intervalMs: 60_000, sendTimeoutMs });
   function register() {
     registerLifecycle({ on: (name: string, handler: any) => { hooks.set(name, handler); } } as never,
       bindings, (api) => queue.attach(api), lock, queue);
@@ -112,7 +113,7 @@ async function fixture(status: "in_progress" | "blocked" = "in_progress") {
     async reload() {
       queue.stop();
       bindings = createBindingsStore({ filePath });
-      queue = createCommentQueueRuntime(bindings, lock, { baseUrl, intervalMs: 60_000, sendTimeoutMs: 30 });
+      queue = createCommentQueueRuntime(bindings, lock, { baseUrl, intervalMs: 60_000, sendTimeoutMs });
       register(); await request({ action: "list" });
     },
     async close() {
@@ -245,7 +246,7 @@ test("发送回复不确定与 reload 均不重发，只能人工核对后移出
 });
 
 test("send 超时后迟到 started/ended 可消费，不重复发送；sameAgent upsert 保持 sending 关联", { timeout: 60_000 }, async () => {
-  const f = await fixture();
+  const f = await fixture("in_progress", 30);
   try {
     await f.enqueue((await f.comment("只发送一次")).id); f.mode("hang");
     await f.end("original-turn"); await f.queue.kick(f.task.id);
