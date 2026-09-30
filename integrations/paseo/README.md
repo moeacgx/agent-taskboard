@@ -49,7 +49,7 @@ Paseo 安装构建会自动执行 `scripts/prepare-installation.mjs`，将实际
 
 ## 使用正式版安装包
 
-1. 从 [GitHub Releases](https://github.com/moeacgx/agent-taskboard/releases/latest) 下载 `agent-taskboard-paseo-v0.3.1.zip` 和 `SHA256SUMS.txt`。
+1. 从 [GitHub Releases](https://github.com/moeacgx/agent-taskboard/releases/latest) 下载 `agent-taskboard-paseo-v0.4.0.zip` 和 `SHA256SUMS.txt`。
 2. 核对 ZIP 的 SHA-256 后，解压到长期保留的目录。包内已包含后台 runtime、自包含页面、依赖锁文件和安装准备脚本。
 3. 在解压后的插件目录运行：
 
