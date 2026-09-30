@@ -463,7 +463,7 @@ export function TaskDetail({
 }: TaskDetailProps) {
   const { language, locale, text } = useTaskboardI18n();
   const [currentTask, setCurrentTask] = useState(task);
-  const [worktreeDialogOpen, setWorktreeDialogOpen] = useState(false);
+  const [worktreeDialogMode, setWorktreeDialogMode] = useState<"local" | "worktree" | null>(null);
   const [title, setTitle] = useState(task.title);
   const [description, setDescription] = useState(task.description);
   const [descriptionCollapsed, setDescriptionCollapsed] = useState(true);
@@ -1116,6 +1116,8 @@ export function TaskDetail({
         await continueSavedComment(saved);
         return;
       }
+      setSavedContinuation(null);
+      if (!savedQueueComment) setContinuationNotice(null);
       let relationAnchor = await getTask(currentTask.id);
       if (changeStatusToTodo && !showCommentContinuation) {
         const saved = await onUpdate(relationAnchor, { status: "todo" });
@@ -2348,7 +2350,10 @@ export function TaskDetail({
                       <button
                         type="button"
                         className="detail-code-directory-action"
-                        onClick={paseoExecutionConfig.onOpen}
+                        onClick={() => {
+                          paseoWorktree.onRefresh();
+                          setWorktreeDialogMode("local");
+                        }}
                       >
                         <LinearIcon name="folder" />
                         <span>{text("选择已有代码目录", "Choose existing code directory")}</span>
@@ -2358,7 +2363,7 @@ export function TaskDetail({
                         className="detail-code-directory-action"
                         onClick={() => {
                           paseoWorktree?.onRefresh();
-                          setWorktreeDialogOpen(true);
+                          setWorktreeDialogMode("worktree");
                         }}
                       >
                         <NewConversationIcon color="currentColor" size={14} />
@@ -2401,14 +2406,16 @@ export function TaskDetail({
               )}
               {paseoWorktree && paseoExecutionConfig && (
                 <PaseoWorktreeDialog
-                  open={worktreeDialogOpen}
+                  key={worktreeDialogMode ?? "closed"}
+                  open={worktreeDialogMode !== null}
+                  initialMode={worktreeDialogMode ?? "worktree"}
                   workspaces={paseoWorktree.workspaces}
                   initialWorkspacePath={taskWorktreePath
                     ?? (paseoAssignment?.kind === "planned" ? paseoAssignment.workspacePath : null)}
                   defaultWorkspacePath={paseoProjectDefaults?.workspacePath ?? null}
                   taskId={currentTask.id}
                   onSaveDirectory={paseoWorktree.onSaveDirectory}
-                  onClose={() => setWorktreeDialogOpen(false)}
+                  onClose={() => setWorktreeDialogMode(null)}
                   onCreated={async (result) => {
                     const saved = await saveTask({ developmentContext: result.context }, "developmentContext");
                     if (!saved) throw new Error(text("独立代码目录已创建，但任务未切换。请重试保存。", "The isolated code directory was created, but the task was not switched. Try saving again."));

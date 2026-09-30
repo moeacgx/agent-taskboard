@@ -226,3 +226,40 @@ it("服务端 skipped 不伪装成功，解除忙碌后重试只使用已保存�
     expect(f.comments()).toHaveLength(1);
   } finally { await f.close(); }
 }, 60000);
+
+it("续聊失败后普通评论保存成功清除旧重试状态，后续可提交新评论继续", async () => {
+  const f = await fixture("旧续聊要求");
+  try {
+    f.failSend(true);
+    const view = render(f.ui({ onPaseoCommentQueue: vi.fn(async () => ({ items: [], pauseReason: null, waitingReason: null })) }));
+    await waitFor(() => expect(view.getByRole("button", { name: "评论并继续处理" }).disabled).toBe(false));
+    fireEvent.click(view.getByRole("button", { name: "评论并继续处理" }));
+    await waitFor(() => expect(view.getByRole("button", { name: "重试已保存评论" }).disabled).toBe(false));
+    expect(f.send).toHaveBeenCalledTimes(1);
+
+    fireEvent.change(view.getByLabelText("留下评论"), { target: { value: "先只保存补充意见" } });
+    f.failSave(true);
+    fireEvent.click(view.getByRole("button", { name: "评论", exact: true }));
+    await waitFor(() => expect(view.getByRole("alert").textContent).toContain("模拟保存失败"));
+    await waitFor(() => expect(view.getByLabelText("留下评论").disabled).toBe(false));
+    expect(view.getByRole("button", { name: "重试已保存评论" })).toBeTruthy();
+
+    f.failSave(false);
+    fireEvent.click(view.getByRole("button", { name: "评论", exact: true }));
+    await waitFor(() => expect(f.comments()).toHaveLength(2));
+    await waitFor(() => expect(view.getByLabelText("留下评论").disabled).toBe(false));
+    expect(view.queryByRole("button", { name: "重试已保存评论" })).toBeNull();
+    expect(view.queryByRole("status")).toBeNull();
+    expect(f.send).toHaveBeenCalledTimes(1);
+
+    f.failSend(false);
+    fireEvent.change(view.getByLabelText("留下评论"), { target: { value: "按最新要求继续" } });
+    fireEvent.click(view.getByRole("button", { name: "评论并继续处理" }));
+    await waitFor(() => expect(view.getByRole("status").textContent).toBe("评论已保存，已继续处理。"));
+    expect(f.comments()).toHaveLength(3);
+    expect(f.send).toHaveBeenCalledTimes(2);
+    expect(f.send.mock.calls[1][0]).toContain("按最新要求继续");
+    expect(f.send.mock.calls[1][0]).not.toContain("旧续聊要求");
+    expect(f.createAgent).not.toHaveBeenCalled();
+  } finally { await f.close(); }
+}, 60000);

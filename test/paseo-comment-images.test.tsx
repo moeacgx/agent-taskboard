@@ -129,7 +129,8 @@ it("TaskDetail 精确匹配旧消息后最终结果置顶，三图仍按原偏�
     expect(refetch).toHaveBeenCalledTimes(1);
     for (const blob of blobs) {
       expect(blob.type).toBe("image/png");
-      const bytes = await new Promise<ArrayBuffer>((resolve, reject) => {
+      // Node fetch 返回原生 Blob；jsdom 的 FileReader 只能读取自身的 Blob。
+      const bytes = typeof blob.arrayBuffer === "function" ? await blob.arrayBuffer() : await new Promise<ArrayBuffer>((resolve, reject) => {
         const reader = new FileReader();
         reader.onload = () => resolve(reader.result as ArrayBuffer);
         reader.onerror = () => reject(reader.error);

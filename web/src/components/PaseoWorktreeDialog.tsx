@@ -9,6 +9,7 @@ interface PaseoWorktreeDialogProps {
   open: boolean;
   workspaces: PaseoWorkspaceOption[];
   initialWorkspacePath: string | null;
+  initialMode?: "local" | "worktree";
   defaultWorkspacePath?: string | null;
   taskId?: string;
   onClose: () => void;
@@ -21,7 +22,7 @@ export function PaseoWorktreeDialog(props: PaseoWorktreeDialogProps) {
   return props.open ? <InlineWorktreeEditor {...props} /> : null;
 }
 
-function InlineWorktreeEditor({ workspaces, initialWorkspacePath, defaultWorkspacePath, taskId, onClose, onCreated, onSaveDirectory }: PaseoWorktreeDialogProps) {
+function InlineWorktreeEditor({ workspaces, initialWorkspacePath, initialMode = "worktree", defaultWorkspacePath, taskId, onClose, onCreated, onSaveDirectory }: PaseoWorktreeDialogProps) {
   const { text } = useTaskboardI18n();
   const pickerRef = useRef<PaseoWorktreePickerHandle>(null);
   const [workspacePath, setWorkspacePath] = useState(initialWorkspacePath);
@@ -43,7 +44,7 @@ function InlineWorktreeEditor({ workspaces, initialWorkspacePath, defaultWorkspa
     }
   }
   return <div className="paseo-inline-directory-editor">
-    <PaseoWorktreePicker ref={pickerRef} workspaces={workspaces} workspacePath={workspacePath} defaultWorkspacePath={defaultWorkspacePath} initialMode="worktree" taskId={taskId} disabled={saving} onWorkspaceChange={setWorkspacePath} />
+    <PaseoWorktreePicker ref={pickerRef} workspaces={workspaces} workspacePath={workspacePath} defaultWorkspacePath={defaultWorkspacePath} initialMode={initialMode} taskId={taskId} disabled={saving} onWorkspaceChange={setWorkspacePath} />
     {error && <p className="paseo-source-error" role="alert">{error}</p>}
     <div className="paseo-inline-directory-actions">
       <button type="button" className="button secondary" disabled={saving} onClick={onClose}>{text("取消", "Cancel")}</button>
