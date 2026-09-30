@@ -181,6 +181,7 @@ export function OriginalTaskboardFrame(props: { theme: PluginTheme; layout: Plug
   const inspectPaseoWorktree = useRpc(contracts.inspectPaseoWorktree);
   const createPaseoWorktree = useRpc(contracts.createPaseoWorktree);
   const getPaseoAutomation = useRpc(contracts.getPaseoAutomation);
+  const commentQueue = useRpc(contracts.commentQueue);
   const savePaseoAutomation = useRpc(contracts.savePaseoAutomation);
   const savePaseoProjectDefaults = useRpc(contracts.savePaseoProjectDefaults);
   const frameRef = useRef<any>(null);
@@ -455,12 +456,13 @@ export function OriginalTaskboardFrame(props: { theme: PluginTheme; layout: Plug
           ? inspectPaseoWorktree({ workspacePath: payload.workspacePath })
           : operation === "create"
             && typeof payload?.workspacePath === "string"
-            && typeof payload?.branch === "string"
+            && (payload?.branch === undefined || typeof payload.branch === "string")
             && (payload?.branchMode === "existing" || payload?.branchMode === "new")
             ? createPaseoWorktree({
               workspacePath: payload.workspacePath,
-              branch: payload.branch,
+              ...(typeof payload.branch === "string" ? { branch: payload.branch } : {}),
               branchMode: payload.branchMode,
+              ...(typeof payload?.baseBranch === "string" ? { baseBranch: payload.baseBranch } : {}),
               ...(typeof payload?.taskId === "string" ? { taskId: payload.taskId } : {}),
             })
             : null;
@@ -471,6 +473,21 @@ export function OriginalTaskboardFrame(props: { theme: PluginTheme; layout: Plug
         void request.then(
           (value) => post({ type: "taskboard:paseo-worktree-response", challenge: nonce, payload: { requestId, ok: true, value } }),
           (error: unknown) => post({ type: "taskboard:paseo-worktree-response", challenge: nonce, payload: { requestId, ok: false, error: error instanceof Error ? error.message : String(error) } }),
+        );
+        return;
+      }
+      if (message.type === "taskboard:paseo-comment-queue-request" && message.challenge === nonce) {
+        const payload = message.payload as Record<string, unknown> | null;
+        const requestId = payload?.requestId;
+        if (typeof requestId !== "string") return;
+        const parsed = contracts.CommentQueueRequestSchema.safeParse(payload);
+        if (!parsed.success) {
+          post({ type: "taskboard:paseo-comment-queue-response", payload: { requestId, error: "无效的评论队列请求。" } });
+          return;
+        }
+        void commentQueue(parsed.data).then(
+          (result) => post({ type: "taskboard:paseo-comment-queue-response", payload: { requestId, queue: result.queue } }),
+          (error: unknown) => post({ type: "taskboard:paseo-comment-queue-response", payload: { requestId, error: error instanceof Error ? error.message : String(error) } }),
         );
         return;
       }
@@ -708,7 +725,7 @@ export function OriginalTaskboardFrame(props: { theme: PluginTheme; layout: Plug
     }
     window.addEventListener("message", receive);
     return () => window.removeEventListener("message", receive);
-  }, [bindExistingPaseoAgent, bridgeRequest, channel, clearPaseoTaskAssignment, createPaseoWorktree, getBinding, getPaseoAutomation, getPaseoConfigurationOptions, getPaseoPresentations, getPaseoTaskAssignments, getTask, hostTheme, inspectPaseoWorktree, listBindings, listPaseoAssignmentOptions, mergePaseoIdeas, moveTaskBoard, nonce, props.navigation, savePaseoAutomation, savePaseoProjectDefaults, saveTaskExecutionPlan]);
+  }, [bindExistingPaseoAgent, bridgeRequest, channel, clearPaseoTaskAssignment, commentQueue, createPaseoWorktree, getBinding, getPaseoAutomation, getPaseoConfigurationOptions, getPaseoPresentations, getPaseoTaskAssignments, getTask, hostTheme, inspectPaseoWorktree, listBindings, listPaseoAssignmentOptions, mergePaseoIdeas, moveTaskBoard, nonce, props.navigation, savePaseoAutomation, savePaseoProjectDefaults, saveTaskExecutionPlan]);
 
   useEffect(() => {
     frameRef.current?.contentWindow?.postMessage({ type: "taskboard:theme", theme: hostTheme }, "*");

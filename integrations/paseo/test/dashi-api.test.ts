@@ -425,13 +425,13 @@ test("latestAssistantText still joins fragments with no separator when messageId
   assert.equal(latestAssistantText(timeline), "第二轮会话与摘要回写成功");
 });
 
-test("latestAssistantText inserts a paragraph break only when messageId explicitly changes", () => {
+test("latestAssistantText reverses only distinct messageId groups", () => {
   const timeline: AgentTimelineItem[] = [
     { type: "user_message", text: "继续" },
     { type: "assistant_message", text: "第一条消息", messageId: "m1" },
     { type: "assistant_message", text: "第二条消息", messageId: "m2" },
   ];
-  assert.equal(latestAssistantText(timeline), "第一条消息\n\n第二条消息");
+  assert.equal(latestAssistantText(timeline), "第二条消息\n\n第一条消息");
 });
 
 test("latestAssistantText only reads what came after the latest user message", () => {

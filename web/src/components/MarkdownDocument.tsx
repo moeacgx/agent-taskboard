@@ -18,7 +18,7 @@ import ReactMarkdown, { defaultUrlTransform, type ExtraProps } from "react-markd
 import { decodeString } from "micromark-util-decode-string";
 import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
-import { resolvePersistedAttachmentUrl } from "../api";
+import { isPaseoEmbeddedHost, resolvePersistedAttachmentUrl } from "../api";
 import { useTaskboardI18n } from "../i18n";
 import { TaskboardImage } from "./TaskboardImage";
 
@@ -577,19 +577,29 @@ export function MarkdownDocument({
   onImageClick,
   onLinkClick,
   renderLink,
+  agentCommentImageContext,
 }: {
   value: string;
   onCopy?: ClipboardEventHandler<HTMLDivElement>;
   onImageClick?: (event: MouseEvent<HTMLImageElement>) => void;
   onLinkClick?: (event: MouseEvent<HTMLAnchorElement>, href?: string) => void;
   renderLink?: (href: string | undefined, children: ReactNode) => ReactNode | null;
+  agentCommentImageContext?: { taskId: string; commentId: string; version: number; sourceOffset?: number };
 }) {
   return (
     <div className="issue-description-document" onCopy={onCopy}>
       <MarkdownDocumentContext.Provider value={{ value, onImageClick, onLinkClick, renderLink }}>
         <ReactMarkdown
           remarkPlugins={[remarkGfm, remarkStripMarkdownComments, remarkBreaks]}
-          urlTransform={(url) => defaultUrlTransform(resolvePersistedAttachmentUrl(url))}
+          urlTransform={(url, key, node) => {
+            const offset = node.position?.start.offset;
+            if (agentCommentImageContext && key === "src" && node.tagName === "img" && /^file:/i.test(url)
+              && typeof offset === "number" && isPaseoEmbeddedHost()) {
+              const { taskId, commentId, version, sourceOffset = 0 } = agentCommentImageContext;
+              return `/api/paseo/tasks/${encodeURIComponent(taskId)}/comments/${encodeURIComponent(commentId)}/images/${sourceOffset + offset}?version=${version}`;
+            }
+            return defaultUrlTransform(resolvePersistedAttachmentUrl(url));
+          }}
           components={{
             a: MarkdownLink,
             img: MarkdownImage,

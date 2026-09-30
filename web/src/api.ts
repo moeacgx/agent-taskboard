@@ -588,8 +588,9 @@ export function inspectPaseoWorktree(workspacePath: string): Promise<PaseoWorktr
 
 export function createPaseoWorktree(input: {
   workspacePath: string;
-  branch: string;
+  branch?: string;
   branchMode: "existing" | "new";
+  baseBranch?: string;
   taskId?: string;
 }): Promise<PaseoCreatedWorktree> {
   return requestPaseoWorktree("create", input);

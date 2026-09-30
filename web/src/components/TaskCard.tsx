@@ -471,7 +471,9 @@ export function TaskCard({
     name: task.creatorName,
     avatarUrl: task.creatorAvatarUrl,
   };
-  const processingCard = task.status === "in_progress";
+  const processingCard = task.status === "in_progress"
+    || (paseoEmbedded && !task.archivedAt && task.status !== "done" && task.status !== "canceled"
+      && (presentation.processing.running || presentation.processing.awaitingPermission));
   const supportsConversation = task.status === "in_progress"
     || task.status === "in_review"
     || task.status === "blocked"
@@ -499,7 +501,8 @@ export function TaskCard({
   );
   const hasProperties = task.priority !== "none" || task.labels.length > 0 || task.dueDate;
   const showsProperties = Boolean(projectName)
-    || (!processingCard && (hasProperties || showsInlineParticipants || showsConversation));
+    || hasProperties
+    || (!processingCard && (showsInlineParticipants || showsConversation));
   const propertyDisabled = savingProperty !== null;
 
   function updateProperty(changes: Partial<TaskDraft>, property: NonNullable<typeof savingProperty>) {
@@ -644,7 +647,7 @@ export function TaskCard({
               <span>{projectName}</span>
             </span>
           )}
-          {!processingCard && task.priority !== "none" && (
+          {task.priority !== "none" && (
             <PriorityControl
               task={task}
               disabled={propertyDisabled}
@@ -653,7 +656,7 @@ export function TaskCard({
               onChange={(priority) => updateProperty({ priority }, "priority")}
             />
           )}
-          {!processingCard && task.labels.length > 0 && (
+          {task.labels.length > 0 && (
             <LabelPicker
               availableLabels={availableLabels}
               selectedLabels={task.labels}

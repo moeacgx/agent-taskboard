@@ -16,7 +16,7 @@
   ],
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "node --test --test-timeout=60000 test/dashi-api.test.ts test/board.test.ts test/dispatch.test.ts test/board-api.test.ts test/lifecycle.test.ts test/turn-ownership.test.ts test/plugin-update.test.ts test/task-message-images.test.ts",
+    "test": "node --test --test-timeout=60000 test/dashi-api.test.ts test/board.test.ts test/dispatch.test.ts test/board-api.test.ts test/lifecycle.test.ts test/turn-ownership.test.ts test/plugin-update.test.ts test/task-message-images.test.ts test/comment-queue.test.ts test/comment-images.test.ts test/comment-presentation.test.ts",
     "prepare:runtime": "node scripts/prepare-runtime.mjs",
     "build:original-srcdoc": "npx vite build --config ../../web/vite.paseo.config.ts && node ../../scripts/build-paseo-srcdoc.mjs"
   },

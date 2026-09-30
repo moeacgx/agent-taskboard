@@ -142,7 +142,9 @@ export interface PaseoWorktreeScan {
   gitRoot: string | null;
   isGitRoot: boolean;
   head: string | null;
+  defaultBranch?: string | null;
   branches: string[];
+  remoteBranches: Array<{ name: string; ref: string; branch: string; localMatches?: boolean }>;
   worktrees: Array<{ path: string; branch: string | null }>;
   error: string | null;
 }
@@ -195,12 +197,78 @@ export type PaseoTaskAssignment =
       profile: PaseoAgentProfile | null;
     };
 
+export type PaseoCommentQueueRequest =
+  | { action: "list" | "retry"; taskId: string }
+  | { action: "enqueue"; taskId: string; commentId: string; agentId: string }
+  | { action: "cancel" | "acknowledge"; taskId: string; itemId: string };
+
+export interface PaseoCommentQueueState {
+  items: Array<{
+    id: string;
+    taskId: string;
+    commentId: string;
+    agentId: string;
+    body: string;
+    createdAt: string;
+    status: "queued" | "sending" | "sent" | "completed" | "canceled" | "uncertain";
+    turnId: string | null;
+    imageCount: number;
+  }>;
+  pauseReason: string | null;
+  waitingReason: string | null;
+}
+
 function paseoBridgeConfig(): { channel: string; nonce: string } | null {
   const query = new URL(document.baseURI).searchParams;
   if (query.get("host") !== "paseo") return null;
   const channel = query.get("channel") ?? "";
   const nonce = query.get("nonce") ?? "";
   return channel && nonce ? { channel, nonce } : null;
+}
+
+/** 评论队列只通过父桥访问；超时后由调用方用原 commentId 显式重试。 */
+export function requestPaseoCommentQueue(
+  input: PaseoCommentQueueRequest,
+  signal?: AbortSignal,
+): Promise<PaseoCommentQueueState> {
+  const config = paseoBridgeConfig();
+  if (!config || window.parent === window) {
+    return Promise.reject(new Error("当前界面未连接 Paseo 评论队列服务。"));
+  }
+  if (signal?.aborted) return Promise.reject(new DOMException("请求已取消", "AbortError"));
+  const requestId = crypto.randomUUID();
+  return new Promise((resolve, reject) => {
+    const timeout = window.setTimeout(() => {
+      cleanup();
+      reject(new Error("评论队列请求超时，结果未确认。重试将使用同一条已保存评论。"));
+    }, 30_000);
+    function cleanup() {
+      window.clearTimeout(timeout);
+      window.removeEventListener("message", receive);
+      signal?.removeEventListener("abort", abort);
+    }
+    function abort() {
+      cleanup();
+      reject(new DOMException("请求已取消", "AbortError"));
+    }
+    function receive(event: MessageEvent) {
+      if (event.source !== window.parent || !event.data || typeof event.data !== "object") return;
+      const message = event.data;
+      if (message.type !== "taskboard:paseo-comment-queue-response"
+        || message.challenge !== config!.nonce || message.payload?.requestId !== requestId) return;
+      cleanup();
+      if (message.payload.error) reject(new Error(String(message.payload.error)));
+      else if (message.payload.queue) resolve(message.payload.queue as PaseoCommentQueueState);
+      else reject(new Error("评论队列响应缺少状态。"));
+    }
+    window.addEventListener("message", receive);
+    signal?.addEventListener("abort", abort, { once: true });
+    window.parent.postMessage({
+      type: "taskboard:paseo-comment-queue-request",
+      challenge: config.nonce,
+      payload: { requestId, ...input },
+    }, "*");
+  });
 }
 
 /** 沙箱 iframe 不能直接打开新窗口；由父页面校验 GitHub 仓库 URL 后再打开。 */

@@ -10,6 +10,7 @@ import { createPaseoAutomationRuntime } from "./server/automation";
 import { configureDashiReadyGate } from "./server/dashi-api";
 import { createDashiServiceManager } from "./server/dashi-service";
 import { PLUGIN_RUNTIME_ROOT } from "./server/plugin-installation.generated";
+import { createCommentQueueRuntime } from "./server/comment-queue";
 
 export default function contribute(server: PluginServerContext) {
   const dashiService = createDashiServiceManager({
@@ -25,10 +26,12 @@ export default function contribute(server: PluginServerContext) {
   const plans = createTaskPlansStore();
   const coordinator = createTaskDispatchCoordinator();
   const mutationLock = createTaskMutationLock();
+  const commentQueue = createCommentQueueRuntime(bindings, mutationLock);
   const automation = createPaseoAutomationRuntime(settings, plans, bindings, coordinator, mutationLock);
-  registerHandlers(server, bindings, settings, plans, coordinator, automation, mutationLock);
-  registerLifecycle(server, bindings, (paseo) => automation.attach(paseo), mutationLock);
+  registerHandlers(server, bindings, settings, plans, coordinator, automation, mutationLock, commentQueue);
+  registerLifecycle(server, bindings, (paseo) => { automation.attach(paseo); commentQueue.attach(paseo); }, mutationLock, commentQueue);
   return async () => {
+    commentQueue.stop();
     await automation.stop();
     configureDashiReadyGate(null);
     await dashiService.stop();

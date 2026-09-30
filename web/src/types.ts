@@ -475,6 +475,8 @@ export interface JiraConnection {
 }
 
 export interface Comment {
+  /** Paseo 只读展示区间，start/end 均指向原始 body，图片偏移不得丢失。 */
+  paseoMessageRanges?: Array<{ start: number; end: number }>;
   id: string;
   taskId: string;
   body: string;

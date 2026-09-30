@@ -155,7 +155,7 @@ async function harness() {
       ref: (id: string) => ({ refresh: async () => workspaceEntries.find((workspace) => workspace.id === id) ?? null }),
       create: async ({ source, title }: { source: { cwd: string; projectId?: string; action: "branch-off" | "checkout"; branchName?: string; refName?: string; baseBranch?: string }; title?: string }) => {
         createdWorkspaceSources.push(source);
-        const branch = source.action === "branch-off" ? source.branchName! : source.refName!;
+        const branch = source.action === "branch-off" ? source.branchName ?? `paseo-${randomUUID().slice(0, 8)}` : source.refName!;
         const target = path.join(path.dirname(source.cwd), `.paseo-handler-${createdWorkspace += 1}-${randomUUID()}-${branch.replace(/[^a-zA-Z0-9._-]+/g, "-")}`);
         const args = source.action === "branch-off"
           ? ["-C", source.cwd, "worktree", "add", "-b", branch, target, source.baseBranch ?? "HEAD"]
@@ -462,6 +462,41 @@ test("Paseo Worktree：仅 Git 根可创建、daemon 登记返回目录、已检
     });
     const inspect = h.handlers.get(contracts.inspectPaseoWorktree.name)!;
     const create = h.handlers.get(contracts.createPaseoWorktree.name)!;
+    await execFile("git", ["-C", repository, "remote", "add", "origin", repository], { windowsHide: true });
+    await execFile("git", ["-C", repository, "update-ref", "refs/remotes/origin/feature/remote", "refs/heads/main"], { windowsHide: true });
+    await execFile("git", ["-C", repository, "commit", "--allow-empty", "-m", "local differs from remote"], { windowsHide: true });
+    await execFile("git", ["-C", repository, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/feature/remote"], { windowsHide: true });
+    const remoteScan = await inspect({ workspacePath: repository }, { paseo: h.paseo });
+    assert.deepEqual(remoteScan.remoteBranches, [{
+      name: "origin/feature/remote",
+      ref: "refs/remotes/origin/feature/remote",
+      branch: "feature/remote",
+      localMatches: false,
+    }]);
+    const remoteCreated = await create({
+      workspacePath: repository,
+      branch: "refs/remotes/origin/feature/remote",
+      branchMode: "existing",
+    }, { paseo: h.paseo });
+    assert.equal(remoteCreated.workspace.branch, "feature/remote");
+    assert.equal((await execFile("git", ["-C", remoteCreated.workspace.path, "rev-parse", "--abbrev-ref", "@{upstream}"], { windowsHide: true })).stdout.trim(), "origin/feature/remote");
+    const basedOnRemote = await create({
+      workspacePath: repository,
+      branch: "feature/from-remote",
+      branchMode: "new",
+      baseBranch: "refs/remotes/origin/feature/remote",
+    }, { paseo: h.paseo });
+    assert.equal(basedOnRemote.workspace.branch, "feature/from-remote");
+    assert.equal((await execFile("git", ["-C", basedOnRemote.workspace.path, "rev-parse", "HEAD"], { windowsHide: true })).stdout.trim(),
+      (await execFile("git", ["-C", repository, "rev-parse", "refs/remotes/origin/feature/remote"], { windowsHide: true })).stdout.trim());
+    const automaticBranch = await create({
+      workspacePath: repository,
+      branchMode: "new",
+      baseBranch: "refs/remotes/origin/feature/remote",
+    }, { paseo: h.paseo });
+    assert.match(automaticBranch.workspace.branch, /^paseo-/);
+    assert.equal((await execFile("git", ["-C", automaticBranch.workspace.path, "rev-parse", "HEAD"], { windowsHide: true })).stdout.trim(),
+      (await execFile("git", ["-C", repository, "rev-parse", "refs/remotes/origin/feature/remote"], { windowsHide: true })).stdout.trim());
     const nonGit = await inspect({ workspacePath: nonGitDirectory }, { paseo: h.paseo });
     assert.equal(nonGit.gitRoot, null);
     assert.match(nonGit.error ?? "", /不是 Git 仓库/);

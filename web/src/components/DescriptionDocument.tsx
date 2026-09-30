@@ -44,6 +44,7 @@ export const DescriptionDocument = memo(function DescriptionDocument({
   attachments = [],
   enableImagePreview = false,
   onOpenAttachment,
+  agentCommentImageContext,
 }: {
   value: string;
   referenceTasks: Task[];
@@ -51,6 +52,7 @@ export const DescriptionDocument = memo(function DescriptionDocument({
   attachments?: Attachment[];
   enableImagePreview?: boolean;
   onOpenAttachment?: (event: MouseEvent<HTMLAnchorElement>, attachment: Attachment) => void;
+  agentCommentImageContext?: { taskId: string; commentId: string; version: number; sourceOffset?: number };
 }) {
   const [previewImage, setPreviewImage] = useState<{ src: string; alt: string } | null>(null);
 
@@ -69,10 +71,12 @@ export const DescriptionDocument = memo(function DescriptionDocument({
   return (<>
     <MarkdownDocument
       value={value}
+      agentCommentImageContext={agentCommentImageContext}
       onImageClick={enableImagePreview ? (event) => {
         event.preventDefault();
         event.stopPropagation();
-        setPreviewImage({ src: event.currentTarget.currentSrc, alt: event.currentTarget.alt });
+        const src = event.currentTarget.currentSrc || event.currentTarget.getAttribute("src");
+        if (src) setPreviewImage({ src, alt: event.currentTarget.alt });
       } : undefined}
       onCopy={(event: ClipboardEvent<HTMLDivElement>) => {
         const selection = event.currentTarget.ownerDocument.getSelection();

@@ -7,7 +7,8 @@ function paseoAttachmentContentPath(src: string | undefined): string | null {
     const baseUrl = new URL(document.baseURI);
     const imageUrl = new URL(src, baseUrl);
     if (imageUrl.origin !== baseUrl.origin) return null;
-    if (!/^\/api\/attachments\/[^/?#]+\/content$/.test(imageUrl.pathname)) return null;
+    if (!/^\/api\/attachments\/[^/?#]+\/content$/.test(imageUrl.pathname)
+      && !/^\/api\/paseo\/tasks\/[^/?#]+\/comments\/[^/?#]+\/images\/\d+$/.test(imageUrl.pathname)) return null;
     return `${imageUrl.pathname}${imageUrl.search}`;
   } catch {
     return null;

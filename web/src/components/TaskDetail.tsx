@@ -99,6 +99,7 @@ import type {
   PaseoAgentProfile,
   PaseoTaskAssignment,
 } from "../paseo-bridge";
+import type { PaseoCommentQueueRequest, PaseoCommentQueueState } from "../paseo-bridge";
 import type { PaseoAgentPresentation } from "../taskConversations";
 import {
   PaseoAssigneePicker,
@@ -132,6 +133,7 @@ interface TaskDetailProps {
   onDeleteLabel: (label: string) => Promise<void>;
   onUpdate: (task: Task, changes: Partial<TaskDraft>) => Promise<Task>;
   onContinuePaseoTask?: (task: Task) => Promise<PaseoCommentDispatchResult>;
+  onPaseoCommentQueue?: (input: PaseoCommentQueueRequest, signal?: AbortSignal) => Promise<PaseoCommentQueueState>;
   onOpenTask: (task: TaskRelationSummary) => void;
   onAddRelation: (
     task: Task,
@@ -179,6 +181,7 @@ interface TaskDetailProps {
     workspaces: PaseoWorkspaceOption[];
     onRefresh: () => void;
     onCreated: (result: PaseoCreatedWorktree) => void | Promise<void>;
+    onSaveDirectory: (path: string | null) => Promise<void>;
   };
 }
 
@@ -438,6 +441,7 @@ export function TaskDetail({
   onDeleteLabel,
   onUpdate,
   onContinuePaseoTask,
+  onPaseoCommentQueue,
   onOpenTask,
   onAddRelation,
   onRemoveRelation,
@@ -459,9 +463,10 @@ export function TaskDetail({
 }: TaskDetailProps) {
   const { language, locale, text } = useTaskboardI18n();
   const [currentTask, setCurrentTask] = useState(task);
-  const [worktreeDialogOpen, setWorktreeDialogOpen] = useState(false);
+  const [worktreeDialogMode, setWorktreeDialogMode] = useState<"local" | "worktree" | null>(null);
   const [title, setTitle] = useState(task.title);
   const [description, setDescription] = useState(task.description);
+  const [descriptionCollapsed, setDescriptionCollapsed] = useState(true);
   const mergedDescription = parseMergedTaskDescription(description);
   const [descriptionSegments, setDescriptionSegments] = useState<InlineMediaSegment[]>(
     () => createInlineMediaSegments(task.description, referenceTasks),
@@ -491,6 +496,17 @@ export function TaskDetail({
     comment: Comment;
     segments: InlineMediaSegment[];
   } | null>(null);
+  const [savedQueueComment, setSavedQueueComment] = useState<{ comment: Comment; agentId: string } | null>(null);
+  const [commentQueue, setCommentQueue] = useState<PaseoCommentQueueState | null>(null);
+  const [commentQueueError, setCommentQueueError] = useState<string | null>(null);
+  const [queueBusy, setQueueBusy] = useState(false);
+  const [confirmQueueItem, setConfirmQueueItem] = useState<string | null>(null);
+  const [confirmQueueResume, setConfirmQueueResume] = useState(false);
+  const queueMutationRef = useRef(false);
+  const queueGenerationRef = useRef(0);
+  const queueTaskRef = useRef(task.id);
+  queueTaskRef.current = task.id;
+  const queueAgentId = paseoAssignment?.kind === "existing" ? paseoAssignment.agentId : null;
   const [continuationNotice, setContinuationNotice] = useState<string | null>(null);
   const [activeMenuId, setActiveMenuId] = useState<string | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -537,6 +553,7 @@ export function TaskDetail({
     }
     if (taskChanged) {
       setEditingDescription(false);
+      setDescriptionCollapsed(true);
       setChangeStatusToTodo(false);
     }
   }, [task]);
@@ -597,6 +614,41 @@ export function TaskDetail({
     );
     return () => controller.abort();
   }, [commentsRevision, task.activityKey, task.id]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    queueGenerationRef.current += 1;
+    setCommentQueue(null);
+    setCommentQueueError(null);
+    setConfirmQueueItem(null);
+    setConfirmQueueResume(false);
+    if (!queueAgentId || !onPaseoCommentQueue) return;
+    let reading = false;
+    const load = async () => {
+      if (controller.signal.aborted || reading || queueMutationRef.current) return;
+      reading = true;
+      const generation = queueGenerationRef.current;
+      try {
+        const queue = await onPaseoCommentQueue({ action: "list", taskId: task.id }, controller.signal);
+        if (!controller.signal.aborted && generation === queueGenerationRef.current && queueTaskRef.current === task.id) {
+          setCommentQueue(queue);
+          setCommentQueueError(null);
+        }
+      } catch (error) {
+        if (!controller.signal.aborted && generation === queueGenerationRef.current && queueTaskRef.current === task.id) {
+          setCommentQueueError(error instanceof Error ? error.message : String(error));
+        }
+      } finally {
+        reading = false;
+      }
+    };
+    void load();
+    const timer = window.setInterval(() => void load(), 4_000);
+    return () => {
+      controller.abort();
+      window.clearInterval(timer);
+    };
+  }, [queueAgentId, onPaseoCommentQueue, task.id]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -896,6 +948,58 @@ export function TaskDetail({
     }
   }
 
+  async function mutateCommentQueue(input: PaseoCommentQueueRequest) {
+    if (!onPaseoCommentQueue || queueMutationRef.current) throw new Error("评论队列操作正在处理中。");
+    queueMutationRef.current = true;
+    const generation = ++queueGenerationRef.current;
+    setQueueBusy(true);
+    setCommentQueueError(null);
+    try {
+      const queue = await onPaseoCommentQueue(input);
+      if (generation === queueGenerationRef.current && queueTaskRef.current === input.taskId) setCommentQueue(queue);
+      return queue;
+    } finally {
+      queueMutationRef.current = false;
+      setQueueBusy(false);
+    }
+  }
+
+  async function queueSavedComment(saved: NonNullable<typeof savedQueueComment>) {
+    try {
+      await mutateCommentQueue({ action: "enqueue", taskId: saved.comment.taskId, commentId: saved.comment.id, agentId: saved.agentId });
+      setSavedQueueComment(null);
+      setContinuationNotice(text("评论已保存并加入队列，按顺序继续原 Agent。", "Comment saved and queued for the original Agent."));
+    } catch (error) {
+      setContinuationNotice(text(
+        `评论已保存，入队未确认：${messageFor(error)} 重试只入队这条评论，不会重复发布。`,
+        `Comment saved; queueing is unconfirmed: ${messageFor(error)} Retrying queues this same comment without posting again.`,
+      ));
+    }
+  }
+
+  async function retrySavedQueueComment() {
+    if (!savedQueueComment || submittingRef.current || queueMutationRef.current) return;
+    submittingRef.current = true;
+    setSubmitting(true);
+    try {
+      await queueSavedComment(savedQueueComment);
+    } finally {
+      submittingRef.current = false;
+      setSubmitting(false);
+    }
+  }
+
+  async function handleQueueAction(action: "cancel" | "retry" | "acknowledge", itemId?: string) {
+    if (queueMutationRef.current) return;
+    try {
+      await mutateCommentQueue(action === "retry" ? { action, taskId: task.id } : { action, taskId: task.id, itemId: itemId! });
+      setConfirmQueueItem(null);
+      setConfirmQueueResume(false);
+    } catch (error) {
+      setCommentQueueError(error instanceof Error ? error.message : String(error));
+    }
+  }
+
   async function continueSavedComment(saved: NonNullable<typeof savedContinuation>) {
     let dispatchRequested = false;
     try {
@@ -947,6 +1051,13 @@ export function TaskDetail({
     setSubmitting(true);
     setContinuationNotice(null);
     try {
+      if (queueProcessing && queueAgentId) {
+        const saved = { comment: savedContinuation.comment, agentId: queueAgentId };
+        setSavedQueueComment(saved);
+        setSavedContinuation(null);
+        await queueSavedComment(saved);
+        return;
+      }
       await continueSavedComment(savedContinuation);
     } finally {
       submittingRef.current = false;
@@ -954,14 +1065,14 @@ export function TaskDetail({
     }
   }
 
-  async function submitComment(continueProcessing = false) {
+  async function submitComment(continueProcessing = false, enqueue = false) {
     const body = draft.trim();
     if ((!body && commentInlineImages.length === 0 && commentInlineFiles.length === 0) || submittingRef.current) return;
-    if (continueProcessing && (!showCommentContinuation || continuationDisabledReason)) return;
+    if ((continueProcessing || enqueue) && (!showCommentContinuation || continuationDisabledReason || queueMutationRef.current)) return;
     submittingRef.current = true;
     setSubmitting(true);
     setCommentsError(null);
-    if (continueProcessing) setContinuationNotice(null);
+    if (continueProcessing || enqueue) setContinuationNotice(null);
     try {
       if (!pendingCommentRef.current) {
         pendingCommentRef.current = {
@@ -993,14 +1104,20 @@ export function TaskDetail({
         : [...current, nextComment]);
       setCommentSegments(createInlineMediaSegments());
       if (commentAttachmentInputRef.current) commentAttachmentInputRef.current.value = "";
-      setSavedContinuation(null);
-      setContinuationNotice(null);
+      if (enqueue && queueAgentId) {
+        const saved = { comment: nextComment, agentId: queueAgentId };
+        setSavedQueueComment(saved);
+        await queueSavedComment(saved);
+        return;
+      }
       if (continueProcessing) {
         const saved = { comment: nextComment, segments: commentSegments };
         setSavedContinuation(saved);
         await continueSavedComment(saved);
         return;
       }
+      setSavedContinuation(null);
+      if (!savedQueueComment) setContinuationNotice(null);
       let relationAnchor = await getTask(currentTask.id);
       if (changeStatusToTodo && !showCommentContinuation) {
         const saved = await onUpdate(relationAnchor, { status: "todo" });
@@ -1138,12 +1255,25 @@ export function TaskDetail({
     ? currentUser
     : currentTask.assignee;
   const paseoEmbedded = new URL(document.baseURI).searchParams.get("host") === "paseo";
+  const queueItems = commentQueue?.items.filter((item) => item.status !== "completed" && item.status !== "canceled") ?? [];
+  const agentRunning = paseoPresentation?.status === "running" || (paseoAssignment?.kind === "existing" && paseoAssignment.status === "running");
+  const agentAwaitingPermission = paseoPresentation?.requiresAttention && paseoPresentation.attentionReason === "permission";
+  const agentIdle = (paseoPresentation?.status ?? (paseoAssignment?.kind === "existing" ? paseoAssignment.status : null)) === "idle";
+  const canResumeQueue = queueItems.length > 0 && agentIdle && !agentAwaitingPermission
+    && Boolean(commentQueue?.pauseReason || commentQueue?.waitingReason);
+  const queueResumeBlocked = queueBusy || queueItems.some((item) => item.status === "sending" || item.status === "uncertain");
+  const queueResumeNeedsConfirmation = queueItems.some((item) => item.status === "sent");
+  const queueProcessing = Boolean(onPaseoCommentQueue && (agentRunning || agentAwaitingPermission || queueItems.length || commentQueue?.pauseReason || savedQueueComment));
   const showCommentContinuation = paseoEmbedded && paseoAssignment?.kind === "existing"
     && Boolean(onContinuePaseoTask)
-    && (currentTask.status === "in_review" || currentTask.status === "blocked" || savedContinuation !== null);
-  const continuationDisabledReason = paseoPresentation?.requiresAttention && paseoPresentation.attentionReason === "permission"
+    && (currentTask.status === "in_review" || currentTask.status === "blocked"
+      || (currentTask.status === "in_progress" && queueProcessing)
+      || savedContinuation !== null || savedQueueComment !== null);
+  const continuationDisabledReason = onPaseoCommentQueue && (!commentQueue || commentQueueError) && !savedQueueComment
+    ? text("评论队列状态尚未读取成功；仍可仅发布评论。", "The comment queue could not be read yet; you can still post a comment.")
+    : queueProcessing ? null : agentAwaitingPermission
     ? text("Agent 正在等待权限，请先打开会话处理授权；仍可仅发布评论。", "The Agent is awaiting permission. Open its session to authorize it; you can still post a comment.")
-    : paseoPresentation?.status === "running" || (paseoAssignment?.kind === "existing" && paseoAssignment.status === "running")
+    : agentRunning
       ? text("Agent 正在运行，请等待本轮结束；仍可仅发布评论。", "The Agent is running. Wait for this turn to finish; you can still post a comment.")
       : currentTask.status !== "in_review" && currentTask.status !== "blocked"
         ? text("任务当前不在等你确认或遇到阻碍，请先查看 Agent 会话；仍可仅发布评论。", "The task is not in review or blocked. Check the Agent session; you can still post a comment.")
@@ -1321,97 +1451,122 @@ export function TaskDetail({
                     />
                   </div>
                 ) : (
-                  <div
-                    className={`issue-description-read${description ? "" : " empty"}`}
-                    role={mergedDescription ? undefined : "button"}
-                    tabIndex={mergedDescription ? -1 : 0}
-                    aria-label={text("编辑议题描述", "Edit issue description")}
-                    onClick={(event) => {
-                      if (event.target instanceof Element && event.target.closest(".merged-task-sources")) return;
-                      if (event.target instanceof Element && event.target.closest("video")) return;
-                      if (window.getSelection()?.isCollapsed === false) return;
-                      descriptionCaretRef.current = null;
-                      const range = event.currentTarget.ownerDocument.caretRangeFromPoint(
-                        event.clientX,
-                        event.clientY,
-                      );
-                      const node = range?.startContainer;
-                      if (range && node?.nodeType === Node.TEXT_NODE && event.currentTarget.contains(node)) {
-                        const value = node.textContent ?? "";
-                        const walker = event.currentTarget.ownerDocument.createTreeWalker(
-                          event.currentTarget,
-                          NodeFilter.SHOW_TEXT,
-                        );
-                        let occurrence = 0;
-                        while (walker.nextNode() && walker.currentNode !== node) {
-                          if (walker.currentNode.textContent === value) occurrence += 1;
-                        }
-                        descriptionCaretRef.current = {
-                          text: value,
-                          offset: range.startOffset,
-                          occurrence,
-                        };
-                      }
-                      const scrollContainer = event.currentTarget.closest<HTMLElement>(".issue-detail-scroll");
-                      descriptionScrollPositionRef.current = scrollContainer
-                        ? { element: scrollContainer, top: scrollContainer.scrollTop }
-                        : null;
-                      setDescriptionSegments(createInlineMediaSegments(
-                        description,
-                        referenceTasks,
-                        attachments,
-                      ));
-                      setEditingDescription(true);
-                    }}
-                    onKeyDown={(event) => {
-                      if (mergedDescription) return;
-                      if (event.key === "Enter" || event.key === " ") {
-                        event.preventDefault();
-                        descriptionCaretRef.current = null;
-                        const scrollContainer = event.currentTarget.closest<HTMLElement>(".issue-detail-scroll");
-                        descriptionScrollPositionRef.current = scrollContainer
-                          ? { element: scrollContainer, top: scrollContainer.scrollTop }
-                          : null;
-                        setDescriptionSegments(createInlineMediaSegments(
-                          description,
-                          referenceTasks,
-                          attachments,
-                        ));
-                        setEditingDescription(true);
-                      }
-                    }}
-                  >
-                    {description
-                      ? mergedDescription
-                        ? <>
-                            {mergedDescription.summary && (
-                              <DescriptionDocument
-                                value={mergedDescription.summary}
+                  <>
+                    {description && (
+                      <button
+                        className="issue-description-toggle"
+                        type="button"
+                        aria-expanded={!descriptionCollapsed}
+                        aria-controls={`issue-description-content-${currentTask.id}`}
+                        onClick={() => setDescriptionCollapsed((collapsed) => !collapsed)}
+                      >
+                        <span className="issue-description-toggle-heading">
+                          <span className="issue-description-toggle-icon" aria-hidden="true">
+                            <LinearIcon name="file" width={16} height={16} />
+                          </span>
+                          <span>{text("原始需求", "Original request")}</span>
+                        </span>
+                        <span className="issue-description-toggle-state">
+                          {descriptionCollapsed ? text("展开内容", "Show content") : text("收起内容", "Hide content")}
+                          <LinearIcon name="chevronDown" width={14} height={14} aria-hidden="true" />
+                        </span>
+                      </button>
+                    )}
+                    {(!description || !descriptionCollapsed) && (
+                      <div
+                        id={description ? `issue-description-content-${currentTask.id}` : undefined}
+                        className={`issue-description-read${description ? "" : " empty"}`}
+                        role={mergedDescription ? undefined : "button"}
+                        tabIndex={mergedDescription ? -1 : 0}
+                        aria-label={text("编辑议题描述", "Edit issue description")}
+                        onClick={(event) => {
+                          if (event.target instanceof Element && event.target.closest(".merged-task-sources")) return;
+                          if (event.target instanceof Element && event.target.closest("video")) return;
+                          if (window.getSelection()?.isCollapsed === false) return;
+                          descriptionCaretRef.current = null;
+                          const range = event.currentTarget.ownerDocument.caretRangeFromPoint(
+                            event.clientX,
+                            event.clientY,
+                          );
+                          const node = range?.startContainer;
+                          if (range && node?.nodeType === Node.TEXT_NODE && event.currentTarget.contains(node)) {
+                            const value = node.textContent ?? "";
+                            const walker = event.currentTarget.ownerDocument.createTreeWalker(
+                              event.currentTarget,
+                              NodeFilter.SHOW_TEXT,
+                            );
+                            let occurrence = 0;
+                            while (walker.nextNode() && walker.currentNode !== node) {
+                              if (walker.currentNode.textContent === value) occurrence += 1;
+                            }
+                            descriptionCaretRef.current = {
+                              text: value,
+                              offset: range.startOffset,
+                              occurrence,
+                            };
+                          }
+                          const scrollContainer = event.currentTarget.closest<HTMLElement>(".issue-detail-scroll");
+                          descriptionScrollPositionRef.current = scrollContainer
+                            ? { element: scrollContainer, top: scrollContainer.scrollTop }
+                            : null;
+                          setDescriptionSegments(createInlineMediaSegments(
+                            description,
+                            referenceTasks,
+                            attachments,
+                          ));
+                          setEditingDescription(true);
+                        }}
+                        onKeyDown={(event) => {
+                          if (mergedDescription) return;
+                          if (event.key === "Enter" || event.key === " ") {
+                            event.preventDefault();
+                            descriptionCaretRef.current = null;
+                            const scrollContainer = event.currentTarget.closest<HTMLElement>(".issue-detail-scroll");
+                            descriptionScrollPositionRef.current = scrollContainer
+                              ? { element: scrollContainer, top: scrollContainer.scrollTop }
+                              : null;
+                            setDescriptionSegments(createInlineMediaSegments(
+                              description,
+                              referenceTasks,
+                              attachments,
+                            ));
+                            setEditingDescription(true);
+                          }
+                        }}
+                      >
+                        {description
+                          ? mergedDescription
+                            ? <>
+                                {mergedDescription.summary && (
+                                  <DescriptionDocument
+                                    value={mergedDescription.summary}
+                                    referenceTasks={referenceTasks}
+                                    onOpenTask={onOpenTask}
+                                    attachments={attachments}
+                                    enableImagePreview
+                                    onOpenAttachment={handleAttachmentDownload}
+                                  />
+                                )}
+                                <MergedTaskSources
+                                  presentation={mergedDescription}
+                                  referenceTasks={referenceTasks}
+                                  attachments={attachments}
+                                  onOpenTask={onOpenTask}
+                                  onOpenAttachment={handleAttachmentDownload}
+                                />
+                              </>
+                            : <DescriptionDocument
+                                value={description}
                                 referenceTasks={referenceTasks}
                                 onOpenTask={onOpenTask}
                                 attachments={attachments}
                                 enableImagePreview
                                 onOpenAttachment={handleAttachmentDownload}
                               />
-                            )}
-                            <MergedTaskSources
-                              presentation={mergedDescription}
-                              referenceTasks={referenceTasks}
-                              attachments={attachments}
-                              onOpenTask={onOpenTask}
-                              onOpenAttachment={handleAttachmentDownload}
-                            />
-                          </>
-                        : <DescriptionDocument
-                            value={description}
-                            referenceTasks={referenceTasks}
-                            onOpenTask={onOpenTask}
-                            attachments={attachments}
-                            enableImagePreview
-                            onOpenAttachment={handleAttachmentDownload}
-                          />
-                      : text("添加描述…", "Add description…")}
-                  </div>
+                          : text("添加描述…", "Add description…")}
+                      </div>
+                    )}
+                  </>
                 )}
                 {(currentTask.threadBinding || currentTask.legacyLocalThreadId) && (
                   <div
@@ -1489,6 +1644,41 @@ export function TaskDetail({
                   onError={setCommentsError}
                   onKeyDown={handleSubmitShortcut}
                 />
+                {onPaseoCommentQueue && queueAgentId && (queueItems.length > 0 || commentQueueError || commentQueue?.pauseReason || commentQueue?.waitingReason || !commentQueue) && (
+                  <div className="comment-queue" aria-label={text("评论队列", "Comment queue")}>
+                    <div className="comment-queue-heading">
+                      <strong>{commentQueue ? text(`待处理 ${queueItems.length} 条`, `${queueItems.length} pending`) : text("正在读取评论队列…", "Loading comment queue…")}</strong>
+                      {canResumeQueue && <button type="button" className="button secondary" disabled={queueResumeBlocked} onClick={() => queueResumeNeedsConfirmation ? setConfirmQueueResume(true) : void handleQueueAction("retry")}>{text("恢复队列", "Resume queue")}</button>}
+                    </div>
+                    {canResumeQueue && confirmQueueResume && queueResumeNeedsConfirmation && <div className="comment-queue-confirm">
+                      <p>{text("请先打开原会话，核对本轮已结束。确认后检查并恢复队列；若发送结果仍不确定，需先核对移出该项。", "Check that the turn has ended in the original session. Confirming checks and resumes the queue; an unconfirmed send must be checked and removed first.")}</p>
+                      {onOpenPaseoAgent && <button type="button" onClick={() => onOpenPaseoAgent(queueAgentId)}>{text("打开原会话", "Open original session")}</button>}
+                      <button type="button" disabled={queueResumeBlocked} onClick={() => void handleQueueAction("retry")}>{text("已核对原会话结束，恢复队列", "Turn checked as ended; resume queue")}</button>
+                      <button type="button" disabled={queueBusy} onClick={() => setConfirmQueueResume(false)}>{text("暂不恢复", "Keep paused")}</button>
+                    </div>}
+                    {commentQueueError && <p role="alert">{text("队列读取或操作失败：", "Queue read or action failed: ")}{commentQueueError}</p>}
+                    {commentQueue?.pauseReason && <p>{text("已暂停：", "Paused: ")}{commentQueue.pauseReason}</p>}
+                    {commentQueue?.waitingReason && <p>{commentQueue.waitingReason}</p>}
+                    <ul>
+                      {queueItems.map((item) => <li key={item.id}>
+                        <div className="comment-queue-row">
+                          <span className="comment-queue-body" title={item.body}>{item.body.trim() || text("图片评论", "Image comment")}</span>
+                          {item.imageCount > 0 && <span>{text(`${item.imageCount} 张图片`, `${item.imageCount} images`)}</span>}
+                          <span>{item.status === "queued" ? text("排队中", "Queued") : item.status === "sending" ? text("发送中", "Sending") : item.status === "sent" ? text("已发送", "Sent") : text("发送待确认", "Send unconfirmed")}</span>
+                          {item.status === "queued" && <button type="button" disabled={queueBusy} onClick={() => void handleQueueAction("cancel", item.id)}>{text("取消排队", "Cancel queued item")}</button>}
+                        </div>
+                        {item.status === "uncertain" && <div className="comment-queue-confirm">
+                          {onOpenPaseoAgent && <button type="button" onClick={() => onOpenPaseoAgent(item.agentId)}>{text("打开原会话", "Open original session")}</button>}
+                          {confirmQueueItem !== item.id ? <button type="button" disabled={queueBusy} onClick={() => setConfirmQueueItem(item.id)}>{text("核对后移出", "Remove after checking")}</button> : <>
+                            <p>{text("请先核对原会话。确认后仅移出此项，不会重发，也不会自动恢复后续；后续需点击“恢复队列”。", "Check the original session first. Confirming only removes this item; it does not resend or resume later items. Use Resume queue separately.")}</p>
+                            <button type="button" disabled={queueBusy} onClick={() => void handleQueueAction("acknowledge", item.id)}>{text("已核对，仅移出此项", "Checked; remove this item only")}</button>
+                            <button type="button" disabled={queueBusy} onClick={() => setConfirmQueueItem(null)}>{text("暂不移出", "Keep item")}</button>
+                          </>}
+                        </div>}
+                      </li>)}
+                    </ul>
+                  </div>
+                )}
                 {(continuationNotice || (showCommentContinuation && continuationDisabledReason)) && (
                   <p className="comment-continue-notice" role="status">
                     {continuationNotice}
@@ -1548,14 +1738,15 @@ export function TaskDetail({
                     {showCommentContinuation && <button
                       className="button primary"
                       type="button"
-                      disabled={submitting || Boolean(continuationDisabledReason) || (!savedContinuation
+                      disabled={submitting || queueBusy || Boolean(continuationDisabledReason) || (!savedContinuation && !savedQueueComment
                         && !draft.trim() && commentInlineImages.length === 0 && commentInlineFiles.length === 0)}
                       title={continuationDisabledReason ?? undefined}
-                      onClick={() => void (savedContinuation ? retrySavedContinuation() : submitComment(true))}
+                      onClick={() => void (savedQueueComment ? retrySavedQueueComment() : savedContinuation ? retrySavedContinuation() : submitComment(!queueProcessing, queueProcessing))}
                     >
-                      {submitting ? text("处理中…", "Working…") : savedContinuation
+                      {submitting ? text("处理中…", "Working…") : savedQueueComment
+                        ? text("重试已保存评论入队", "Retry queueing saved comment") : savedContinuation
                         ? text("重试已保存评论", "Retry saved comment")
-                        : text("评论并继续处理", "Comment and resume")}
+                        : queueProcessing ? text("评论并排队", "Comment and queue") : text("评论并继续处理", "Comment and resume")}
                     </button>}
                   </div>
                 </footer>
@@ -1627,6 +1818,8 @@ export function TaskDetail({
                     );
                   }
                   const comment = item.comment;
+                  const messageRanges = paseoEmbedded && comment.authorId === "paseo-agent" && comment.paseoMessageRanges?.length
+                    ? comment.paseoMessageRanges : [{ start: 0, end: comment.body.length }];
                   const commentActor: ActorIdentity = comment.authorType === currentUser.type
                     && comment.authorId === currentUser.id
                     ? currentUser
@@ -1780,14 +1973,17 @@ export function TaskDetail({
                       ) : (
                         comment.body && (
                           <div className="comment-body">
-                            <DescriptionDocument
-                              value={comment.body}
+                            {messageRanges.map(({ start, end }) => <DescriptionDocument
+                              key={start}
+                              value={comment.body.slice(start, end)}
+                              agentCommentImageContext={paseoEmbedded && comment.authorId === "paseo-agent"
+                                ? { taskId: currentTask.id, commentId: comment.id, version: comment.version, sourceOffset: start } : undefined}
                               referenceTasks={referenceTasks}
                               onOpenTask={onOpenTask}
                               attachments={comment.attachments}
                               enableImagePreview
                               onOpenAttachment={handleAttachmentDownload}
-                            />
+                            />)}
                           </div>
                         )
                       )}
@@ -2154,7 +2350,10 @@ export function TaskDetail({
                       <button
                         type="button"
                         className="detail-code-directory-action"
-                        onClick={paseoExecutionConfig.onOpen}
+                        onClick={() => {
+                          paseoWorktree.onRefresh();
+                          setWorktreeDialogMode("local");
+                        }}
                       >
                         <LinearIcon name="folder" />
                         <span>{text("选择已有代码目录", "Choose existing code directory")}</span>
@@ -2164,11 +2363,11 @@ export function TaskDetail({
                         className="detail-code-directory-action"
                         onClick={() => {
                           paseoWorktree?.onRefresh();
-                          setWorktreeDialogOpen(true);
+                          setWorktreeDialogMode("worktree");
                         }}
                       >
                         <NewConversationIcon color="currentColor" size={14} />
-                        <span>{text("新建独立代码目录（Worktree）", "Create isolated code directory (worktree)")}</span>
+                        <span>{text("本地 / 新建 Worktree", "Local / new worktree")}</span>
                       </button>
                     </div>
                   )}
@@ -2207,12 +2406,16 @@ export function TaskDetail({
               )}
               {paseoWorktree && paseoExecutionConfig && (
                 <PaseoWorktreeDialog
-                  open={worktreeDialogOpen}
+                  key={worktreeDialogMode ?? "closed"}
+                  open={worktreeDialogMode !== null}
+                  initialMode={worktreeDialogMode ?? "worktree"}
                   workspaces={paseoWorktree.workspaces}
                   initialWorkspacePath={taskWorktreePath
                     ?? (paseoAssignment?.kind === "planned" ? paseoAssignment.workspacePath : null)}
+                  defaultWorkspacePath={paseoProjectDefaults?.workspacePath ?? null}
                   taskId={currentTask.id}
-                  onClose={() => setWorktreeDialogOpen(false)}
+                  onSaveDirectory={paseoWorktree.onSaveDirectory}
+                  onClose={() => setWorktreeDialogMode(null)}
                   onCreated={async (result) => {
                     const saved = await saveTask({ developmentContext: result.context }, "developmentContext");
                     if (!saved) throw new Error(text("独立代码目录已创建，但任务未切换。请重试保存。", "The isolated code directory was created, but the task was not switched. Try saving again."));

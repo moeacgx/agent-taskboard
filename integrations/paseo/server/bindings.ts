@@ -146,12 +146,31 @@ export function createBindingsStore(options: { filePath?: string } = {}) {
             agentModel: bindingInput.agentModel ?? (sameAgent ? existing?.agentModel ?? null : null),
             lastOutcome: sameAgent ? (existing?.lastOutcome ?? null) : null,
             pendingWriteback: sameAgent ? (existing?.pendingWriteback ?? null) : null,
-            dispatchArmed: false,
-            acceptedTurnId: null,
+            dispatchArmed: sameAgent && existing.commentQueue.some((item) => !["completed", "canceled"].includes(item.status))
+              ? existing.dispatchArmed : false,
+            acceptedTurnId: sameAgent && existing.commentQueue.some((item) => !["completed", "canceled"].includes(item.status))
+              ? existing.acceptedTurnId : null,
             turnGeneration: sameAgent ? (existing?.turnGeneration ?? 0) : 0,
+            commentQueue: sameAgent ? existing.commentQueue : [],
+            commentQueuePauseReason: sameAgent ? existing.commentQueuePauseReason : null,
+            commentQueueWait: sameAgent ? existing.commentQueueWait : null,
           };
           next[input.taskId] = saved;
           return next;
+        });
+        return saved;
+      });
+    },
+
+    /** 队列及其轮次认领一起原子落盘；调用者仍使用任务 FIFO 串行用户操作。 */
+    mutateCommentQueue(taskId: string, agentId: string, update: (binding: Binding) => Binding): Promise<Binding | null> {
+      return enqueue(async () => {
+        let saved: Binding | null = null;
+        await mutate((byTaskId) => {
+          const current = byTaskId[taskId];
+          if (!current || current.agentId !== agentId) return byTaskId;
+          saved = update(current);
+          return { ...byTaskId, [taskId]: saved };
         });
         return saved;
       });
@@ -267,6 +286,9 @@ export function createBindingsStore(options: { filePath?: string } = {}) {
             dispatchArmed: false,
             acceptedTurnId: turnId,
             turnGeneration: (existing.turnGeneration ?? 0) + 1,
+            commentQueuePauseReason: explicitDispatch && existing.commentQueue.some((item) => item.status === "uncertain") ? null : existing.commentQueuePauseReason,
+            commentQueue: existing.commentQueue.map((item) => explicitDispatch && (item.status === "sending" || item.status === "uncertain")
+              ? { ...item, status: "sent" as const, turnId } : item),
             updatedAt: new Date().toISOString(),
           };
           return { ...byTaskId, [taskId]: updated };

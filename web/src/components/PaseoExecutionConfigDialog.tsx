@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useState } from "react";
 import { createPortal } from "react-dom";
 
 import { useTaskboardI18n } from "../i18n";
@@ -15,15 +15,10 @@ import {
   PaseoConfigurationFields,
   type PaseoConfigurationSelection,
 } from "./PaseoConfigurationFields";
-import {
-  PaseoWorkspacePicker,
-  type PaseoWorkspaceOption,
-} from "./PaseoWorkspacePicker";
 
 interface PaseoExecutionConfigDialogProps {
   taskIdentifier: string;
   options: PaseoAssigneeOption[];
-  workspaces: PaseoWorkspaceOption[];
   loading: boolean;
   error: string | null;
   initialChoiceId: string;
@@ -40,12 +35,9 @@ interface PaseoExecutionConfigDialogProps {
   ) => Promise<void>;
 }
 
-const SAVED_WORKSPACE_ID = "paseo:saved-task-workspace";
-
 export function PaseoExecutionConfigDialog({
   taskIdentifier,
   options,
-  workspaces,
   loading,
   error,
   initialChoiceId,
@@ -58,22 +50,7 @@ export function PaseoExecutionConfigDialog({
   onSave,
 }: PaseoExecutionConfigDialogProps) {
   const { text } = useTaskboardI18n();
-  const dialogWorkspaces = useMemo(() => {
-    if (!initialWorkspacePath) return workspaces;
-    return [{
-      id: SAVED_WORKSPACE_ID,
-      name: text("当前已保存目录", "Currently saved directory"),
-      path: initialWorkspacePath,
-      projectWorkspace: false,
-      kind: "workspace" as const,
-    }, ...workspaces.filter((workspace) => workspace.path !== initialWorkspacePath)];
-  }, [initialWorkspacePath, text, workspaces]);
   const [choiceId, setChoiceId] = useState(initialChoiceId);
-  const [workspaceId, setWorkspaceId] = useState(() => (
-    initialWorkspacePath
-      ? dialogWorkspaces.find((workspace) => workspace.path === initialWorkspacePath)?.id ?? ""
-      : ""
-  ));
   const [configuration, setConfiguration] = useState<PaseoConfigurationSelection>({});
   const [configurationSeed, setConfigurationSeed] = useState<PaseoConfigurationSelection>({
     ...(initialModeId ? { modeId: initialModeId } : {}),
@@ -86,12 +63,11 @@ export function PaseoExecutionConfigDialog({
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const selectedOption = options.find((option) => option.id === choiceId) ?? null;
-  const selectedWorkspace = dialogWorkspaces.find((workspace) => workspace.id === workspaceId) ?? null;
   const target = selectedOption?.provider && selectedOption.model
     ? {
         provider: selectedOption.provider,
         model: selectedOption.model,
-        workspacePath: selectedWorkspace?.path ?? null,
+        workspacePath: initialWorkspacePath,
         ...(configurationSeed.modeId ? { modeId: configurationSeed.modeId } : {}),
         ...(configurationSeed.thinkingOptionId
           ? { thinkingOptionId: configurationSeed.thinkingOptionId }
@@ -125,7 +101,7 @@ export function PaseoExecutionConfigDialog({
     setSaving(true);
     setSaveError(null);
     try {
-      await onSave(choiceId, selectedWorkspace?.path ?? null, configuration);
+      await onSave(choiceId, initialWorkspacePath, configuration);
     } catch (caught) {
       setSaveError(caught instanceof Error ? caught.message : String(caught));
       setSaving(false);
@@ -185,23 +161,14 @@ export function PaseoExecutionConfigDialog({
               }}
             />
           </div>
-          <div className="paseo-execution-field">
-            <span>{text("代码工作目录", "Code working directory")}</span>
-            <PaseoWorkspacePicker
-              options={dialogWorkspaces}
-              value={workspaceId}
-              allowEmpty
-              emptyLabel={text("使用项目默认目录", "Use project default directory")}
-              placeholder={text("使用项目默认目录", "Use project default directory")}
-              onChange={(id) => {
-                setWorkspaceId(id);
-                resetConfiguration(selectedOption);
-              }}
-            />
-          </div>
+          {initialWorkspacePath && (
+            <p className="paseo-execution-directory-note">
+              {text("代码目录已在任务详情中设置", "Code directory is set in the task details")}
+            </p>
+          )}
           {target && (
             <PaseoConfigurationFields
-              key={`${choiceId}\u0000${workspaceId}`}
+              key={choiceId}
               target={target}
               loadOptions={loadOptions}
               onSelectionChange={setConfiguration}
